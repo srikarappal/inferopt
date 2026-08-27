@@ -1,0 +1,22 @@
+# Isolated toolchains. Both exist because their pins CANNOT coexist with vLLM's:
+#   .aic-pkgs    aiconfigurator wants numpy~=1.26.4, vLLM wants <2.4
+#   .quant-pkgs  llmcompressor wants compressed-tensors==0.18.0, vLLM pins ==0.17.0
+# Rebuild with: python quantize.py --setup
+.aic-pkgs/
+.quant-pkgs/
+.venv-aic/
+
+# Measurement output and generated inputs -- machine-specific, and large.
+runs/
+data/
+artifacts/
+calibration.json
+
+# registry.json was a cache for the Hub-lookup approach that got deleted.
+registry.json
+
+__pycache__/
+*.pyc
+
+# Claude Code session transcripts, not project code.
+2026-*-local-command-*.txt

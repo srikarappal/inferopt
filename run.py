@@ -1,0 +1,268 @@
+"""inferopt CLI.
+
+    python run.py trace    --out data/trace.jsonl            # build a workload trace
+    python run.py optimize --model Qwen/Qwen3.5-9B \\
+                           --trace data/trace.jsonl \\
+                           --ttft-p99 500 --itl-p99 30 --allow-loss 0.03
+
+Stage 1.2 runs AIConfigurator against the nearest supported member of the GPU's
+architecture family, corrects the result with a roofline for the real hardware,
+and hands the DAG a seed. It also reports when an SLO is arithmetically
+unreachable -- which no amount of measurement can determine faster.
+
+HISTORY
+
+  gpu_memory_utilization is 0.75 on unified-memory parts, not the usual 0.90.
+  There the fraction is of SYSTEM memory, and the CPU, the benchmark client and
+  the OS all compete for the remainder. 0.90 of 122GB left ~1.6GB of headroom
+  and ran the box to the edge of the OOM killer.
+
+  enforce_eager is on in the seed, deliberately. torch.compile costs ~30-40 min
+  on this hardware and is keyed on shapes, so changing max_num_seqs or
+  max_model_len -- which the traversal does constantly -- invalidates it. Paying
+  it per node would cost more than the entire search. Compilation is tested ONCE
+  as its own node, against the accumulated config.
+
+  free_port exists because production is on the same box. The OCR server sits on
+  8813 and vLLM defaults to 8000.
+
+  Stage 1.3 stops the run if the seed cannot meet the SLO. Everything downstream
+  is a ratio against that measurement, so a starting point at goodput ~0 makes
+  every later comparison a comparison of noise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from pathlib import Path
+
+from calibration import STORE
+from fingerprint import NodeMeasurement
+from request import InferOptRequest, build_fingerprint
+from traverse import report, traverse
+
+
+def cmd_trace(args) -> int:
+    """Build a replayable trace from a ShareGPT dump.
+
+    The benchmark needs real prompt TEXT, not just token counts -- the
+    fingerprint can be derived from counts, but you cannot replay a workload you
+    only have statistics about.
+    """
+    src = Path(args.sharegpt)
+    if not src.exists():
+        print(f"  {src} not found. Point --sharegpt at a ShareGPT V3 dump.")
+        return 1
+    rng = random.Random(args.seed)
+    convs = json.loads(src.read_text())
+    prompts = [t["value"] for c in convs for t in c.get("conversations", [])[:1]
+               if 64 <= len(t.get("value") or "") <= 16000]
+    rng.shuffle(prompts)
+    prompts = prompts[: args.n]
+
+    rows, t = [], 0.0
+    shared = [f"sys{i}" for i in range(5)]
+    for p in prompts:
+        t += rng.expovariate(args.qps)
+        rows.append({
+            "prompt": p,
+            "input_tokens": len(p) // 4,
+            "output_tokens": int(rng.lognormvariate(5.4, 0.6)),
+            "arrival_ts": round(t, 4),
+            "prefix_id": rng.choice(shared) if rng.random() < args.prefix_share else None,
+            "adapter_id": None,
+            "temperature": 0.0,
+        })
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    print(f"  wrote {args.out}  ({len(rows)} requests, ~{args.qps} qps, "
+          f"{args.prefix_share:.0%} prefix sharing)")
+    return 0
+
+
+def seed_config(fp) -> dict:
+    """Conservative starting point, used until a predictor covers this hardware.
+
+    gpu_memory_utilization is 0.75 on unified-memory parts rather than the usual
+    0.90: there the fraction is of SYSTEM memory, and the CPU, the benchmark
+    client and the OS are all competing for the remainder. 0.90 of 122GB left
+    ~1.6GB of headroom on this box and ran the machine to the edge of the OOM
+    killer.
+    """
+    need = fp.workload.p999_input_tokens + fp.workload.p99_output_tokens
+    return {
+        "max_num_seqs": 256,
+        "gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90,
+        "max_model_len": min(fp.model.max_model_len, max(4096, ((need // 1024) + 2) * 1024)),
+        "enable_prefix_caching": False,
+        "enable_chunked_prefill": False,
+        # Eager on purpose. torch.compile costs ~30 min on this hardware and is
+        # keyed on shapes, so changing max_num_seqs or max_model_len -- which
+        # the traversal does constantly -- invalidates it. Paying that per node
+        # would cost more than the entire search. Compilation is tested ONCE, as
+        # its own node, against the accumulated config.
+        "enforce_eager": True,
+    }
+
+
+def free_port(start: int) -> int:
+    """First free port at or above `start`. The OCR server sits on 8813 and
+    vLLM's default is 8000, so a fixed port is a collision waiting to happen."""
+    import socket
+    for p in range(start, start + 40):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", p)) != 0:
+                return p
+    raise RuntimeError(f"no free port in {start}..{start+40}")
+
+
+def cmd_optimize(args) -> int:
+    req = InferOptRequest(
+        model=args.model, trace=args.trace,
+        ttft_p99_ms=args.ttft_p99, itl_p99_ms=args.itl_p99,
+        allow_loss=args.allow_loss, adapters=args.adapter or [],
+        budget_minutes=args.budget_minutes,
+    )
+    fp, slo = build_fingerprint(req)
+
+    print(f"\n  model     {fp.model.id}  ({fp.model.n_params_b}B {fp.model.attention_type}, "
+          f"{fp.model.weight_gb:.0f}GB weights, {fp.model.kv_bytes_per_token/1024:.0f}KB KV/token)")
+    print(f"  hardware  {fp.hw.gpu_name} x{fp.hw.gpu_count}  cc{fp.hw.compute_capability}  "
+          f"{fp.hw.memory_gb:.0f}GB{' unified' if fp.hw.unified_memory else ''}  "
+          f"{fp.hw.memory_bandwidth_gb_s:.0f} GB/s")
+    print(f"  workload  {fp.workload.n_requests} reqs, in p99 {fp.workload.p99_input_tokens}, "
+          f"out mean {fp.workload.mean_output_tokens:.0f}, {fp.workload.request_rate_qps:.1f} qps, "
+          f"prefix {fp.workload.prefix_overlap:.0%}")
+    print(f"  slo       ttft_p99 {slo.ttft_p99_ms}ms  itl_p99 {slo.itl_p99_ms}ms  "
+          f"allow_loss {slo.quality_budget}")
+
+    kv_one = fp.model.kv_bytes_per_token * fp.model.max_model_len / 1e9
+    print(f"  headroom  one max-length sequence needs {kv_one:.1f}GB of KV\n")
+
+    from evaluator import VllmEvaluator
+    from fingerprint import Context
+
+    cfg = seed_config(fp)
+    if args.skip_predict:
+        print(f"  stage 1.2 skipped by --skip-predict")
+    else:
+        from predictor import describe, predict
+        try:
+            pred = predict(fp, slo)
+            describe(pred)
+            if pred.seed_config:
+                # The predictor chooses the SHAPE (batch size, parallelism); the
+                # conservative defaults keep the safety rails it does not model
+                # (unified-memory utilisation, eager mode, right-sized context).
+                cfg.update(pred.seed_config)
+                cfg.pop("tensor_parallel_size", None) if fp.hw.gpu_count == 1 else None
+            if not pred.feasible:
+                print(f"\n  proceeding anyway -- the roofline is a LOWER BOUND, so measurement "
+                      f"can confirm it but never beat it. Expect stage 1.3 to report goodput 0 "
+                      f"and stop, which costs one launch and yields a real measured ITL.")
+        except Exception as e:
+            print(f"  stage 1.2 unavailable ({type(e).__name__}: {e})")
+            print(f"  falling back to the conservative seed")
+    print(f"\n  seed      {json.dumps(cfg)}\n")
+
+    port = free_port(args.port)
+    if port != args.port:
+        print(f"  port      {args.port} is taken; using {port}")
+    run_dir = Path(args.run_dir)
+    ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
+
+    ctx = Context(fingerprint=fp, slo=slo, incumbent=cfg)
+    if not args.skip_stage13:
+        print("  stage 1.3 measuring the seed config")
+        t = ev.measure(cfg, probes=["goodput", "equivalence"], benchmarks=[], node_id="stage_1_3")
+        if t.diagnostics.get("launch_error"):
+            # A launch failure is NOT an SLO failure. Reporting inf ttft as
+            # "does not satisfy the SLO" sends you to tune a threshold when the
+            # server never started.
+            print(f"\n  the server did not start -- this is a launch failure, not an "
+                  f"SLO problem, and nothing about the SLO or the seed config will "
+                  f"fix it.\n\n    {t.diagnostics['launch_error']}\n")
+            tail = (t.diagnostics.get("stderr_tail") or "").strip().splitlines()[-6:]
+            for line in tail:
+                print(f"    {line[:130]}")
+            print(f"\n  full log: {run_dir}/launches/*/server.log")
+            print(f"  if it says 'not healthy in Ns', the launch was still working when "
+                  f"the clock ran out -- raise INFEROPT_LAUNCH_TIMEOUT_S (currently "
+                  f"{__import__('evaluator').LAUNCH_TIMEOUT_S:.0f}s).")
+            return 1
+        if not t.slo_ok:
+            print(f"\n  the seed config MEASURED ttft_p99 {t.ttft_p99_ms:.0f}ms against an "
+                  f"SLO of {slo.ttft_p99_ms}ms, so its goodput is ~0. Everything "
+                  f"downstream is a ratio against this, so every comparison would be "
+                  f"against noise. Relax the SLO, or lower the offered load "
+                  f"({fp.workload.request_rate_qps:.1f} qps at concurrency "
+                  f"{fp.workload.max_concurrency}).")
+            return 1
+        ctx.incumbent_metrics = NodeMeasurement(
+            goodput=t.goodput, ttft_p99_ms=t.ttft_p99_ms, itl_p99_ms=t.itl_p99_ms,
+            quality={}, config=cfg)
+        print(f"  stage 1.3 goodput {t.goodput:.1f}  ttft_p99 {t.ttft_p99_ms:.0f}ms\n")
+
+    dag = json.loads(Path(args.dag).read_text())
+    res = traverse(dag, ctx, ev, lossless_only=args.lossless_only)
+    report(res)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out = run_dir / "result.json"
+    out.write_text(json.dumps({
+        "fingerprint": fp.model_dump(),
+        "incumbent": res.incumbent,
+        "frontier": [t.__dict__ for t in res.frontier()],
+        "trials": [t.__dict__ for t in res.trials],
+        "visited": res.visited, "skipped": res.skipped,
+        "launches": res.launches, "minutes": res.minutes,
+        "stopped_early": res.stopped_early,
+    }, indent=2, default=str))
+    print(f"\n  wrote {out}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="inferopt")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    t = sub.add_parser("trace", help="build a replayable workload trace")
+    t.add_argument("--sharegpt", default="../qwen-serve-opt/data/ShareGPT_V3_unfiltered_cleaned_split.json")
+    t.add_argument("--out", default="data/trace.jsonl")
+    t.add_argument("--n", type=int, default=800)
+    t.add_argument("--qps", type=float, default=16.0)
+    t.add_argument("--prefix-share", type=float, default=0.30)
+    t.add_argument("--seed", type=int, default=0)
+    t.set_defaults(fn=cmd_trace)
+
+    o = sub.add_parser("optimize", help="fingerprint, then traverse the DAG")
+    o.add_argument("--model", required=True)
+    o.add_argument("--trace", required=True)
+    o.add_argument("--ttft-p99", type=float, default=None)
+    o.add_argument("--itl-p99", type=float, default=None)
+    o.add_argument("--allow-loss", type=float, default=None)
+    o.add_argument("--adapter", action="append")
+    o.add_argument("--dag", default="dag/llm.json")
+    o.add_argument("--gpu", default="0")
+    o.add_argument("--port", type=int, default=8100,
+                   help="first port to try; the next free one is used if taken")
+    o.add_argument("--run-dir", default="runs/latest")
+    o.add_argument("--budget-minutes", type=int, default=180)
+    o.add_argument("--skip-predict", action="store_true",
+                   help="skip stage 1.2 and use the conservative seed")
+    o.add_argument("--lossless-only", action="store_true",
+                   help="stop at the lossless branch; do not enter the lossy nodes. "
+                        "The frontier still includes everything measured.")
+    o.add_argument("--skip-stage13", action="store_true",
+                   help="skip measuring the seed; the first node is then kept unconditionally")
+    o.set_defaults(fn=cmd_optimize)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

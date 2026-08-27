@@ -1,0 +1,811 @@
+{
+  "$schema": "./schema.md",
+  "modality": "llm",
+  "version": 1,
+  "description": "Deterministic technique DAG for autoregressive LLM serving. Traversed greedily by a state machine: apply a node, measure, keep or revert, follow the corresponding edge. Every measurement is recorded as a Pareto candidate whether or not it becomes the incumbent.",
+  "inputs": {
+    "incumbent_config": "best config from stage 1.2, validated by 1.3",
+    "incumbent_metrics": "measured goodput / ttft_p99 / itl_p99 / quality at stage 1.3",
+    "accept_band": "Relative improvement required to keep a node. Sourced from the calibration store for this (model, hardware) pair; falls back to a deliberately LOOSE default when the pair has never been measured. Never hardcoded in a node, and the run report states which of the two it used -- a result should never rest silently on a default.",
+    "fingerprint": "model / hardware / workload characterization from stage 0, including a lora block: n_adapters, max_rank, target_modules, request_distribution, adapter_switching_rate.",
+    "slo": "user TTFT and ITL constraints; violated configs score goodput 0",
+    "quality_budget": "user allow-loss, or null to produce the frontier and let them pick",
+    "quality_tolerance": "Per-benchmark score delta that counts as noise. Measured at lossless_complete and written back to the calibration store; a per-benchmark default until then."
+  },
+  "objective": {
+    "primary": "goodput",
+    "definition": "throughput counting only requests that satisfy the SLO constraints",
+    "constraints": [
+      "ttft_p99 <= slo.ttft_p99",
+      "itl_p99 <= slo.itl_p99"
+    ],
+    "frontier_axes": [
+      "quality",
+      "goodput",
+      "ttft_p99",
+      "memory_gb"
+    ]
+  },
+  "traversal": {
+    "strategy": "greedy_accumulate",
+    "decision_rule": "keep the best swept variant if goodput > incumbent.goodput * (1 + accept_band) and it satisfies every constraint; otherwise revert",
+    "revert_semantics": "reverting discards the node's effect on the incumbent, NOT its measurements. A reverted config is still a Pareto candidate and may be the operating point the user wants.",
+    "budget_guard": {
+      "max_launches": {
+        "default": 20,
+        "multi_lora": 26
+      },
+      "max_minutes": {
+        "default": 240,
+        "multi_lora": 280
+      },
+      "on_exceed": "stop traversal, emit the frontier from what was measured, list unvisited nodes",
+      "note": "Multi-LoRA genuinely costs more -- four extra nodes that a single-adapter or non-LoRA customer never sees. Budgeted separately rather than hidden in one averaged number. Minutes raised to accommodate graph_capture, whose single launch pays a ~40 min compile that no other node pays."
+    },
+    "skip_semantics": "A node is not executed when status != 'active' OR applicable_when evaluates false. In both cases the traverser follows its on_keep edge straight through. This keeps TODO and inapplicable nodes wired into the spine so enabling one is a predicate or status change, not a rewiring."
+  },
+  "probes": {
+    "goodput": {
+      "cost": "1 measurement window",
+      "runs_on": "every node"
+    },
+    "equivalence": {
+      "cost": "seconds",
+      "runs_on": "lossless nodes only",
+      "note": "greedy generations compared against the incumbent's. Detects an accidentally-lossy change without paying for a benchmark."
+    },
+    "quality": {
+      "cost": "3-6 min",
+      "runs_on": "lossy nodes only",
+      "traversal_set": "pinned 100-item subset per benchmark",
+      "finalist_set": "full public dataset, or 1000+ if the user supplies a custom eval set",
+      "report": "point estimate with confidence interval; state the resolution the sample size buys"
+    }
+  },
+  "benchmarks": [
+    {
+      "id": "humaneval_plus",
+      "metric": "pass@1",
+      "scoring": "test execution, greedy decode",
+      "why": "code breaks on a single wrong token - highest sensitivity per sample to quantization damage",
+      "n_full": 164
+    },
+    {
+      "id": "math_500",
+      "metric": "exact_match",
+      "scoring": "final boxed answer",
+      "why": "long reasoning chains, genuine headroom at 9B scale",
+      "n_full": 500
+    },
+    {
+      "id": "ruler_multineedle",
+      "metric": "accuracy",
+      "scoring": "exact string match of all needles",
+      "contexts": [
+        16384,
+        32768
+      ],
+      "why": "probes exactly what KV-cache quantization damages; vanilla NIAH saturates at 1.00 and cannot",
+      "n_full": 200
+    }
+  ],
+  "nodes": [
+    {
+      "id": "incumbent",
+      "title": "Stage 1 result",
+      "class": "root",
+      "status": "active",
+      "requires": [],
+      "cost_launches": 0,
+      "note": "No work. The predictor's config, already measured twice in stage 1.3. Parallelism, CUDA graphs, KV fraction and max token capacity were decided there and are deliberately NOT revisited here - AIConfigurator models them, this DAG does not. When fingerprint.lora.n_adapters <= 1 every LoRA node below evaluates its predicate false and the traverser falls straight through to max_model_len_rightsize at zero cost.",
+      "on_keep": [
+        "lora_serve_strategy"
+      ],
+      "on_revert": []
+    },
+    {
+      "id": "lora_serve_strategy",
+      "title": "Multi-LoRA vs merged replicas",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "incumbent"
+      ],
+      "applicable_when": "fingerprint.lora.n_adapters > 1 and (fingerprint.lora.n_adapters * fingerprint.model.weight_gb) <= (fingerprint.hw.memory_gb * 0.6)",
+      "rationale": "N merged replicas cost N x weight memory but delete every LoRA kernel AND restore a valid performance predictor per model. For small N on a small model that can beat 1 base + N adapters outright. Only offered when the replicas actually fit.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "lora_strategy": "merged_replicas"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "max_model_len_rightsize"
+      ],
+      "on_revert": [
+        "lora_max_rank"
+      ],
+      "scenario": "multi_lora"
+    },
+    {
+      "id": "lora_max_rank",
+      "title": "Right-size max LoRA rank",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "lora_serve_strategy"
+      ],
+      "applicable_when": "fingerprint.lora.n_adapters > 1",
+      "rationale": "Rank buffers are allocated to the declared maximum. Declaring 64 when every adapter is rank 8 wastes memory that KV blocks could use. Same shape of win as right-sizing the context window.",
+      "action": {
+        "set": {
+          "max_lora_rank": "fingerprint.lora.max_rank"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "lora_max_loras"
+      ],
+      "on_revert": [
+        "lora_max_loras"
+      ],
+      "scenario": "multi_lora"
+    },
+    {
+      "id": "lora_max_loras",
+      "title": "Adapters resident per batch",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "lora_max_rank"
+      ],
+      "applicable_when": "fingerprint.lora.n_adapters > 1",
+      "rationale": "How many distinct adapters a single batch may mix. Higher means requests for different adapters batch together instead of serializing; it also costs memory. The right value follows the request distribution, so sweep around it rather than guessing.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "max_loras": 2
+        },
+        {
+          "max_loras": 8
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "lora_cpu_cache"
+      ],
+      "on_revert": [
+        "lora_cpu_cache"
+      ],
+      "scenario": "multi_lora",
+      "sweep_note": "bracketed, same reasoning"
+    },
+    {
+      "id": "lora_cpu_cache",
+      "title": "CPU-side adapter cache",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "lora_max_loras"
+      ],
+      "applicable_when": "fingerprint.lora.n_adapters > fingerprint.lora.max_loras_gpu_resident",
+      "rationale": "Adapters not resident on GPU are swapped in on demand. A CPU cache turns a cold-adapter request from a disk read into a host-to-device copy. Only matters when there are more adapters than GPU slots.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "max_cpu_loras": 16
+        },
+        {
+          "max_cpu_loras": 32
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "max_model_len_rightsize"
+      ],
+      "on_revert": [
+        "max_model_len_rightsize"
+      ],
+      "scenario": "multi_lora"
+    },
+    {
+      "id": "max_model_len_rightsize",
+      "title": "Right-size the context window",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "lora_cpu_cache"
+      ],
+      "applicable_when": "fingerprint.model.max_model_len > 1.5 * (workload.p999_input_tokens + workload.p99_output_tokens)",
+      "rationale": "Every unused position of context costs KV blocks that could hold real sequences. Cheapest structural win in the tree and routinely left on the table.",
+      "action": {
+        "set": {
+          "max_model_len": "ceil(workload.p999_input_tokens + workload.p99_output_tokens, 1024)"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "chunked_prefill"
+      ],
+      "on_revert": [
+        "chunked_prefill"
+      ]
+    },
+    {
+      "id": "chunked_prefill",
+      "title": "Chunked prefill",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "max_model_len_rightsize"
+      ],
+      "applicable_when": "workload.p99_input_tokens > 1024",
+      "rationale": "Interleaves prefill with decode, trading TTFT against ITL. Only meaningful when prompts are long enough for prefill to block decode.",
+      "action": {
+        "set": {
+          "enable_chunked_prefill": true
+        }
+      },
+      "sweep": [
+        {
+          "max_num_batched_tokens": 2048
+        },
+        {
+          "max_num_batched_tokens": 8192
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "prefix_caching"
+      ],
+      "on_revert": [
+        "prefix_caching"
+      ],
+      "sweep_note": "bracketed: 3rd interior point cost a launch and rarely moved the decision"
+    },
+    {
+      "id": "prefix_caching",
+      "title": "Prefix caching",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "chunked_prefill"
+      ],
+      "applicable_when": "workload.prefix_overlap_per_adapter > 0.05",
+      "rationale": "Pure win when prompts share prefixes, pure overhead when they do not. Under multi-LoRA the cache is keyed by (prefix, lora_id), so N adapters fragment the hit rate N ways -- the predicate uses PER-ADAPTER overlap, never the global number, which would enable caching on the strength of sharing that does not exist in practice.",
+      "action": {
+        "set": {
+          "enable_prefix_caching": true
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "kv_block_size"
+      ],
+      "on_revert": [
+        "kv_block_size"
+      ]
+    },
+    {
+      "id": "kv_block_size",
+      "title": "KV block size",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "prefix_caching"
+      ],
+      "applicable_when": "workload.p99_input_tokens > 4096",
+      "rationale": "Larger blocks cut paging overhead but coarsen allocation and waste tail memory. Only matters once sequences are long.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "block_size": 32
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "spec_decode_ngram"
+      ],
+      "on_revert": [
+        "spec_decode_ngram"
+      ]
+    },
+    {
+      "id": "spec_decode_ngram",
+      "title": "Speculative decoding, n-gram proposer",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "kv_block_size"
+      ],
+      "applicable_when": "workload.mean_output_tokens > 64",
+      "rationale": "Rejection sampling preserves the target distribution, so this is distributionally lossless. Needs no draft model. Helps decode only - pointless on prefill-dominated traffic. Gated on mean OUTPUT LENGTH rather than the decode token fraction: the token ratio understates decode's share of wall clock by roughly two orders of magnitude, so a 0.4 token-ratio threshold would exclude workloads that are overwhelmingly decode-bound in time.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "speculative_config": {
+            "method": "ngram",
+            "num_speculative_tokens": 3,
+            "prompt_lookup_max": 4
+          }
+        },
+        {
+          "speculative_config": {
+            "method": "ngram",
+            "num_speculative_tokens": 5,
+            "prompt_lookup_max": 8
+          }
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "diagnostics": [
+        "spec_acceptance_rate",
+        "spec_tokens_per_draft"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "spec_decode_depth"
+      ],
+      "on_revert": [
+        "spec_decode_draft"
+      ]
+    },
+    {
+      "id": "spec_decode_draft",
+      "title": "Speculative decoding, draft model",
+      "class": "lossless",
+      "status": "todo",
+      "requires": [
+        "spec_decode_ngram"
+      ],
+      "applicable_when": "fingerprint.model.has_compatible_draft and measurements.spec_decode_ngram.spec_acceptance_rate < 0.6 and not fingerprint.lora.multi_lora_active",
+      "rationale": "Reached only when n-gram acceptance was poor. Gated off under multi-LoRA: the draft must approximate the ADAPTED target, so acceptance collapses against a domain-adapted model and you would need one draft per adapter. n-gram is unaffected because it never models the network at all. Valid again once merged.",
+      "todo": "Requires a draft-model registry per target model. Deferred with NVFP4.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "spec_decode_depth"
+      ],
+      "on_revert": [
+        "graph_capture"
+      ]
+    },
+    {
+      "id": "spec_decode_depth",
+      "title": "Speculative depth refinement",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "spec_decode_ngram"
+      ],
+      "applicable_when": "measurements.spec_decode_ngram.kept or measurements.spec_decode_draft.kept",
+      "rationale": "Acceptance rate and optimal depth trade off directly: deeper speculation wins more per hit and wastes more per miss. Refine only after a proposer has proven itself.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "speculative_config.num_speculative_tokens": 7
+        },
+        {
+          "speculative_config.num_speculative_tokens": 2
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "graph_capture"
+      ],
+      "on_revert": [
+        "graph_capture"
+      ]
+    },
+    {
+      "id": "graph_capture",
+      "title": "CUDA graphs / torch.compile",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "spec_decode_depth"
+      ],
+      "applicable_when": null,
+      "rationale": "Deliberately LAST in the lossless branch and deliberately its own node. Compilation is expensive (~30 min on GB10) and keyed on shapes, so a cache warmed at one max_num_seqs is invalidated by the next sweep value -- paying it per node would cost more than the whole search. Every earlier node runs eager, then this one tests compilation ONCE against the config they accumulated. It also belongs here for a second reason: the compile is worth most on the final shapes, not on shapes that are about to change.",
+      "action": {
+        "set": {
+          "enforce_eager": false
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "cost_minutes_hint": 40,
+      "on_keep": [
+        "lossless_complete"
+      ],
+      "on_revert": [
+        "lossless_complete"
+      ]
+    },
+    {
+      "id": "lossless_complete",
+      "title": "Lossless frontier checkpoint",
+      "class": "checkpoint",
+      "status": "active",
+      "requires": [
+        "graph_capture"
+      ],
+      "cost_launches": 1,
+      "note": "Emit the lossless frontier before entering the lossy branch -- if the budget guard fires, the run still delivers a complete result here.\n\nALSO measures the quality tolerance, for free in the useful sense: lossless nodes cannot move quality by definition, so the difference between quality here and quality at stage 1.3 IS the noise, and it spans the whole lossless traversal -- every launch, config change and thermal state in between, which is exactly the variation the lossy gate has to survive. A dedicated repeat would measure less.\n\nBudgeted at 1 launch conservatively. When the preceding node was KEPT, the live server already holds the incumbent config and the probe is free; only a REVERTED predecessor requires a relaunch, since its server holds a rejected config rather than the incumbent.",
+      "on_keep": [
+        "kv_cache_fp8"
+      ],
+      "on_revert": [
+        "kv_cache_fp8"
+      ],
+      "probes": [
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500",
+        "ruler_multineedle"
+      ],
+      "reuse_server_if": "previous_node.kept",
+      "on_measure": "If the quality delta exceeds what per_token_flip_rate predicts, something in the lossless branch was not lossless. Stop and report rather than entering the lossy branch on a corrupted incumbent.",
+      "quality_benchmarks_todo": [
+        "humaneval_plus (needs a sandboxed pass@1 runner)"
+      ]
+    },
+    {
+      "id": "kv_cache_fp8",
+      "title": "FP8 KV cache",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "lossless_complete"
+      ],
+      "applicable_when": "fingerprint.hw.supports_fp8",
+      "rationale": "Entered first in the lossy branch because it has the best gain-to-damage ratio: roughly halves KV memory, touches no weights, and the damage is concentrated in long-context recall where RULER can see it.",
+      "action": {
+        "set": {
+          "kv_cache_dtype": "fp8_e4m3"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "ruler_multineedle",
+        "math_500"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "retune_batching_after_kv"
+      ],
+      "on_revert": [
+        "lora_unmerge_for_weight_quant"
+      ],
+      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all."
+    },
+    {
+      "id": "retune_batching_after_kv",
+      "title": "Re-tune batching after freeing KV memory",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "kv_cache_fp8"
+      ],
+      "applicable_when": "measurements.kv_cache_fp8.kept",
+      "rationale": "THE interaction node. Halving KV memory changes where batching saturates, so the concurrency chosen in stage 1 is now wrong. This is a distinct forward node, not a back-edge - the graph stays acyclic and the state machine stays deterministic.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "max_num_seqs": "incumbent.max_num_seqs * 1.5"
+        },
+        {
+          "max_num_seqs": "incumbent.max_num_seqs * 2.0"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "lora_unmerge_for_weight_quant"
+      ],
+      "on_revert": [
+        "lora_unmerge_for_weight_quant"
+      ]
+    },
+    {
+      "id": "lora_unmerge_for_weight_quant",
+      "title": "Un-merge to reach published quantized checkpoints",
+      "class": "lossy",
+      "status": "active",
+      "scenario": null,
+      "requires": [
+        "retune_batching_after_kv"
+      ],
+      "applicable_when": "preconditions.merge_verification.merged and fingerprint.lora.adapter_retained and (fingerprint.model.can_quantize_fp8 or fingerprint.model.can_quantize_int4_awq)",
+      "rationale": "Two reasons, and the first is structural rather than about quality. (1) v1 quantizes only from PUBLISHED checkpoints, and those are of the original base model -- once an adapter is merged the served weights match no published checkpoint, so the entire weight-quantization branch becomes unreachable without calibration. Serving unmerged over a published quantized base restores it. (2) It is also the arrangement where a BF16 adapter sits above quantized weights and can partially compensate for quantization error, which is the QLoRA serving shape. The merge gate in stage 0 was decided at BF16 and cannot see either effect.",
+      "action": {
+        "set": {
+          "lora_strategy": "unmerged_over_quantized_base"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500"
+      ],
+      "cost_launches": 1,
+      "cost_note": "1 launch, not 2 -- the merged arm was already measured by the incumbent at this point in the traversal, so only the alternative needs running.",
+      "on_keep": [
+        "weight_fp8"
+      ],
+      "on_revert": [
+        "frontier"
+      ],
+      "revert_note": "Reverting means staying merged, which leaves no published checkpoint to quantize from. The lossy branch ends here with KV quantization already applied; weight quantization needs the calibration pipeline (see future.conversion_pipeline).",
+      "quality_benchmarks_todo": [
+        "humaneval_plus (needs a sandboxed pass@1 runner)"
+      ]
+    },
+    {
+      "id": "weight_fp8",
+      "title": "FP8 weights",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "lora_unmerge_for_weight_quant"
+      ],
+      "applicable_when": "fingerprint.model.can_quantize_fp8 and (fingerprint.lora.n_adapters == 0 or measurements.lora_unmerge_for_weight_quant.kept)",
+      "rationale": "First rung of the precision ladder. Halves weight bandwidth, which is the dominant cost in memory-bound decode.",
+      "constraint": "No artifact and no conversion time: vLLM quantizes the bf16 weights to FP8 during model load. Works on the CUSTOMER'S OWN model -- nothing is downloaded.",
+      "action": {
+        "set": {
+          "quantization": "fp8"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500",
+        "ruler_multineedle"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "weight_int4_awq"
+      ],
+      "on_revert": [
+        "weight_int4_awq"
+      ],
+      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all. If the adapter was merged upstream, note that merging into an already-quantized base is a distinct lossy step: merge into the BF16 base first, then quantize the merged model -- never quantize then merge.",
+      "checkpoint_constraint": "The published checkpoint is of the ORIGINAL base model. It is only usable when the served weights are still the base -- i.e. no LoRA, or LoRA served unmerged on top. A merged model needs calibration, which v1 does not do.",
+      "quality_benchmarks_todo": [
+        "humaneval_plus (needs a sandboxed pass@1 runner)"
+      ],
+      "cost_minutes_hint": 0
+    },
+    {
+      "id": "weight_int4_awq",
+      "title": "INT4 weights (AWQ)",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "weight_fp8"
+      ],
+      "applicable_when": "fingerprint.model.can_quantize_int4_awq and (fingerprint.lora.n_adapters == 0 or measurements.lora_unmerge_for_weight_quant.kept)",
+      "rationale": "Second rung. Largest memory win available, and the first point where quality damage is usually visible rather than marginal - which is exactly why it belongs on the frontier as an operating point rather than as a default.",
+      "constraint": "Produced LOCALLY from the served checkpoint by llmcompressor, calibrated on the user's own trace. Never a published -AWQ repo: the customer's model has none, and measuring someone else's would benchmark their calibration job.",
+      "action": {
+        "set": {
+          "quantize": "int4_awq"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500",
+        "ruler_multineedle"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "weight_nvfp4"
+      ],
+      "on_revert": [
+        "weight_nvfp4"
+      ],
+      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all. If the adapter was merged upstream, note that merging into an already-quantized base is a distinct lossy step: merge into the BF16 base first, then quantize the merged model -- never quantize then merge.",
+      "checkpoint_constraint": "The published checkpoint is of the ORIGINAL base model. It is only usable when the served weights are still the base -- i.e. no LoRA, or LoRA served unmerged on top. A merged model needs calibration, which v1 does not do.",
+      "quality_benchmarks_todo": [
+        "humaneval_plus (needs a sandboxed pass@1 runner)"
+      ],
+      "cost_minutes_hint": 35
+    },
+    {
+      "id": "weight_nvfp4",
+      "title": "NVFP4 weights",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "weight_int4_awq"
+      ],
+      "applicable_when": "fingerprint.model.can_quantize_nvfp4 and (fingerprint.lora.n_adapters == 0 or measurements.lora_unmerge_for_weight_quant.kept)",
+      "rationale": "Blackwell-class FP4 with hardware support. Expected to dominate INT4 on both speed and quality where the silicon supports it.",
+      "action": {
+        "set": {
+          "quantize": "nvfp4"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500",
+        "ruler_multineedle"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "retune_batching_after_weight"
+      ],
+      "on_revert": [
+        "retune_batching_after_weight"
+      ],
+      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all. If the adapter was merged upstream, note that merging into an already-quantized base is a distinct lossy step: merge into the BF16 base first, then quantize the merged model -- never quantize then merge.",
+      "quality_benchmarks_todo": [
+        "humaneval_plus (needs a sandboxed pass@1 runner)"
+      ],
+      "constraint": "Blackwell-native FP4, produced locally like int4_awq. Needs cc>=10.",
+      "cost_minutes_hint": 35
+    },
+    {
+      "id": "retune_batching_after_weight",
+      "title": "Re-tune batching after weight quantization",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "weight_int4_awq"
+      ],
+      "applicable_when": "measurements.weight_fp8.kept or measurements.weight_int4_awq.kept or measurements.weight_nvfp4.kept",
+      "rationale": "Second interaction node, same reason as the first: quantized weights free memory and shift the arithmetic intensity, so the batching optimum moves again.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "max_num_seqs": "incumbent.max_num_seqs * 1.5"
+        },
+        {
+          "max_num_seqs": "incumbent.max_num_seqs * 2.0"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "frontier"
+      ],
+      "on_revert": [
+        "frontier"
+      ]
+    },
+    {
+      "id": "frontier",
+      "title": "Emit the Pareto frontier",
+      "class": "terminal",
+      "status": "active",
+      "requires": [
+        "retune_batching_after_weight"
+      ],
+      "cost_launches": 0,
+      "note": "Compute the true non-dominated set over (quality, goodput, ttft_p99, memory_gb) across EVERY measurement taken, including reverted ones. Re-run quality on the 2-3 frontier candidates against the full benchmark sets, report with confidence intervals, and hand the user the operating points."
+    }
+  ],
+  "future": {
+    "stage_3_gepa_nodes": [
+      "custom kernel generation for an operator the profiler flags as dominant",
+      "admission control and queueing policy as a written program rather than a flag",
+      "replacing applicable_when predicates with a reasoner that reads diagnostics and skips nodes the profile says cannot help - measurable as: same frontier, fewer launches"
+    ],
+    "conversion_pipeline": "baseline -> FP8 / INT4 / NVFP4 for customer-supplied models, offline, outside the 2-3h budget"
+  },
+  "preconditions": {
+    "lora_single_adapter_is_merged_upstream": "When fingerprint.lora.n_adapters == 1, stage 0 merges the adapter into the base weights before stage 1.2, because the merged model is architecturally identical to the base -- same GEMM shapes, no SGMV kernels -- which makes the performance predictor valid again and removes LoRA from the serving path entirely.\n\nEQUIVALENCE CLASS: quality-equivalent (VERIFY), not strictly equivalent. (W0 + BA)x == W0x + BAx holds algebraically (LoRA, arXiv 2106.09685), but the merged weights are rounded back to the storage dtype on save while the unmerged path accumulates separately, so outputs are NOT bitwise identical. No paper establishes identical held-out task performance for single-adapter merge; the merge literature (TIES/DARE-TIES, LoRI, Compress-then-Merge) studies merging MULTIPLE adapters together, which is a different and demonstrably lossy operation. Merging into a QUANTIZED base is separately lossy -- W0+BA cannot be represented in the quantized format without a second re-quantization step.\n\nTherefore stage 0 must VERIFY the merge rather than assume it: run the equivalence probe and one quality benchmark on merged vs unmerged, once. Record the delta. If it exceeds the measured band, serve unmerged and let the multi-LoRA subtree run instead.",
+    "merge_verification": {
+      "when": "fingerprint.lora.n_adapters == 1",
+      "compare": "merged vs unmerged, same seed, same prompts",
+      "probes": [
+        "equivalence",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "humaneval_plus",
+        "math_500"
+      ],
+      "cost_launches": 2,
+      "accept": "divergence within the measured band AND quality delta within its confidence interval",
+      "on_fail": "serve unmerged; enable the multi_lora subtree; report the merge delta to the user",
+      "note": "Two launches in stage 0, not stage 2 -- it gates whether the rest of the run even applies. Charged to stage 1's budget."
+    }
+  }
+}
