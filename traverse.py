@@ -100,7 +100,8 @@ class Evaluator(Protocol):
     def measure(self, config: dict[str, Any], *, probes: list[str],
                 benchmarks: list[str], node_id: str,
                 concurrency: int | None = None,
-                also_at: list[int] | None = None) -> Trial: ...
+                levels: tuple[int, ...] | list[int] | None = None,
+                fixed_concurrency: int | None = None) -> Trial: ...
 
 
 @dataclass
@@ -186,7 +187,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              *, log=print, lossless_only: bool = False,
              journal: str | Path | None = None,
              baseline: Trial | None = None,
-             concurrency: int | None = None) -> Result:
+             concurrency: int | None = None,
+             fixed_concurrency: int | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
 
     `journal` is a path to APPEND every Trial to as it completes; the caller
@@ -241,7 +243,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # the first node be kept for free. Costs one launch and makes every
         # keep/revert decision in the run comparable.
         t = evaluator.measure(incumbent_cfg, probes=["goodput"], benchmarks=[],
-                              node_id="incumbent", concurrency=concurrency)
+                              node_id="incumbent", concurrency=concurrency,
+                              fixed_concurrency=fixed_concurrency)
         # Same inheritance as any lossless node. Without it the incumbent lands
         # on the frontier plot with no accuracy coordinate and is silently
         # dropped from the quality view.
@@ -309,7 +312,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             # point it measures at. It moves whenever a node is kept -- see
             # below. Anchoring it permanently to the seed is what broke run five.
             t = evaluator.measure(var, probes=probes, benchmarks=benches, node_id=cur,
-                                  concurrency=concurrency)
+                                  concurrency=concurrency,
+                                  fixed_concurrency=fixed_concurrency)
             # Every point needs a quality coordinate for the frontier plot. A
             # lossless node cannot move quality -- that is what makes it
             # lossless, and the equivalence probe verifies it -- so it inherits
@@ -383,7 +387,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 # kept node's peak IS the new operating point -- and the next
                 # node's bracket must be centred there or it re-measures the old
                 # config's range and cannot see any further improvement.
-                if best.concurrency and best.concurrency != concurrency:
+                if (not fixed_concurrency and best.concurrency
+                        and best.concurrency != concurrency):
                     log(f"         operating point {concurrency} -> {best.concurrency} "
                         f"(kept config sustains more)")
                     concurrency = best.concurrency

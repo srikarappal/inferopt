@@ -193,9 +193,11 @@ def cmd_optimize(args) -> int:
         # levels=SWEEP_LEVELS makes this one launch do both jobs: measure the
         # baseline AND characterise capacity across the full geometric range.
         from evaluator import SWEEP_LEVELS
+        sweep_off = args.skip_sweep or args.fixed_concurrency
         t = ev.measure(cfg, probes=["goodput", "equivalence", "quality"],
                        benchmarks=BASELINE_BENCHMARKS, node_id="stage_1_3",
-                       levels=None if args.skip_sweep else SWEEP_LEVELS)
+                       levels=None if sweep_off else SWEEP_LEVELS,
+                       fixed_concurrency=args.fixed_concurrency)
         if t.diagnostics.get("launch_error"):
             # A launch failure is NOT an SLO failure. Reporting inf ttft as
             # "does not satisfy the SLO" sends you to tune a threshold when the
@@ -277,6 +279,11 @@ def cmd_optimize(args) -> int:
         # each other. The baseline Trial now carries both the curve and the peak.
         curve = baseline.curve
         operating_L = baseline.concurrency
+        if args.fixed_concurrency:
+            print(f"  concurrency PINNED at {args.fixed_concurrency} "
+                  f"(--fixed-concurrency): open-loop driver, no sweep, no bracket.\n"
+                  f"  This is run four's instrument. Numbers are comparable to that "
+                  f"run and NOT to a swept run.\n")
         if curve:
             pk = max(curve, key=lambda m: m["goodput"])
             capacity_toks = pk["goodput"]
@@ -305,7 +312,8 @@ def cmd_optimize(args) -> int:
     dag = json.loads(Path(args.dag).read_text())
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
                    journal=journal, baseline=baseline,
-                   concurrency=operating_L)
+                   concurrency=operating_L,
+                   fixed_concurrency=args.fixed_concurrency)
 
     # Full sweep on the finalists. The traversal ranks configs at one operating
     # point, which is enough to CHOOSE between them -- most goodput curves sit
@@ -313,7 +321,7 @@ def cmd_optimize(args) -> int:
     # own curve is what sets capacity and therefore the replica count, so the
     # configs anyone might actually deploy get measured properly.
     finalist_curves = {}
-    if not args.skip_sweep and not args.no_finalist_sweep:
+    if not args.skip_sweep and not args.no_finalist_sweep and not args.fixed_concurrency:
         finalists = res.frontier()[: args.finalists]
         if finalists:
             print(f"\n  sweeping {len(finalists)} frontier finalist(s) for capacity\n")
@@ -378,6 +386,13 @@ def main() -> int:
     o.add_argument("--budget-minutes", type=int, default=180)
     o.add_argument("--skip-predict", action="store_true",
                    help="skip stage 1.2 and use the conservative seed")
+    o.add_argument("--fixed-concurrency", type=int, default=None, metavar="N",
+                   help="measure every node at exactly N in-flight requests using "
+                        "the open-loop driver, with no sweep and no bracket. This is "
+                        "the instrument run four used (N=30). Use it to reproduce a "
+                        "previous run, or when the production arrival rate is known "
+                        "and you want that specific operating point rather than the "
+                        "peak of the curve.")
     o.add_argument("--no-finalist-sweep", action="store_true",
                    help="skip the per-finalist capacity sweeps at the end")
     o.add_argument("--finalists", type=int, default=3,

@@ -180,6 +180,30 @@ def main() -> int:
           f"wide L={high.concurrency} of {sorted(c['concurrency'] for c in high.curve)} "
           f"-- a peak at the top edge means the search stopped before finding it")
 
+    print("\n=== aggregate(): worst case in BOTH directions ===")
+    a = {"goodput": 200.0, "ttft_p99_ms": 400.0, "slo_attainment": 1.0, "concurrency": 30}
+    b = {"goodput": 150.0, "ttft_p99_ms": 900.0, "slo_attainment": 0.8, "concurrency": 30}
+    agg = ev.aggregate([a, b])
+    check("goodput takes the LOWER of two passes", agg["goodput"] == 150.0, str(agg))
+    check("ttft takes the HIGHER of two passes -- min() here reported the better "
+          "latency, backwards for an SLO gate", agg["ttft_p99_ms"] == 900.0, str(agg))
+    check("concurrency is excluded from the aggregate", "concurrency" not in agg)
+
+    print("\n=== --fixed-concurrency: run-four reproduction path ===")
+    ev.WINDOW_S = 0.5
+    fx = e.measure({"cfg": "pinned"}, probes=["goodput"], benchmarks=[],
+                   node_id="pinned", fixed_concurrency=24)
+    check("measure() returns on the fixed-concurrency path", fx is not None)
+    check("it measures at exactly the pinned L", fx.concurrency == 24,
+          f"got {fx.concurrency}")
+    check("no sweep happened (curve is empty)", fx.curve == [],
+          f"curve has {len(fx.curve)} points -- the sweep was not skipped")
+    check("the mode is recorded on the trial",
+          fx.diagnostics.get("mode") == "fixed_concurrency_open_loop",
+          f"mode={fx.diagnostics.get('mode')}")
+    check("goodput <= throughput on this path too",
+          fx.goodput <= fx.diagnostics["throughput"] + 1e-6)
+
     print("\n=== traverse(): full walk, operating point must follow the incumbent ===")
     PEAK_L = 32
     import json

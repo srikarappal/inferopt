@@ -96,6 +96,31 @@ SETTLE_S = 20.0        # floor; the real value is derived per model, see below
 SETTLE_MAX_S = 75.0    # ceiling, so a slow model cannot make the sweep unbounded
 SWEEP_WINDOW_S = 45.0
 SWEEP_LEVELS = (4, 8, 16, 32, 64, 128, 256)
+WINDOW_S = 45.0        # open-loop window, used by --fixed-concurrency
+REPEATS = 2
+
+# Which direction is "worse" for each metric. Aggregating passes with a blanket
+# min() is conservative for goodput and OPTIMISTIC for latency -- it reports the
+# better of two TTFT samples, which is exactly backwards for a gate that decides
+# whether an SLO was met.
+LOWER_IS_BETTER = {"ttft_p99_ms", "itl_p99_ms", "failed", "window_s"}
+
+
+def aggregate(passes: list[dict]) -> dict:
+    """Worst value across passes, per metric direction.
+
+    The gate asks "is this reliably better", so every metric is taken at its
+    least flattering observed value: min for goodput and throughput, max for
+    TTFT and ITL. `concurrency` is excluded -- the smaller of two identical L
+    values is meaningless and it is carried on the Trial separately.
+    """
+    out = {}
+    for k, v in passes[0].items():
+        if k == "concurrency" or not isinstance(v, (int, float)):
+            continue
+        vals = [p[k] for p in passes if k in p]
+        out[k] = max(vals) if k in LOWER_IS_BETTER else min(vals)
+    return out
 
 
 class LaunchError(RuntimeError):
@@ -527,7 +552,8 @@ class VllmEvaluator:
     def measure(self, config: dict[str, Any], *, probes: list[str],
                 benchmarks: list[str], node_id: str,
                 concurrency: int | None = None,
-                levels: tuple[int, ...] | list[int] | None = None) -> Trial:
+                levels: tuple[int, ...] | list[int] | None = None,
+                fixed_concurrency: int | None = None) -> Trial:
         """Measure one config.
 
         `concurrency` is the operating point found by the stage 1.3 sweep. Every
@@ -553,6 +579,80 @@ class VllmEvaluator:
                 self.log(f"        {el()} healthy, warming up {WARMUP_S:.0f}s")
                 asyncio.run(_load(self.base_url, model, self.prompts,
                                   self.max_tokens, self.qps, self.conc, WARMUP_S))
+
+                if fixed_concurrency:
+                    # RUN-FOUR REPRODUCTION MODE.
+                    #
+                    # The exact instrument run four used: open loop at the
+                    # trace's arrival rate with a semaphore cap, a fixed 45s
+                    # window, REPEATS passes, no bracket and no sweep. Kept as a
+                    # first-class mode rather than a historical curiosity --
+                    # when the production arrival rate IS known, measuring at it
+                    # is the right thing to do, and reproducing a previous
+                    # measurement is how you tell a code change from a real one.
+                    #
+                    # Under saturation the semaphore is always full, so this is
+                    # close to closed loop at the same L; the difference is that
+                    # the window opens on a drained server rather than a settled
+                    # one.
+                    conc = fixed_concurrency
+                    passes, pts = [], []
+                    for i in range(REPEATS):
+                        reqs, t0, t1, offered, started = asyncio.run(
+                            _load(self.base_url, model, self.prompts,
+                                  self.max_tokens, self.qps, conc, WINDOW_S))
+                        m = summarize(reqs, t0, t1, self.slo)
+                        m["concurrency"] = conc
+                        passes.append(m)
+                        self.log(f"        {el()} pass {i+1}/{REPEATS}  "
+                                 f"goodput {m['goodput']:7.1f} tok/s "
+                                 f"({m['goodput_req_s']:.2f} req/s)  "
+                                 f"thru {m['throughput']:7.1f}  "
+                                 f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  "
+                                 f"slo {m['slo_attainment']:.0%}  "
+                                 f"({m['completed']} ok/{m['failed']} fail, "
+                                 f"{started}/{offered} started)")
+                    med = aggregate(passes)
+                    spread = ((max(p["goodput"] for p in passes)
+                               - min(p["goodput"] for p in passes))
+                              / max(1e-9, abs(min(p["goodput"] for p in passes))))
+                    if spread > 0.10:
+                        self.log(f"        {el()} NOTE pass-to-pass goodput spread "
+                                 f"{spread:.0%} at L={conc} -- larger than the accept "
+                                 f"band, so a keep/revert decision here is not "
+                                 f"resolvable at this sample size")
+                    diag = self._metrics()
+                    div = self._equivalence(model) if "equivalence" in probes else None
+                    if div is not None:
+                        self.log(f"        {el()} equivalence  {div:.1%} of "
+                                 f"first-{self.equiv_k}-token prefixes differ")
+                    qual = {}
+                    if "quality" in probes and benchmarks:
+                        from quality import resolution, run_benchmark
+                        for b in benchmarks:
+                            qual[b] = run_benchmark(
+                                b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
+                                max_input_tokens=config.get("max_model_len"))
+                            self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
+                                     f"(+/- {resolution(b):.1%} resolution)")
+                    mem = self._gpu_memory_gb()
+                    self.log(f"        {el()} done, tearing down")
+                    return Trial(
+                        node_id=node_id, config=dict(config),
+                        goodput=round(med["goodput"], 1),
+                        ttft_p99_ms=round(med["ttft_p99_ms"], 1),
+                        itl_p99_ms=round(med["itl_p99_ms"], 2),
+                        memory_gb=mem, quality=qual, equivalence_divergence=div,
+                        concurrency=conc, curve=[],
+                        diagnostics={**diag,
+                                     "slo_attainment": round(med["slo_attainment"], 3),
+                                     "throughput": round(med["throughput"], 1),
+                                     "goodput_req_s": round(med.get("goodput_req_s", 0.0), 3),
+                                     "throughput_req_s": round(med.get("throughput_req_s", 0.0), 3),
+                                     "completed": med["completed"], "failed": med["failed"],
+                                     "mode": "fixed_concurrency_open_loop"},
+                        slo_ok=med["goodput"] > 0)
+
                 # BRACKET THE PEAK, do not measure at a fixed L.
                 #
                 # Measuring every node at one concurrency is what run five got
@@ -632,12 +732,9 @@ class VllmEvaluator:
                 # has actually won. `concurrency` is excluded -- taking the min of
                 # two identical L values is meaningless and it is carried on the
                 # Trial separately.
-                agg = {k: min(p[k] for p in passes)
-                       for k in passes[0]
-                       if k != "concurrency" and isinstance(passes[0][k], (int, float))}
+                med = aggregate(passes)
                 spread = ((max(p["goodput"] for p in passes) - min(p["goodput"] for p in passes))
                           / max(1e-9, abs(min(p["goodput"] for p in passes))))
-                med = agg
 
                 # A node whose two passes at the SAME concurrency disagree by more
                 # than the accept band cannot be decided by that band: the
