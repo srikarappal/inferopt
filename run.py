@@ -190,8 +190,12 @@ def cmd_optimize(args) -> int:
         # on the final frontier needs an accuracy coordinate, and a lossless
         # node inherits this one -- so without a baseline score the whole
         # quality axis is empty.
+        # levels=SWEEP_LEVELS makes this one launch do both jobs: measure the
+        # baseline AND characterise capacity across the full geometric range.
+        from evaluator import SWEEP_LEVELS
         t = ev.measure(cfg, probes=["goodput", "equivalence", "quality"],
-                       benchmarks=BASELINE_BENCHMARKS, node_id="stage_1_3")
+                       benchmarks=BASELINE_BENCHMARKS, node_id="stage_1_3",
+                       levels=None if args.skip_sweep else SWEEP_LEVELS)
         if t.diagnostics.get("launch_error"):
             # A launch failure is NOT an SLO failure. Reporting inf ttft as
             # "does not satisfy the SLO" sends you to tune a threshold when the
@@ -267,14 +271,24 @@ def cmd_optimize(args) -> int:
         # that does not even typecheck, since qps is 1/time and concurrency is
         # dimensionless. Everything was measured at an arbitrary point on an
         # unnamed curve.
-        if not args.skip_sweep:
-            print(f"  stage 1.3b capacity sweep -- finding the operating point")
-            curve, pk = ev.capacity(cfg, "stage_1_3b_sweep")
-            operating_L = pk["concurrency"]
+        # The sweep happened INSIDE the stage 1.3 launch, via levels=SWEEP_LEVELS.
+        # It used to be a second launch of the identical config: ~9 wasted minutes,
+        # and two independently-derived operating points that could disagree with
+        # each other. The baseline Trial now carries both the curve and the peak.
+        curve = baseline.curve
+        operating_L = baseline.concurrency
+        if curve:
+            pk = max(curve, key=lambda m: m["goodput"])
             capacity_toks = pk["goodput"]
-            print(f"\n  {'-'*68}")
+            print(f"  {'-'*68}")
             print(f"  CAPACITY  one replica, seed config")
             print(f"  {'-'*68}")
+            for m in sorted(curve, key=lambda m: m["concurrency"]):
+                mark = "  <- peak" if m["concurrency"] == operating_L else ""
+                print(f"    L={m['concurrency']:<5d} goodput {m['goodput']:8.1f} tok/s  "
+                      f"thru {m['throughput']:8.1f}  ttft_p99 {m['ttft_p99_ms']:7.0f}ms  "
+                      f"slo {m['slo_attainment']:4.0%}{mark}")
+            print()
             print(f"    peak goodput     {capacity_toks:9.1f} tok/s  at concurrency {operating_L}")
             print(f"    sustainable      {pk.get('goodput_req_s', 0):9.2f} req/s")
             demand = fp.workload.request_rate_qps * fp.workload.mean_output_tokens
@@ -284,12 +298,9 @@ def cmd_optimize(args) -> int:
             import math as _m
             print(f"    replicas needed  {_m.ceil(demand/max(1e-9, capacity_toks)):9d}   "
                   f"= demand / capacity, to serve this workload at the SLO")
-            print(f"    every node below is measured at concurrency {operating_L}")
+            print(f"    nodes start bracketed around L={operating_L}; the bracket "
+                  f"moves with the incumbent")
             print(f"  {'-'*68}\n")
-        else:
-            curve, operating_L = [], None
-            print(f"  stage 1.3b sweep skipped by --skip-sweep; nodes measured at "
-                  f"the fingerprint's concurrency {fp.workload.max_concurrency}\n")
 
     dag = json.loads(Path(args.dag).read_text())
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,

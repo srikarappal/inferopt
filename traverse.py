@@ -240,7 +240,16 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # No stage-1.3 measurement: measure the incumbent here rather than let
         # the first node be kept for free. Costs one launch and makes every
         # keep/revert decision in the run comparable.
-        t = evaluator.measure(incumbent_cfg, probes=["goodput"], benchmarks=[], node_id="incumbent")
+        t = evaluator.measure(incumbent_cfg, probes=["goodput"], benchmarks=[],
+                              node_id="incumbent", concurrency=concurrency)
+        # Same inheritance as any lossless node. Without it the incumbent lands
+        # on the frontier plot with no accuracy coordinate and is silently
+        # dropped from the quality view.
+        if not t.quality and ctx.quality_baseline:
+            t.quality = dict(ctx.quality_baseline)
+            t.quality_inherited = True
+        if t.concurrency:
+            concurrency = t.concurrency
         record(t)
         launches += 1
         trials.append(t)
