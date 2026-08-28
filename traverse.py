@@ -163,7 +163,9 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              journal: str | Path | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
 
-    `journal` is a path to append every Trial to as it completes. It exists
+    `journal` is a path to APPEND every Trial to as it completes; the caller
+    truncates it and writes the stage 1.3 baseline first, so the file holds the
+    whole run. It exists
     because a KeyError in the quality probe once discarded nine launches and two
     hours of measurement: result.json is only written after traverse RETURNS, so
     any exception inside it loses everything. A measurement that cost eight
@@ -184,7 +186,6 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     jpath = Path(journal) if journal else None
     if jpath:
         jpath.parent.mkdir(parents=True, exist_ok=True)
-        jpath.write_text("")
 
     def record(t: Trial) -> None:
         """Append one measurement to the journal immediately.

@@ -168,10 +168,14 @@ def cmd_optimize(args) -> int:
             print(f"  falling back to the conservative seed")
     print(f"\n  seed      {json.dumps(cfg)}\n")
 
+    run_dir = Path(args.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    journal = run_dir / "trials.jsonl"
+    journal.write_text("")          # truncate once, here; traverse only appends
+
     port = free_port(args.port)
     if port != args.port:
         print(f"  port      {args.port} is taken; using {port}")
-    run_dir = Path(args.run_dir)
     ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
 
     ctx = Context(fingerprint=fp, slo=slo, incumbent=cfg)
@@ -204,18 +208,24 @@ def cmd_optimize(args) -> int:
         ctx.incumbent_metrics = NodeMeasurement(
             goodput=t.goodput, ttft_p99_ms=t.ttft_p99_ms, itl_p99_ms=t.itl_p99_ms,
             quality={}, config=cfg)
+        # The baseline every later percentage is computed against. It used to
+        # exist only in the console: stage 1.3 runs before traverse(), so it
+        # missed both the journal and result.json, and after the run there was
+        # no way to say what "+307%" was 307% OF.
+        journal.write_text(json.dumps(t.__dict__, default=str) + "\n")
         print(f"  stage 1.3 goodput {t.goodput:.1f}  ttft_p99 {t.ttft_p99_ms:.0f}ms\n")
 
-    run_dir.mkdir(parents=True, exist_ok=True)
     dag = json.loads(Path(args.dag).read_text())
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
-                   journal=run_dir / 'trials.jsonl')
+                   journal=journal)
     report(res)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     out = run_dir / "result.json"
     out.write_text(json.dumps({
         "fingerprint": fp.model_dump(),
+        "baseline": (ctx.incumbent_metrics.model_dump()
+                     if ctx.incumbent_metrics else None),
         "incumbent": res.incumbent,
         "frontier": [t.__dict__ for t in res.frontier()],
         "trials": [t.__dict__ for t in res.trials],
