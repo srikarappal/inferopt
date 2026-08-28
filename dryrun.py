@@ -126,5 +126,5 @@ if __name__ == "__main__":
     # every frontier percentage prints '--', which is exactly the failure this
     # argument exists to prevent.
     base = ev.measure(ctx.incumbent, probes=["goodput"], benchmarks=[], node_id="stage_1_3")
-    res = traverse(dag, ctx, ev, baseline=base)
+    res = traverse(dag, ctx, ev, baseline=base, concurrency=32)
     report(res)

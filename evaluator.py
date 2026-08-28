@@ -482,6 +482,20 @@ class VllmEvaluator:
                     break
         return curve
 
+    def _point(self, model, L: int, el, label: str = "") -> dict:
+        """One closed-loop measurement at concurrency L on a live server."""
+        asyncio.run(_closed_loop(self.base_url, model, self.prompts,
+                                 self.max_tokens, L, SETTLE_S))
+        reqs, t0, t1 = asyncio.run(_closed_loop(
+            self.base_url, model, self.prompts, self.max_tokens, L, SWEEP_WINDOW_S))
+        m = summarize(reqs, t0, t1, self.slo)
+        m["concurrency"] = L
+        self.log(f"        {el()} L={L:<4d} goodput {m['goodput']:7.1f} tok/s "
+                 f"({m['goodput_req_s']:.2f} req/s)  thru {m['throughput']:7.1f}  "
+                 f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  slo {m['slo_attainment']:.0%}  "
+                 f"({m['completed']} done){'  ' + label if label else ''}")
+        return m
+
     @staticmethod
     def peak(curve: list[dict]) -> dict:
         """The operating point: highest goodput on the curve.
@@ -538,80 +552,70 @@ class VllmEvaluator:
                 self.log(f"        {el()} healthy, warming up {WARMUP_S:.0f}s")
                 asyncio.run(_load(self.base_url, model, self.prompts,
                                   self.max_tokens, self.qps, self.conc, WARMUP_S))
-                conc = concurrency or self.conc
-                passes = []
-                for i in range(REPEATS):
-                    reqs, t0, t1, offered, started = asyncio.run(
-                        _load(self.base_url, model, self.prompts,
-                              self.max_tokens, self.qps, conc, WINDOW_S))
-                    m = summarize(reqs, t0, t1, self.slo)
-                    m["offered"], m["started"] = offered, started
-                    passes.append(m)
-                    # offered >> started means the trace asks for more than the
-                    # server can take. Every config then measures queue depth
-                    # rather than its own behaviour, so keep/revert decisions
-                    # rest on differences between saturated states.
-                    self.log(f"        {el()} pass {i+1}/{REPEATS}  "
-                             f"goodput {m['goodput']:7.1f} tok/s "
-                             f"({m['goodput_req_s']:.2f} req/s)  "
-                             f"thru {m['throughput']:7.1f}  "
-                             f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  "
-                             f"slo {m['slo_attainment']:.0%}  "
-                             f"({m['completed']} ok/{m['failed']} fail, "
-                             f"{started}/{offered} started)")
-                # MIN across passes, not median and definitely not max.
+                # BRACKET THE PEAK, do not measure at a fixed L.
                 #
-                # This was `sorted(...)[len(passes)//2]`, named `med` for median
-                # -- but two samples have no median, and index 1 of two is the
-                # LARGER. Combined with `best = max(variants)` in traverse, a
-                # 2-variant node scored as the max of 4 draws, sitting ~1.5-2
-                # sigma above its true mean. At the 2-4% spread measured on this
-                # rig that is +3-6%, against a 5% accept band: a node with no
-                # real effect could clear the bar on noise alone, and then raise
-                # the incumbent for everything after it.
+                # Measuring every node at one concurrency is what run five got
+                # wrong. L* was found by sweeping the SEED -- a config with
+                # chunked_prefill off and 2598-token prompts, so concurrent
+                # prefills block decode, TTFT crosses the SLO as soon as L rises,
+                # and the sweep terminated at L=4. Every later node was then
+                # measured at a 4 x 9.2 = 37 tok/s ceiling and came back 30.9,
+                # 30.8, 30.8 -- indistinguishable, and 6x below what the same
+                # configs measured at L=30 in run four.
                 #
-                # The gate asks "is this reliably better", so the conservative
-                # estimate is the honest one. A config that wins on its worst
-                # pass has actually won.
-                agg = {k: min(p[k] for p in passes)
-                       for k in passes[0] if isinstance(passes[0][k], (int, float))}
-                spread = {k: (max(p[k] for p in passes) - min(p[k] for p in passes))
-                          / max(1e-9, abs(min(p[k] for p in passes)))
-                          for k in ("goodput",) if k in passes[0]}
-                med = agg
-                # A node whose passes disagree by more than the accept band
-                # cannot be decided by that band: the difference being tested is
-                # smaller than the difference between two runs of the SAME config.
-                gs = spread.get("goodput", 0.0)
-                if gs > 0.10:
-                    self.log(f"        {el()} NOTE pass-to-pass goodput spread {gs:.0%} "
-                             f"-- larger than the accept band, so a keep/revert "
-                             f"decision here is not resolvable at this sample size")
-                # Crossing-prone nodes: measure at the extra levels too, on this
-                # same server. The best point wins, because the question these
-                # nodes answer is "does this help ANYWHERE in the operating
-                # range", not "does it help at exactly L*".
-                extra = []
+                # The error is conceptual, not arithmetic. What these techniques
+                # DO is raise the concurrency the server can sustain. Pinning
+                # them all at the worst config's peak guarantees none of them can
+                # show it. So each node is measured across a bracket and scored
+                # on its PEAK: a config that sustains more concurrency wins by
+                # reaching a higher point, which is exactly the property being
+                # optimised.
+                base_L = concurrency or self.conc
+                levels = sorted({max(2, base_L // 2), base_L, base_L * 2})
+                pts: list[dict] = []
+                for L in levels:
+                    pts.append(self._point(model, L, el))
+
+                # If the best sits at an endpoint the bracket did not contain the
+                # peak; walk outward rather than reporting a boundary as a
+                # maximum. Two steps is enough to cross an octave in each
+                # direction and bounds the cost.
+                for _ in range(2):
+                    best_i = max(range(len(pts)), key=lambda i: pts[i]["goodput"])
+                    if best_i == len(pts) - 1:
+                        nxt = pts[-1]["concurrency"] * 2
+                        if nxt > 1024:
+                            break
+                        self.log(f"        {el()} peak at the top of the bracket, extending to L={nxt}")
+                        pts.append(self._point(model, nxt, el))
+                    elif best_i == 0 and pts[0]["concurrency"] > 2:
+                        nxt = max(2, pts[0]["concurrency"] // 2)
+                        self.log(f"        {el()} peak at the bottom of the bracket, extending to L={nxt}")
+                        pts.insert(0, self._point(model, nxt, el))
+                    else:
+                        break
+
+                peak = max(pts, key=lambda m: m["goodput"])
+                conc = peak["concurrency"]
+                self.log(f"        {el()} peak goodput {peak['goodput']:.1f} tok/s at L={conc}")
+
+                # A second pass at the peak only. The bracket points establish
+                # WHERE the peak is; the repeat establishes how noisy it is, and
+                # only the peak's noise matters for the keep/revert gate.
+                passes = [peak, self._point(model, conc, el, label="repeat")]
+                # `also_at` is subsumed by the bracket: every node now spans
+                # {L/2, L, 2L} and is scored on its peak, so a crossing curve is
+                # caught for free rather than needing a special case. The
+                # parameter is kept so callers do not break; extra levels are
+                # merged into the same peak search.
                 for L2 in (also_at or []):
-                    asyncio.run(_closed_loop(self.base_url, model, self.prompts,
-                                             self.max_tokens, L2, SETTLE_S))
-                    r2, a2, b2 = asyncio.run(_closed_loop(
-                        self.base_url, model, self.prompts, self.max_tokens,
-                        L2, SWEEP_WINDOW_S))
-                    m2 = summarize(r2, a2, b2, self.slo)
-                    m2["concurrency"] = L2
-                    extra.append(m2)
-                    self.log(f"        {el()} also at L={L2:<4d} goodput {m2['goodput']:7.1f}  "
-                             f"ttft_p99 {m2['ttft_p99_ms']:6.0f}ms  "
-                             f"slo {m2['slo_attainment']:.0%}")
-                if extra:
-                    best_extra = max(extra, key=lambda m: m["goodput"])
-                    if best_extra["goodput"] > med["goodput"]:
-                        self.log(f"        {el()} L={best_extra['concurrency']} beats "
-                                 f"L={conc} ({best_extra['goodput']:.1f} vs "
-                                 f"{med['goodput']:.1f}) -- this node's curve crosses")
-                        med = best_extra
-                        conc = best_extra["concurrency"]
+                    if L2 not in [m["concurrency"] for m in pts]:
+                        pts.append(self._point(model, L2, el, label="also_at"))
+                extra = pts
+                cand = max(pts, key=lambda m: m["goodput"])
+                if cand["concurrency"] != conc:
+                    conc = cand["concurrency"]
+                    passes = [cand, self._point(model, conc, el, label="repeat")]
 
                 diag = self._metrics()
                 div = None
@@ -643,8 +647,17 @@ class VllmEvaluator:
                      ttft_p99_ms=round(med["ttft_p99_ms"], 1),
                      itl_p99_ms=round(med["itl_p99_ms"], 2),
                      memory_gb=mem, quality=qual, equivalence_divergence=div,
+                     # Both of these were declared on the dataclass, documented,
+                     # and never assigned -- so every trial recorded null and run
+                     # five's operating point had to be back-computed from
+                     # throughput instead of read off the record.
+                     concurrency=conc,
+                     curve=[{k: v for k, v in m.items()
+                             if isinstance(v, (int, float))} for m in pts],
                      diagnostics={**diag, "slo_attainment": round(med["slo_attainment"], 3),
                                   "throughput": round(med["throughput"], 1),
+                                  "goodput_req_s": round(med.get("goodput_req_s", 0.0), 3),
+                                  "throughput_req_s": round(med.get("throughput_req_s", 0.0), 3),
                                   "completed": med["completed"], "failed": med["failed"]},
                      slo_ok=med["goodput"] > 0)
 

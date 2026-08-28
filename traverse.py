@@ -296,11 +296,11 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         for var in variants:
             # Crossing-prone nodes get extra concurrency levels. Everything
             # else is judged at the operating point the stage 1.3 sweep found.
-            also = None
-            if concurrency and node.get("curve_crosses"):
-                also = [max(2, concurrency // 2), concurrency * 2]
+            # `concurrency` anchors a BRACKET the evaluator sweeps, not a fixed
+            # point it measures at. It moves whenever a node is kept -- see
+            # below. Anchoring it permanently to the seed is what broke run five.
             t = evaluator.measure(var, probes=probes, benchmarks=benches, node_id=cur,
-                                  concurrency=concurrency, also_at=also)
+                                  concurrency=concurrency)
             # Every point needs a quality coordinate for the frontier plot. A
             # lossless node cannot move quality -- that is what makes it
             # lossless, and the equivalence probe verifies it -- so it inherits
@@ -369,6 +369,15 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 f"({len(variants)} variant{'s' if len(variants) > 1 else ''})")
             if keep:
                 incumbent_cfg, incumbent_goodput = dict(best.config), best.goodput
+                # The operating point moves with the incumbent. These techniques
+                # work by raising the concurrency the server can sustain, so a
+                # kept node's peak IS the new operating point -- and the next
+                # node's bracket must be centred there or it re-measures the old
+                # config's range and cannot see any further improvement.
+                if best.concurrency and best.concurrency != concurrency:
+                    log(f"         operating point {concurrency} -> {best.concurrency} "
+                        f"(kept config sustains more)")
+                    concurrency = best.concurrency
         else:
             ctx.measurements[cur] = NodeMeasurement(kept=False)
             log(f"  revert {cur:32s} no variant satisfied the SLO")
