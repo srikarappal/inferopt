@@ -322,7 +322,9 @@
       "on_revert": [
         "kv_block_size"
       ],
-      "sweep_note": "bracketed: 3rd interior point cost a launch and rarely moved the decision"
+      "sweep_note": "bracketed: 3rd interior point cost a launch and rarely moved the decision",
+      "curve_crosses": true,
+      "curve_note": "Negative at low concurrency -- chunking a prefill that could run in one shot is pure overhead -- and positive at high concurrency, where it stops a long prefill blocking every decode behind it. The curves cross, so a single-point measurement is a coin flip."
     },
     {
       "id": "kv_block_size",
@@ -397,7 +399,9 @@
       ],
       "on_revert": [
         "spec_decode_draft"
-      ]
+      ],
+      "curve_crosses": true,
+      "curve_note": "Speculative decoding spends spare compute to amortise weight reads. At low concurrency there is spare compute and it wins; at high concurrency weight reads are already amortised across sequences and rejected drafts are pure waste, so it can go negative. Mirror image of chunked_prefill."
     },
     {
       "id": "spec_decode_draft",
@@ -424,7 +428,9 @@
       ],
       "on_revert": [
         "graph_capture"
-      ]
+      ],
+      "curve_crosses": true,
+      "curve_note": "Same crossing behaviour as spec_decode_ngram."
     },
     {
       "id": "spec_decode_depth",
@@ -457,7 +463,9 @@
       ],
       "on_revert": [
         "graph_capture"
-      ]
+      ],
+      "curve_crosses": true,
+      "curve_note": "Same crossing behaviour as the proposer it depends on."
     },
     {
       "id": "graph_capture",

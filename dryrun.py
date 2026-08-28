@@ -40,7 +40,8 @@ class DryRunEvaluator:
     def __init__(self, seed: int = 0):
         self.rng = random.Random(seed)
 
-    def measure(self, config: dict[str, Any], *, probes, benchmarks, node_id) -> Trial:
+    def measure(self, config: dict[str, Any], *, probes, benchmarks, node_id,
+                concurrency=None, also_at=None) -> Trial:
         g, ttft, mem, quality = BASE_GOODPUT, 420.0, 18.0, {}
 
         if config.get("enable_chunked_prefill"):

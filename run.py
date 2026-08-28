@@ -44,6 +44,10 @@ from fingerprint import NodeMeasurement
 from request import InferOptRequest, build_fingerprint
 from traverse import report, traverse
 
+# Benchmarks run once on the seed so the frontier has a quality axis. Lossless
+# nodes inherit these; lossy nodes re-measure.
+BASELINE_BENCHMARKS = ["math_500", "ruler_multineedle"]
+
 
 def cmd_trace(args) -> int:
     """Build a replayable trace from a ShareGPT dump.
@@ -179,10 +183,15 @@ def cmd_optimize(args) -> int:
     ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
 
     ctx = Context(fingerprint=fp, slo=slo, incumbent=cfg)
-    baseline = None
+    baseline, curve, operating_L = None, [], None
     if not args.skip_stage13:
         print("  stage 1.3 measuring the seed config")
-        t = ev.measure(cfg, probes=["goodput", "equivalence"], benchmarks=[], node_id="stage_1_3")
+        # Quality is measured HERE, not only at lossless_complete. Every point
+        # on the final frontier needs an accuracy coordinate, and a lossless
+        # node inherits this one -- so without a baseline score the whole
+        # quality axis is empty.
+        t = ev.measure(cfg, probes=["goodput", "equivalence", "quality"],
+                       benchmarks=BASELINE_BENCHMARKS, node_id="stage_1_3")
         if t.diagnostics.get("launch_error"):
             # A launch failure is NOT an SLO failure. Reporting inf ttft as
             # "does not satisfy the SLO" sends you to tune a threshold when the
@@ -210,6 +219,7 @@ def cmd_optimize(args) -> int:
             goodput=t.goodput, ttft_p99_ms=t.ttft_p99_ms, itl_p99_ms=t.itl_p99_ms,
             quality={}, config=cfg)
         baseline = t
+        ctx.quality_baseline.update(t.quality)
 
         # THE BASELINE IS THE RUN'S ANCHOR. Every percentage the traversal
         # prints, and every number in the frontier, is a ratio against it.
@@ -243,16 +253,79 @@ def cmd_optimize(args) -> int:
         print(f"    persisted to     {journal}  (line 1)  and  {run_dir}/result.json")
         print(f"  {'-'*68}\n")
 
+        # --- capacity sweep -------------------------------------------------
+        # Concurrency is not a knob. By Little's Law (L = lambda x W) it is an
+        # OUTCOME of arrival rate and service time, and goodput as a function of
+        # it has a peak: past capacity, extra concurrency only pushes requests
+        # over the deadline, so goodput falls. That peak is simultaneously the
+        # maximum goodput, the best concurrency, and the sustainable req/s that
+        # divides into demand to size a fleet.
+        #
+        # Run four judged every node at L=30, from `int(qps*2)` -- a formula
+        # that does not even typecheck, since qps is 1/time and concurrency is
+        # dimensionless. Everything was measured at an arbitrary point on an
+        # unnamed curve.
+        if not args.skip_sweep:
+            print(f"  stage 1.3b capacity sweep -- finding the operating point")
+            curve, pk = ev.capacity(cfg, "stage_1_3b_sweep")
+            operating_L = pk["concurrency"]
+            capacity_toks = pk["goodput"]
+            print(f"\n  {'-'*68}")
+            print(f"  CAPACITY  one replica, seed config")
+            print(f"  {'-'*68}")
+            print(f"    peak goodput     {capacity_toks:9.1f} tok/s  at concurrency {operating_L}")
+            print(f"    sustainable      {capacity_toks/max(1,fp.workload.mean_output_tokens):9.2f} req/s")
+            demand = fp.workload.request_rate_qps * fp.workload.mean_output_tokens
+            print(f"    demand           {demand:9.1f} tok/s  "
+                  f"({fp.workload.request_rate_qps:.1f} req/s x "
+                  f"{fp.workload.mean_output_tokens:.0f} tokens)")
+            import math as _m
+            print(f"    replicas needed  {_m.ceil(demand/max(1e-9, capacity_toks)):9d}   "
+                  f"to serve this workload at the SLO")
+            print(f"    every node below is measured at concurrency {operating_L}")
+            print(f"  {'-'*68}\n")
+        else:
+            curve, operating_L = [], None
+            print(f"  stage 1.3b sweep skipped by --skip-sweep; nodes measured at "
+                  f"the fingerprint's concurrency {fp.workload.max_concurrency}\n")
+
     dag = json.loads(Path(args.dag).read_text())
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
-                   journal=journal, baseline=baseline)
-    report(res)
+                   journal=journal, baseline=baseline,
+                   concurrency=operating_L)
+
+    # Full sweep on the finalists. The traversal ranks configs at one operating
+    # point, which is enough to CHOOSE between them -- most goodput curves sit
+    # uniformly above or below each other rather than crossing. But the winner's
+    # own curve is what sets capacity and therefore the replica count, so the
+    # configs anyone might actually deploy get measured properly.
+    finalist_curves = {}
+    if not args.skip_sweep and not args.no_finalist_sweep:
+        finalists = res.frontier()[: args.finalists]
+        if finalists:
+            print(f"\n  sweeping {len(finalists)} frontier finalist(s) for capacity\n")
+        for t in finalists:
+            print(f"    {t.node_id}")
+            try:
+                c, pk = ev.capacity(t.config, f"finalist-{t.node_id}")
+                finalist_curves[t.node_id] = {"curve": c, "peak": pk}
+                t.curve = c
+                t.concurrency = pk["concurrency"]
+            except Exception as e:
+                print(f"      sweep failed ({type(e).__name__}: {e}); "
+                      f"keeping the traversal measurement")
+
+    report(res, demand_tok_s=fp.workload.request_rate_qps * fp.workload.mean_output_tokens)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     out = run_dir / "result.json"
     out.write_text(json.dumps({
         "fingerprint": fp.model_dump(),
         "baseline": (baseline.__dict__ if baseline else None),
+        "capacity_curve": curve,
+        "operating_concurrency": operating_L,
+        "finalist_curves": finalist_curves,
+        "demand_tok_s": fp.workload.request_rate_qps * fp.workload.mean_output_tokens,
         "incumbent": res.incumbent,
         "frontier": [t.__dict__ for t in res.frontier()],
         "trials": [t.__dict__ for t in res.trials],
@@ -292,6 +365,14 @@ def main() -> int:
     o.add_argument("--budget-minutes", type=int, default=180)
     o.add_argument("--skip-predict", action="store_true",
                    help="skip stage 1.2 and use the conservative seed")
+    o.add_argument("--no-finalist-sweep", action="store_true",
+                   help="skip the per-finalist capacity sweeps at the end")
+    o.add_argument("--finalists", type=int, default=3,
+                   help="how many frontier configs get a full capacity sweep")
+    o.add_argument("--skip-sweep", action="store_true",
+                   help="skip the stage 1.3b capacity sweep and measure at the "
+                        "fingerprint's concurrency. Faster, but every goodput number "
+                        "is then a point on an unnamed curve.")
     o.add_argument("--lossless-only", action="store_true",
                    help="stop at the lossless branch; do not enter the lossy nodes. "
                         "The frontier still includes everything measured.")

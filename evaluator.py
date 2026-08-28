@@ -92,6 +92,9 @@ LAUNCH_TIMEOUT_S = float(os.environ.get("INFEROPT_LAUNCH_TIMEOUT_S", "1800"))
 # because pass 1 ran cold and pass 2 warm. Both passes must measure the same
 # steady state, which is also the state production runs in.
 WARMUP_S = 45.0
+SETTLE_S = 20.0        # after stepping concurrency, before measuring
+SWEEP_WINDOW_S = 45.0
+SWEEP_LEVELS = (4, 8, 16, 32, 64, 128, 256)
 WINDOW_S = 45.0
 REPEATS = 2
 
@@ -255,6 +258,35 @@ async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds):
     return out, t0, t1, len(tasks), len(live)
 
 
+async def _closed_loop(base_url, model, prompts, max_tokens, conc, seconds):
+    """Hold exactly `conc` requests in flight, replacing each as it completes.
+
+    The open-loop driver above fixes the ARRIVAL RATE and lets concurrency
+    emerge. That matches production -- users arrive when they arrive -- but
+    above capacity it does not converge: queues grow without bound, so TTFT
+    depends on how long the window ran and a 45s window and a 90s window give
+    different answers. Run three and run four were both measuring that.
+
+    Closed loop is bounded by construction, so it converges and repeats. It is
+    the right instrument for CHARACTERISING capacity -- sweeping L to find where
+    goodput peaks. It is the wrong instrument for validating an operating point,
+    because holding L constant removes burstiness, and burstiness is what moves
+    the TTFT tail. Hence both drivers: sweep closed, validate open.
+    """
+    out: list[Req] = []
+    t0 = time.perf_counter()
+    deadline = t0 + seconds
+    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=conc + 16)) as c:
+        async def worker(slot: int):
+            i = slot
+            while time.perf_counter() < deadline:
+                out.append(await _one(c, base_url, model, prompts[i % len(prompts)], max_tokens))
+                i += conc
+        await asyncio.gather(*[asyncio.create_task(worker(k)) for k in range(conc)],
+                             return_exceptions=True)
+    return out, t0, time.perf_counter()
+
+
 def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
     win = max(1e-9, t1 - t0)
     in_win = lambda tt: t0 <= tt < t1
@@ -312,7 +344,7 @@ class VllmEvaluator:
         kind = config.pop("quantize", None)
         if kind:
             from quantize import ensure_variant
-            path = ensure_variant(self.fp.model.id, kind, self.trace_path, log=self.log)
+            path = ensure_variant(self.fp, kind, self.trace_path, log=self.log)
             if path:
                 config["model"] = path
             else:
@@ -402,9 +434,86 @@ class VllmEvaluator:
                     return await _one(c, self.base_url, model, p, max_tokens, stream=False)
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
+    # --- capacity ---
+    def _sweep_on_live_server(self, model, levels=SWEEP_LEVELS, el=lambda: "") -> list[dict]:
+        """Goodput vs concurrency on an ALREADY-RUNNING server.
+
+        This is the cheap part and the reason capacity measurement is affordable
+        at all: the 4-minute model load is paid once and amortised across every
+        point. Relaunching per level would make the sweep cost more than the
+        entire traversal.
+
+        Ramps geometrically and stops when goodput falls twice running -- past
+        the peak, more concurrency only pushes requests over the deadline, and
+        the points beyond it cost time to learn nothing.
+        """
+        curve, falling, best = [], 0, 0.0
+        for L in levels:
+            asyncio.run(_closed_loop(self.base_url, model, self.prompts,
+                                     self.max_tokens, L, SETTLE_S))
+            reqs, t0, t1 = asyncio.run(_closed_loop(
+                self.base_url, model, self.prompts, self.max_tokens, L, SWEEP_WINDOW_S))
+            m = summarize(reqs, t0, t1, self.slo)
+            m["concurrency"] = L
+            curve.append(m)
+            self.log(f"        {el()} L={L:<4d} goodput {m['goodput']:7.1f}  "
+                     f"thru {m['throughput']:7.1f}  ttft_p99 {m['ttft_p99_ms']:6.0f}ms  "
+                     f"slo {m['slo_attainment']:.0%}  ({m['completed']} done)")
+            if m["goodput"] > best:
+                best, falling = m["goodput"], 0
+            else:
+                falling += 1
+                if falling >= 2:
+                    self.log(f"        {el()} goodput fell twice -- past the peak, stopping")
+                    break
+        return curve
+
+    @staticmethod
+    def peak(curve: list[dict]) -> dict:
+        """The operating point: highest goodput on the curve.
+
+        Goodput already encodes the SLO -- requests that miss the deadline
+        contribute nothing -- so its maximum IS the SLO-constrained capacity.
+        There is no separate 'find where TTFT crosses 500ms' step; that crossing
+        is what bends the curve over.
+        """
+        return max(curve, key=lambda m: m["goodput"])
+
+    def capacity(self, config: dict, tag: str) -> tuple[list[dict], dict]:
+        """Launch `config` and sweep it. Returns (curve, peak)."""
+        t_start = time.time()
+        el = lambda: f"+{(time.time()-t_start)/60:4.1f}m"
+        self.log(f"        {el()} launching for capacity sweep")
+        with self._serve(config, tag) as model:
+            self.log(f"        {el()} healthy, warming up {WARMUP_S:.0f}s")
+            asyncio.run(_load(self.base_url, model, self.prompts,
+                              self.max_tokens, self.qps, self.conc, WARMUP_S))
+            curve = self._sweep_on_live_server(model, el=el)
+        pk = self.peak(curve)
+        self.log(f"        {el()} peak goodput {pk['goodput']:.1f} tok/s at L={pk['concurrency']}")
+        return curve, pk
+
     # --- the Evaluator protocol ---
     def measure(self, config: dict[str, Any], *, probes: list[str],
-                benchmarks: list[str], node_id: str) -> Trial:
+                benchmarks: list[str], node_id: str,
+                concurrency: int | None = None,
+                also_at: list[int] | None = None) -> Trial:
+        """Measure one config.
+
+        `concurrency` is the operating point found by the stage 1.3 sweep. Every
+        node is measured there rather than at an arbitrary offered load -- run
+        four judged everything at L=30, a number produced by `int(qps*2)`, and
+        the middle of its frontier was uninterpretable as a result.
+
+        `also_at` adds extra concurrency levels for nodes whose goodput curves
+        CROSS rather than sit uniformly above or below the incumbent's.
+        chunked_prefill is negative at low L (chunking a prefill that could run
+        in one shot is pure overhead) and positive at high L (it stops a long
+        prefill blocking every decode behind it). Speculative decoding is the
+        mirror: it spends spare compute, so it wins at low L and can go negative
+        at high L where there is none. Ranking those at a single point is a coin
+        flip; the best of their measured points is used.
+        """
         tag = f"{node_id}-{abs(hash(json.dumps(config, sort_keys=True, default=str))) % 10**8:08d}"
         t_start = time.time()
         el = lambda: f"+{(time.time()-t_start)/60:4.1f}m"
@@ -415,11 +524,12 @@ class VllmEvaluator:
                 self.log(f"        {el()} healthy, warming up {WARMUP_S:.0f}s")
                 asyncio.run(_load(self.base_url, model, self.prompts,
                                   self.max_tokens, self.qps, self.conc, WARMUP_S))
+                conc = concurrency or self.conc
                 passes = []
                 for i in range(REPEATS):
                     reqs, t0, t1, offered, started = asyncio.run(
                         _load(self.base_url, model, self.prompts,
-                              self.max_tokens, self.qps, self.conc, WINDOW_S))
+                              self.max_tokens, self.qps, conc, WINDOW_S))
                     m = summarize(reqs, t0, t1, self.slo)
                     m["offered"], m["started"] = offered, started
                     passes.append(m)
@@ -461,6 +571,32 @@ class VllmEvaluator:
                     self.log(f"        {el()} NOTE pass-to-pass goodput spread {gs:.0%} "
                              f"-- larger than the accept band, so a keep/revert "
                              f"decision here is not resolvable at this sample size")
+                # Crossing-prone nodes: measure at the extra levels too, on this
+                # same server. The best point wins, because the question these
+                # nodes answer is "does this help ANYWHERE in the operating
+                # range", not "does it help at exactly L*".
+                extra = []
+                for L2 in (also_at or []):
+                    asyncio.run(_closed_loop(self.base_url, model, self.prompts,
+                                             self.max_tokens, L2, SETTLE_S))
+                    r2, a2, b2 = asyncio.run(_closed_loop(
+                        self.base_url, model, self.prompts, self.max_tokens,
+                        L2, SWEEP_WINDOW_S))
+                    m2 = summarize(r2, a2, b2, self.slo)
+                    m2["concurrency"] = L2
+                    extra.append(m2)
+                    self.log(f"        {el()} also at L={L2:<4d} goodput {m2['goodput']:7.1f}  "
+                             f"ttft_p99 {m2['ttft_p99_ms']:6.0f}ms  "
+                             f"slo {m2['slo_attainment']:.0%}")
+                if extra:
+                    best_extra = max(extra, key=lambda m: m["goodput"])
+                    if best_extra["goodput"] > med["goodput"]:
+                        self.log(f"        {el()} L={best_extra['concurrency']} beats "
+                                 f"L={conc} ({best_extra['goodput']:.1f} vs "
+                                 f"{med['goodput']:.1f}) -- this node's curve crosses")
+                        med = best_extra
+                        conc = best_extra["concurrency"]
+
                 diag = self._metrics()
                 div = None
                 if "equivalence" in probes:

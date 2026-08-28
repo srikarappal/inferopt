@@ -70,6 +70,18 @@ class Trial:
     equivalence_divergence: float | None = None
     kept: bool = False
     slo_ok: bool = True
+    concurrency: int | None = None
+    """In-flight requests this was measured at. NOT a tuning knob -- it is the
+    operating point the stage 1.3 sweep found, and by Little's Law (L = lambda*W)
+    an outcome of arrival rate and service time rather than an input."""
+    curve: list[dict] = field(default_factory=list)
+    """Extra (concurrency, goodput) points, for nodes whose curves cross."""
+    quality_inherited: bool = False
+    """True when quality was carried forward from the baseline rather than
+    measured. Lossless nodes cannot move quality, and the equivalence probe is a
+    stronger check than a 100-sample benchmark would be -- but the plot still
+    needs a quality coordinate for every point, so it is inherited and flagged
+    rather than left empty."""
 
     @property
     def min_quality(self) -> float:
@@ -86,7 +98,9 @@ class Evaluator(Protocol):
     """Launch a config and measure it. Implementations own the GPU."""
 
     def measure(self, config: dict[str, Any], *, probes: list[str],
-                benchmarks: list[str], node_id: str) -> Trial: ...
+                benchmarks: list[str], node_id: str,
+                concurrency: int | None = None,
+                also_at: list[int] | None = None) -> Trial: ...
 
 
 @dataclass
@@ -98,6 +112,11 @@ class Result:
     launches: int
     minutes: float
     stopped_early: str | None = None
+    concurrency: int | None = None
+    """The operating point every node was measured at, from the stage 1.3
+    sweep. Recorded because a goodput number without the concurrency it was
+    taken at is a point on an unnamed curve -- which is what made run four's
+    middle rows uninterpretable."""
     baseline: Trial | None = None
     """The stage 1.3 seed measurement. EVERY percentage in this run is a ratio
     against it, so a Result without it cannot be interpreted -- run four
@@ -166,7 +185,8 @@ def _variants(node, base: dict, ctx: Context) -> list[dict]:
 def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              *, log=print, lossless_only: bool = False,
              journal: str | Path | None = None,
-             baseline: Trial | None = None) -> Result:
+             baseline: Trial | None = None,
+             concurrency: int | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
 
     `journal` is a path to APPEND every Trial to as it completes; the caller
@@ -274,7 +294,21 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         benches = node.get("quality_benchmarks", [])
         measured: list[Trial] = []
         for var in variants:
-            t = evaluator.measure(var, probes=probes, benchmarks=benches, node_id=cur)
+            # Crossing-prone nodes get extra concurrency levels. Everything
+            # else is judged at the operating point the stage 1.3 sweep found.
+            also = None
+            if concurrency and node.get("curve_crosses"):
+                also = [max(2, concurrency // 2), concurrency * 2]
+            t = evaluator.measure(var, probes=probes, benchmarks=benches, node_id=cur,
+                                  concurrency=concurrency, also_at=also)
+            # Every point needs a quality coordinate for the frontier plot. A
+            # lossless node cannot move quality -- that is what makes it
+            # lossless, and the equivalence probe verifies it -- so it inherits
+            # the baseline's scores rather than spending 5 minutes re-measuring
+            # what cannot have changed.
+            if not t.quality and node.get("class") != "lossy" and ctx.quality_baseline:
+                t.quality = dict(ctx.quality_baseline)
+                t.quality_inherited = True
             launches += 1
             measured.append(t)
             trials.append(t)
@@ -343,12 +377,12 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         nxt = node.get("on_keep") if keep else node.get("on_revert")
         cur = (nxt or [None])[0]
 
-    return Result(baseline=baseline, trials=trials, incumbent=incumbent_cfg, visited=visited,
+    return Result(concurrency=concurrency, baseline=baseline, trials=trials, incumbent=incumbent_cfg, visited=visited,
                   skipped=skipped, launches=launches,
                   minutes=(time.time() - t0) / 60, stopped_early=stopped)
 
 
-def report(res: Result, log=print) -> None:
+def report(res: Result, log=print, demand_tok_s: float | None = None) -> None:
     log(f"\n{'='*74}")
     log(f"visited {len(res.visited)} nodes, skipped {len(res.skipped)}, "
         f"{res.launches} launches, {res.minutes:.1f} min")
@@ -364,22 +398,40 @@ def report(res: Result, log=print) -> None:
         log(f"  ttft p99         {b.ttft_p99_ms:9.0f} ms")
         log(f"  itl p99          {b.itl_p99_ms:9.0f} ms")
         log(f"  slo attainment   {d.get('slo_attainment', 0):9.0%}")
+        for k, v in (b.quality or {}).items():
+            log(f"  {k:16s} {v:9.4f}")
     else:
         log(f"\nBASELINE  NOT RECORDED -- percentages below have no anchor.")
 
     log(f"\nPARETO FRONTIER  ({len(res.frontier())} of {len(res.trials)} measurements)\n")
-    hdr = f"  {'node':30s} {'goodput':>9s} {'vs base':>9s} {'quality':>8s} {'ttft p99':>9s} {'mem':>7s}"
+    if res.concurrency:
+        log(f"  measured at concurrency {res.concurrency} (the stage 1.3 sweep's peak)\n")
+    hdr = (f"  {'node':28s} {'goodput':>9s} {'vs base':>9s} {'quality':>8s} "
+           f"{'ttft p99':>9s} {'L':>5s} {'replicas':>9s}")
     log(hdr)
     log("  " + "-" * (len(hdr) - 2))
     for t in res.frontier():
         q = f"{t.min_quality:.4f}" if t.quality else "     --"
         rel = f"{(t.goodput/b.goodput - 1)*100:+8.1f}%" if b and b.goodput else "       --"
-        log(f"  {t.node_id:30s} {t.goodput:9.1f} {rel:>9s} {q:>8s} "
-            f"{t.ttft_p99_ms:8.0f}ms {t.memory_gb:6.1f}G"
-            f"{'' if t.kept else '   (reverted)'}")
+        if t.quality_inherited:
+            q = q + "~"                       # inherited, not measured
+        rep = (f"{__import__('math').ceil(demand_tok_s / max(1e-9, t.goodput)):9d}"
+               if demand_tok_s else "       --")
+        log(f"  {t.node_id:28s} {t.goodput:9.1f} {rel:>9s} {q:>8s} "
+            f"{t.ttft_p99_ms:8.0f}ms {str(t.concurrency or '-'):>5s} {rep}"
+            f"{'' if t.kept else '  (reverted)'}")
 
+    log(f"\n  quality marked ~ was inherited from the baseline: a lossless node "
+        f"cannot move it,\n  and the equivalence probe is a stronger check than a "
+        f"100-sample benchmark.")
     if b and b.goodput:
         best = max((t for t in res.trials if t.slo_ok), key=lambda t: t.goodput, default=None)
         if best:
             log(f"\n  best measured   {best.goodput:.1f} tok/s at {best.node_id} "
                 f"({best.goodput/b.goodput:.2f}x the baseline's {b.goodput:.1f})")
+            if demand_tok_s:
+                import math
+                r0 = math.ceil(demand_tok_s / max(1e-9, b.goodput))
+                r1 = math.ceil(demand_tok_s / max(1e-9, best.goodput))
+                log(f"  fleet           {r0} replicas -> {r1} to serve "
+                    f"{demand_tok_s:.0f} tok/s at the SLO")
