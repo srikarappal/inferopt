@@ -98,6 +98,11 @@ class Result:
     launches: int
     minutes: float
     stopped_early: str | None = None
+    baseline: Trial | None = None
+    """The stage 1.3 seed measurement. EVERY percentage in this run is a ratio
+    against it, so a Result without it cannot be interpreted -- run four
+    reported '+307%' and the 307% was of a number that existed only in the
+    operator's terminal scrollback."""
 
     def frontier(self) -> list[Trial]:
         """True non-dominated set over every measurement taken, reverted ones
@@ -160,7 +165,8 @@ def _variants(node, base: dict, ctx: Context) -> list[dict]:
 
 def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              *, log=print, lossless_only: bool = False,
-             journal: str | Path | None = None) -> Result:
+             journal: str | Path | None = None,
+             baseline: Trial | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
 
     `journal` is a path to APPEND every Trial to as it completes; the caller
@@ -337,7 +343,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         nxt = node.get("on_keep") if keep else node.get("on_revert")
         cur = (nxt or [None])[0]
 
-    return Result(trials=trials, incumbent=incumbent_cfg, visited=visited,
+    return Result(baseline=baseline, trials=trials, incumbent=incumbent_cfg, visited=visited,
                   skipped=skipped, launches=launches,
                   minutes=(time.time() - t0) / 60, stopped_early=stopped)
 
@@ -348,11 +354,32 @@ def report(res: Result, log=print) -> None:
         f"{res.launches} launches, {res.minutes:.1f} min")
     if res.stopped_early:
         log(f"stopped early: {res.stopped_early}")
+
+    b = res.baseline
+    if b:
+        d = b.diagnostics or {}
+        log(f"\nBASELINE  (stage 1.3, the seed config -- every % below is against this)\n")
+        log(f"  goodput          {b.goodput:9.1f} tok/s")
+        log(f"  throughput       {d.get('throughput', float('nan')):9.1f} tok/s")
+        log(f"  ttft p99         {b.ttft_p99_ms:9.0f} ms")
+        log(f"  itl p99          {b.itl_p99_ms:9.0f} ms")
+        log(f"  slo attainment   {d.get('slo_attainment', 0):9.0%}")
+    else:
+        log(f"\nBASELINE  NOT RECORDED -- percentages below have no anchor.")
+
     log(f"\nPARETO FRONTIER  ({len(res.frontier())} of {len(res.trials)} measurements)\n")
-    log(f"  {'node':32s} {'goodput':>9s} {'quality':>8s} {'ttft p99':>9s} {'mem':>7s}")
-    log("  " + "-" * 70)
+    hdr = f"  {'node':30s} {'goodput':>9s} {'vs base':>9s} {'quality':>8s} {'ttft p99':>9s} {'mem':>7s}"
+    log(hdr)
+    log("  " + "-" * (len(hdr) - 2))
     for t in res.frontier():
         q = f"{t.min_quality:.4f}" if t.quality else "     --"
-        log(f"  {t.node_id:32s} {t.goodput:9.1f} {q:>8s} "
+        rel = f"{(t.goodput/b.goodput - 1)*100:+8.1f}%" if b and b.goodput else "       --"
+        log(f"  {t.node_id:30s} {t.goodput:9.1f} {rel:>9s} {q:>8s} "
             f"{t.ttft_p99_ms:8.0f}ms {t.memory_gb:6.1f}G"
             f"{'' if t.kept else '   (reverted)'}")
+
+    if b and b.goodput:
+        best = max((t for t in res.trials if t.slo_ok), key=lambda t: t.goodput, default=None)
+        if best:
+            log(f"\n  best measured   {best.goodput:.1f} tok/s at {best.node_id} "
+                f"({best.goodput/b.goodput:.2f}x the baseline's {b.goodput:.1f})")

@@ -120,5 +120,10 @@ if __name__ == "__main__":
     import json
     dag = json.load(open("dag/llm.json"))
     ctx = build_context()
-    res = traverse(dag, ctx, DryRunEvaluator(seed=7))
+    ev = DryRunEvaluator(seed=7)
+    # A synthetic baseline so the report's anchor path is exercised. Without one
+    # every frontier percentage prints '--', which is exactly the failure this
+    # argument exists to prevent.
+    base = ev.measure(ctx.incumbent, probes=["goodput"], benchmarks=[], node_id="stage_1_3")
+    res = traverse(dag, ctx, ev, baseline=base)
     report(res)

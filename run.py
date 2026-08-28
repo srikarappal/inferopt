@@ -179,6 +179,7 @@ def cmd_optimize(args) -> int:
     ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
 
     ctx = Context(fingerprint=fp, slo=slo, incumbent=cfg)
+    baseline = None
     if not args.skip_stage13:
         print("  stage 1.3 measuring the seed config")
         t = ev.measure(cfg, probes=["goodput", "equivalence"], benchmarks=[], node_id="stage_1_3")
@@ -208,24 +209,50 @@ def cmd_optimize(args) -> int:
         ctx.incumbent_metrics = NodeMeasurement(
             goodput=t.goodput, ttft_p99_ms=t.ttft_p99_ms, itl_p99_ms=t.itl_p99_ms,
             quality={}, config=cfg)
-        # The baseline every later percentage is computed against. It used to
-        # exist only in the console: stage 1.3 runs before traverse(), so it
-        # missed both the journal and result.json, and after the run there was
-        # no way to say what "+307%" was 307% OF.
+        baseline = t
+
+        # THE BASELINE IS THE RUN'S ANCHOR. Every percentage the traversal
+        # prints, and every number in the frontier, is a ratio against it.
+        # It used to be summarised in one console line and persisted nowhere:
+        # stage 1.3 runs before traverse(), so it missed the journal AND
+        # result.json, and after run four finished there was no way to say what
+        # "+307%" was 307% OF. It had to be inferred from a previous run.
+        #
+        # So it is now written THREE times -- console block, journal line 1,
+        # result.json["baseline"] -- because losing it makes the entire run
+        # uninterpretable, and it costs nothing to keep.
         journal.write_text(json.dumps(t.__dict__, default=str) + "\n")
-        print(f"  stage 1.3 goodput {t.goodput:.1f}  ttft_p99 {t.ttft_p99_ms:.0f}ms\n")
+        d = t.diagnostics or {}
+        miss = lambda v, lim: ("" if not lim else
+                               ("  <- MISSES the %g ms SLO" % lim if v > lim else "  (within SLO)"))
+        print(f"\n  {'-'*68}")
+        print(f"  BASELINE  stage 1.3, the seed config")
+        print(f"            every percentage this run prints is against these numbers")
+        print(f"  {'-'*68}")
+        print(f"    goodput          {t.goodput:9.1f} tok/s   <- the objective")
+        print(f"    throughput       {d.get('throughput', float('nan')):9.1f} tok/s   "
+              f"(goodput's ceiling)")
+        print(f"    ttft p99         {t.ttft_p99_ms:9.0f} ms"
+              f"{miss(t.ttft_p99_ms, slo.ttft_p99_ms)}")
+        print(f"    itl p99          {t.itl_p99_ms:9.0f} ms"
+              f"{miss(t.itl_p99_ms, slo.itl_p99_ms)}")
+        print(f"    slo attainment   {d.get('slo_attainment', 0):9.0%}   "
+              f"of requests met both targets")
+        print(f"    memory           {t.memory_gb:9.1f} GB")
+        print(f"    config           {json.dumps(cfg, default=str)}")
+        print(f"    persisted to     {journal}  (line 1)  and  {run_dir}/result.json")
+        print(f"  {'-'*68}\n")
 
     dag = json.loads(Path(args.dag).read_text())
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
-                   journal=journal)
+                   journal=journal, baseline=baseline)
     report(res)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     out = run_dir / "result.json"
     out.write_text(json.dumps({
         "fingerprint": fp.model_dump(),
-        "baseline": (ctx.incumbent_metrics.model_dump()
-                     if ctx.incumbent_metrics else None),
+        "baseline": (baseline.__dict__ if baseline else None),
         "incumbent": res.incumbent,
         "frontier": [t.__dict__ for t in res.frontier()],
         "trials": [t.__dict__ for t in res.trials],
