@@ -159,6 +159,24 @@ def quality_scatter(base, trials, frontier) -> None:
     print(f"\n    B baseline   # frontier   o dominated"
           f"   (~ in the table = inherited, not re-measured)")
 
+    # A flat line here is not an empty result -- it is the strongest statement
+    # the lossless branch can make. The y-spread being zero while the x-spread is
+    # 4x means the accuracy was never the thing being traded: the same answers
+    # came out, and they came out faster. Say so, because a reader looking at a
+    # horizontal line will otherwise conclude the plot has nothing in it.
+    qs = [p[1] for p in pts]
+    gx = [p[0] for p in pts]
+    if qs and (max(qs) - min(qs)) < 1e-9 and min(gx) > 0:
+        print(f"\n  The line is FLAT and that is the finding: accuracy is identical")
+        print(f"  ({qs[0]:.4f}) across a {max(gx)/min(gx):.2f}x range of goodput")
+        print(f"  ({min(gx):.1f} -> {max(gx):.1f} tok/s). Nothing was traded away --")
+        print(f"  the same answers, {max(gx)/min(gx):.2f}x faster. The line only bends")
+        print(f"  once the lossy branch runs.")
+    elif qs and len(qs) > 1:
+        print(f"\n  accuracy spans {min(qs):.4f} to {max(qs):.4f} across a "
+              f"{max(gx)/max(1e-9,min(gx)):.2f}x goodput range --")
+        print(f"  the bend is the trade a quality-first reader has to choose on.")
+
 
 def main() -> int:
     if len(sys.argv) < 2:

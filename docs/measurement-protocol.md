@@ -12,6 +12,21 @@ are in `docs/decision-log.md`.
 A request that misses its TTFT or ITL target contributes zero, however many
 tokens it produced.
 
+The term is standard, not local jargon. It comes from networking, where it means
+application-level throughput excluding protocol overhead and retransmissions, and
+DistServe (OSDI 2024) established it for LLM serving. vLLM ships it:
+`vllm/benchmarks/serve.py` takes a `--goodput` flag and reports
+`Request goodput (req/s)`.
+
+**Units differ, so both are reported.** vLLM computes
+`request_goodput = good_completed / dur_s` — *requests* per second. We optimise
+*tokens* per second, which is the right objective when responses vary in length:
+a config that finishes only the short requests on time should not score the same
+as one that finishes the long ones. But reporting tok/s alone makes every number
+here roughly `mean_output_tokens` times larger than the vLLM figure someone would
+compare it against, so both units appear in every block and every pass line.
+req/s is also what divides into demand for the replica count.
+
 Raw throughput rewards the wrong thing. A server maximises tokens/sec by queueing
 deeply and serving everything slowly — a magnificent aggregate number while every
 user stares at a blank screen. Three configs with identical 200 tok/s raw

@@ -393,7 +393,8 @@ def report(res: Result, log=print, demand_tok_s: float | None = None) -> None:
     if b:
         d = b.diagnostics or {}
         log(f"\nBASELINE  (stage 1.3, the seed config -- every % below is against this)\n")
-        log(f"  goodput          {b.goodput:9.1f} tok/s")
+        log(f"  goodput          {b.goodput:9.1f} tok/s"
+            f"   ({d.get('goodput_req_s', 0):.2f} req/s)")
         log(f"  throughput       {d.get('throughput', float('nan')):9.1f} tok/s")
         log(f"  ttft p99         {b.ttft_p99_ms:9.0f} ms")
         log(f"  itl p99          {b.itl_p99_ms:9.0f} ms")

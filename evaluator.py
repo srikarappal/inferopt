@@ -298,9 +298,23 @@ def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
     itls = sorted((r.latency - r.ttft) / (r.n_out - 1)
                   for r in done if r.ttft is not None and r.n_out > 1)
     pct = lambda xs, q: (xs[min(len(xs) - 1, int(q * (len(xs) - 1)))] if xs else float("nan"))
+    # Two units, because the field uses both and they are not interchangeable.
+    #
+    # vLLM's own benchmark (vllm/benchmarks/serve.py) reports
+    # `request_goodput = good_completed / dur_s` -- REQUESTS per second.
+    # We optimise tokens/sec, which is the right objective when responses vary in
+    # length (a config that finishes only short requests on time should not score
+    # the same as one that finishes long ones). But reporting only tok/s makes
+    # every number here ~mean_output_tokens x larger than the vLLM figure someone
+    # would compare it against, so both are emitted and both are labelled.
+    #
+    # req/s is also what divides into demand for the replica count.
+    good_reqs = sum(1 for r in done if r.meets(slo))
     return {
         "goodput": good_tok / win,
+        "goodput_req_s": good_reqs / win,
         "throughput": all_tok / win,
+        "throughput_req_s": len(done) / win,
         "slo_attainment": (sum(r.meets(slo) for r in done) / len(done)) if done else 0.0,
         "ttft_p99_ms": pct(ttfts, 0.99) * 1e3,
         "itl_p99_ms": pct(itls, 0.99) * 1e3,
@@ -538,7 +552,9 @@ class VllmEvaluator:
                     # rather than its own behaviour, so keep/revert decisions
                     # rest on differences between saturated states.
                     self.log(f"        {el()} pass {i+1}/{REPEATS}  "
-                             f"goodput {m['goodput']:7.1f}  thru {m['throughput']:7.1f}  "
+                             f"goodput {m['goodput']:7.1f} tok/s "
+                             f"({m['goodput_req_s']:.2f} req/s)  "
+                             f"thru {m['throughput']:7.1f}  "
                              f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  "
                              f"slo {m['slo_attainment']:.0%}  "
                              f"({m['completed']} ok/{m['failed']} fail, "

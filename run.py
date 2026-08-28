@@ -240,6 +240,8 @@ def cmd_optimize(args) -> int:
         print(f"            every percentage this run prints is against these numbers")
         print(f"  {'-'*68}")
         print(f"    goodput          {t.goodput:9.1f} tok/s   <- the objective")
+        print(f"                     {d.get('goodput_req_s', 0):9.2f} req/s   "
+              f"same number, the unit vLLM's own benchmark reports")
         print(f"    throughput       {d.get('throughput', float('nan')):9.1f} tok/s   "
               f"(goodput's ceiling)")
         print(f"    ttft p99         {t.ttft_p99_ms:9.0f} ms"
@@ -274,14 +276,14 @@ def cmd_optimize(args) -> int:
             print(f"  CAPACITY  one replica, seed config")
             print(f"  {'-'*68}")
             print(f"    peak goodput     {capacity_toks:9.1f} tok/s  at concurrency {operating_L}")
-            print(f"    sustainable      {capacity_toks/max(1,fp.workload.mean_output_tokens):9.2f} req/s")
+            print(f"    sustainable      {pk.get('goodput_req_s', 0):9.2f} req/s")
             demand = fp.workload.request_rate_qps * fp.workload.mean_output_tokens
             print(f"    demand           {demand:9.1f} tok/s  "
                   f"({fp.workload.request_rate_qps:.1f} req/s x "
                   f"{fp.workload.mean_output_tokens:.0f} tokens)")
             import math as _m
             print(f"    replicas needed  {_m.ceil(demand/max(1e-9, capacity_toks)):9d}   "
-                  f"to serve this workload at the SLO")
+                  f"= demand / capacity, to serve this workload at the SLO")
             print(f"    every node below is measured at concurrency {operating_L}")
             print(f"  {'-'*68}\n")
         else:
