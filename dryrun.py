@@ -91,8 +91,8 @@ def build_context() -> Context:
             id="Qwen/Qwen3.5-9B", architecture="Qwen3ForCausalLM", n_params_b=9.0,
             n_layers=48, hidden_size=4096, n_heads=32, n_kv_heads=8,
             attention_type="gqa", max_model_len=32768,
-            has_fp8_checkpoint=True, fp8_checkpoint="Qwen/Qwen3.5-9B-FP8",
-            has_awq_checkpoint=True, awq_checkpoint="Qwen/Qwen3.5-9B-AWQ"),
+            can_quantize_fp8=True,
+            can_quantize_int4_awq=True),
         hw=HardwareFingerprint(
             gpu_name="NVIDIA GB10", compute_capability="12.1", memory_gb=121.7,
             memory_bandwidth_gb_s=273.0, unified_memory=True,

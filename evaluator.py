@@ -87,7 +87,11 @@ from traverse import Trial
 VLLM_CMD = os.environ.get("INFEROPT_VLLM_CMD", "vllm").split()
 HOST = "127.0.0.1"
 LAUNCH_TIMEOUT_S = float(os.environ.get("INFEROPT_LAUNCH_TIMEOUT_S", "1800"))
-WARMUP_S = 15.0
+# 45s, not 15s. The prefix cache does not fill in 15s: passes were identical
+# (47.9/47.9) before prefix caching was enabled and 42% apart after (137.9/195.2),
+# because pass 1 ran cold and pass 2 warm. Both passes must measure the same
+# steady state, which is also the state production runs in.
+WARMUP_S = 45.0
 WINDOW_S = 45.0
 REPEATS = 2
 
@@ -429,8 +433,34 @@ class VllmEvaluator:
                              f"slo {m['slo_attainment']:.0%}  "
                              f"({m['completed']} ok/{m['failed']} fail, "
                              f"{started}/{offered} started)")
-                med = {k: sorted(p[k] for p in passes)[len(passes) // 2]
+                # MIN across passes, not median and definitely not max.
+                #
+                # This was `sorted(...)[len(passes)//2]`, named `med` for median
+                # -- but two samples have no median, and index 1 of two is the
+                # LARGER. Combined with `best = max(variants)` in traverse, a
+                # 2-variant node scored as the max of 4 draws, sitting ~1.5-2
+                # sigma above its true mean. At the 2-4% spread measured on this
+                # rig that is +3-6%, against a 5% accept band: a node with no
+                # real effect could clear the bar on noise alone, and then raise
+                # the incumbent for everything after it.
+                #
+                # The gate asks "is this reliably better", so the conservative
+                # estimate is the honest one. A config that wins on its worst
+                # pass has actually won.
+                agg = {k: min(p[k] for p in passes)
                        for k in passes[0] if isinstance(passes[0][k], (int, float))}
+                spread = {k: (max(p[k] for p in passes) - min(p[k] for p in passes))
+                          / max(1e-9, abs(min(p[k] for p in passes)))
+                          for k in ("goodput",) if k in passes[0]}
+                med = agg
+                # A node whose passes disagree by more than the accept band
+                # cannot be decided by that band: the difference being tested is
+                # smaller than the difference between two runs of the SAME config.
+                gs = spread.get("goodput", 0.0)
+                if gs > 0.10:
+                    self.log(f"        {el()} NOTE pass-to-pass goodput spread {gs:.0%} "
+                             f"-- larger than the accept band, so a keep/revert "
+                             f"decision here is not resolvable at this sample size")
                 diag = self._metrics()
                 div = None
                 if "equivalence" in probes:

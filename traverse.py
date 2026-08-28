@@ -40,8 +40,11 @@ HISTORY
 
 from __future__ import annotations
 
+import json
+
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from calibration import STORE
@@ -156,7 +159,16 @@ def _variants(node, base: dict, ctx: Context) -> list[dict]:
 
 
 def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
-             *, log=print, lossless_only: bool = False) -> Result:
+             *, log=print, lossless_only: bool = False,
+             journal: str | Path | None = None) -> Result:
+    """Walk the DAG, measuring each applicable node against the incumbent.
+
+    `journal` is a path to append every Trial to as it completes. It exists
+    because a KeyError in the quality probe once discarded nine launches and two
+    hours of measurement: result.json is only written after traverse RETURNS, so
+    any exception inside it loses everything. A measurement that cost eight
+    minutes of GPU time should survive a bug in the code that reads it.
+    """
     nodes = {n["id"]: n for n in dag["nodes"]}
     root = next(n["id"] for n in dag["nodes"] if n.get("class") == "root")
     guard = dag["traversal"]["budget_guard"]
@@ -168,6 +180,26 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     ctx.accept_band = band
     log(f"accept_band {band:.1%}  [{band_src}]")
     log(f"budget      {max_launches} launches / {max_minutes} min  [{scenario}]\n")
+
+    jpath = Path(journal) if journal else None
+    if jpath:
+        jpath.parent.mkdir(parents=True, exist_ok=True)
+        jpath.write_text("")
+
+    def record(t: Trial) -> None:
+        """Append one measurement to the journal immediately.
+
+        Flushed per line: a crash, a kill, or an OOM must not cost the trials
+        already paid for. Journal failures are reported but never raised -- a
+        broken journal must not take down a run that is otherwise fine."""
+        if not jpath:
+            return
+        try:
+            with open(jpath, "a") as fh:
+                fh.write(json.dumps(t.__dict__, default=str) + "\n")
+                fh.flush()
+        except Exception as e:
+            log(f"  (journal write failed: {type(e).__name__}: {e})")
 
     trials: list[Trial] = []
     visited: list[str] = []
@@ -182,6 +214,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # the first node be kept for free. Costs one launch and makes every
         # keep/revert decision in the run comparable.
         t = evaluator.measure(incumbent_cfg, probes=["goodput"], benchmarks=[], node_id="incumbent")
+        record(t)
         launches += 1
         trials.append(t)
         incumbent_goodput = t.goodput
@@ -238,6 +271,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             launches += 1
             measured.append(t)
             trials.append(t)
+            record(t)
 
         # --- keep or revert ---
         eligible = [t for t in measured if t.slo_ok]

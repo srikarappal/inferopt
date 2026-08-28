@@ -206,8 +206,10 @@ def cmd_optimize(args) -> int:
             quality={}, config=cfg)
         print(f"  stage 1.3 goodput {t.goodput:.1f}  ttft_p99 {t.ttft_p99_ms:.0f}ms\n")
 
+    run_dir.mkdir(parents=True, exist_ok=True)
     dag = json.loads(Path(args.dag).read_text())
-    res = traverse(dag, ctx, ev, lossless_only=args.lossless_only)
+    res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
+                   journal=run_dir / 'trials.jsonl')
     report(res)
 
     run_dir.mkdir(parents=True, exist_ok=True)

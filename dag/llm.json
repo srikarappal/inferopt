@@ -127,7 +127,7 @@
       ],
       "cost_launches": 1,
       "on_keep": [
-        "max_model_len_rightsize"
+        "prefix_caching"
       ],
       "on_revert": [
         "lora_max_rank"
@@ -225,12 +225,40 @@
       ],
       "cost_launches": 2,
       "on_keep": [
+        "prefix_caching"
+      ],
+      "on_revert": [
+        "prefix_caching"
+      ],
+      "scenario": "multi_lora"
+    },
+    {
+      "id": "prefix_caching",
+      "title": "Prefix caching",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "chunked_prefill"
+      ],
+      "applicable_when": "workload.prefix_overlap_per_adapter > 0.05",
+      "rationale": "Placed FIRST among the flag nodes, ahead of the batching and context nodes. On a workload with real prefix sharing this is what makes the SLO reachable at all: measured 2368ms -> 630ms TTFT and 15% -> 97% attainment on Qwen3-14B/GB10. Until attainment is high, goodput is quantised by whole requests -- at 15% attainment one request flipping moves goodput ~11%, against a 5% accept band -- so every node judged before it is decided on noise. The SLO-enabling technique has to come before the nodes measured against the SLO.",
+      "action": {
+        "set": {
+          "enable_prefix_caching": true
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
         "max_model_len_rightsize"
       ],
       "on_revert": [
         "max_model_len_rightsize"
-      ],
-      "scenario": "multi_lora"
+      ]
     },
     {
       "id": "max_model_len_rightsize",
@@ -289,40 +317,12 @@
       ],
       "cost_launches": 2,
       "on_keep": [
-        "prefix_caching"
+        "kv_block_size"
       ],
       "on_revert": [
-        "prefix_caching"
+        "kv_block_size"
       ],
       "sweep_note": "bracketed: 3rd interior point cost a launch and rarely moved the decision"
-    },
-    {
-      "id": "prefix_caching",
-      "title": "Prefix caching",
-      "class": "lossless",
-      "status": "active",
-      "requires": [
-        "chunked_prefill"
-      ],
-      "applicable_when": "workload.prefix_overlap_per_adapter > 0.05",
-      "rationale": "Pure win when prompts share prefixes, pure overhead when they do not. Under multi-LoRA the cache is keyed by (prefix, lora_id), so N adapters fragment the hit rate N ways -- the predicate uses PER-ADAPTER overlap, never the global number, which would enable caching on the strength of sharing that does not exist in practice.",
-      "action": {
-        "set": {
-          "enable_prefix_caching": true
-        }
-      },
-      "sweep": null,
-      "probes": [
-        "goodput",
-        "equivalence"
-      ],
-      "cost_launches": 1,
-      "on_keep": [
-        "kv_block_size"
-      ],
-      "on_revert": [
-        "kv_block_size"
-      ]
     },
     {
       "id": "kv_block_size",

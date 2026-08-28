@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 DATA = Path(__file__).parent / "data"
@@ -95,10 +96,17 @@ def _norm_latex(s: str) -> str:
     return s
 
 
-def _math_500(rows, gen: Generate) -> float:
+def _math_500_prompt(r) -> str:
+    return r["problem"] + "\n\nPut your final answer in \\boxed{}."
+
+
+def _ruler_prompt(r) -> str:
+    return r["prompt"]
+
+
+def _math_500(rows, gen: Generate, prompt) -> float:
     """exact_match on the final boxed answer -- MATH-500's own metric."""
-    outs = gen([r["problem"] + "\n\nPut your final answer in \\boxed{}."
-                for r in rows], 1024)
+    outs = gen([prompt(r) for r in rows], 1024)
     hit = 0
     for r, o in zip(rows, outs):
         m = _BOXED.findall(o.text)
@@ -108,10 +116,10 @@ def _math_500(rows, gen: Generate) -> float:
     return hit / len(rows)
 
 
-def _ruler(rows, gen: Generate) -> float:
+def _ruler(rows, gen: Generate, prompt) -> float:
     """accuracy -- every needle must appear. Multi-needle on purpose: the
     single-needle variant saturates at 1.00 and cannot show a regression."""
-    outs = gen([r["prompt"] for r in rows], 64)
+    outs = gen([prompt(r) for r in rows], 64)
     hit = 0
     for r, o in zip(rows, outs):
         needles = r["answers"] if isinstance(r.get("answers"), list) else [r["answer"]]
@@ -119,14 +127,14 @@ def _ruler(rows, gen: Generate) -> float:
     return hit / len(rows)
 
 
-def _humaneval_plus(rows, gen: Generate) -> float:
+def _humaneval_plus(rows, gen: Generate, prompt) -> float:
     """pass@1 by executing the generated code against the tests.
 
     Generation is implemented; SCORING is not, and deliberately so: running
     model-written code requires a real sandbox. Wiring it to bare exec() would
     be the single most dangerous line in this project.
     """
-    outs = gen([r["prompt"] for r in rows], 512)
+    outs = gen([prompt(r) for r in rows], 512)
     raise NotImplementedError(
         f"generated {len(outs)} completions, but pass@1 needs sandboxed execution.\n"
         f"Wire this to a container/nsjail runner (or the evalplus harness) before "
@@ -136,50 +144,78 @@ def _humaneval_plus(rows, gen: Generate) -> float:
     )
 
 
-BENCHMARKS: dict[str, tuple[Callable, str, int]] = {
-    "math_500": (_math_500, "exact_match", 500),
-    "ruler_multineedle": (_ruler, "accuracy", 200),
-    "humaneval_plus": (_humaneval_plus, "pass@1", 164),
+@dataclass(frozen=True)
+class Benchmark:
+    """One benchmark, with its prompt construction in ONE place.
+
+    `prompt` is here rather than inline in the scorer because it used to be in
+    both: the scorer built its own text, and the context-length filter in
+    run_benchmark guessed at `row["prompt"]`. MATH-500 rows carry `problem`, not
+    `prompt`, so the filter raised KeyError after a full two-hour traversal had
+    already completed. One source of truth removes the whole class of bug.
+
+    `max_tokens` is here for the same reason -- the filter needs to reserve room
+    for the GENERATION, and MATH-500 asks for 1024 tokens where RULER asks 64.
+    A fixed reserve would be wrong for one of them.
+    """
+    score: Callable
+    prompt: Callable
+    metric: str
+    n_full: int
+    max_tokens: int
+
+
+BENCHMARKS: dict[str, Benchmark] = {
+    "math_500": Benchmark(_math_500, _math_500_prompt, "exact_match", 500, 1024),
+    "ruler_multineedle": Benchmark(_ruler, _ruler_prompt, "accuracy", 200, 64),
+    "humaneval_plus": Benchmark(_humaneval_plus, _ruler_prompt, "pass@1", 164, 512),
 }
 
 
 def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                   max_input_tokens: int | None = None) -> float:
-    """Score one benchmark, refusing to score it on prompts the server cannot take.
+    """Score one benchmark, refusing to score prompts the server cannot take.
 
-    RULER generates 16k-33k token documents. Served under a right-sized
-    max_model_len (6144 on this workload) every one of them is rejected for
-    exceeding context, and the benchmark returns 0.0 -- for EVERY config, so the
-    gate reads "quality unchanged" instead of "probe broken". That is the same
-    shape as the accuracy gate that could never pass in the previous run, so it
-    fails loudly here instead.
+    RULER generates long documents. Served under a right-sized max_model_len,
+    every prompt can exceed the context and be rejected, and the benchmark then
+    returns 0.0 -- for EVERY config, so the gate reads "quality unchanged"
+    instead of "probe broken". That is the same shape as the accuracy gate that
+    could never pass earlier in this project, so it fails loudly here instead.
     """
     if name not in BENCHMARKS:
         raise KeyError(f"unknown benchmark {name!r}; have {', '.join(BENCHMARKS)}")
-    fn, _metric, n_full = BENCHMARKS[name]
+    b = BENCHMARKS[name]
     rows = _load(name, None if full else TRAVERSAL_N)
 
     if max_input_tokens:
-        budget = max_input_tokens - 128          # leave room for the generation
-        fits = [r for r in rows if len(r["prompt"]) // 4 < budget]
+        # Reserve room for the generation: the prompt plus what the model is
+        # asked to produce must both fit inside max_model_len.
+        budget = max_input_tokens - b.max_tokens
+        est = lambda r: len(b.prompt(r)) // 4
+        if budget <= 0:
+            raise ValueError(
+                f"{name}: max_model_len={max_input_tokens} leaves no room for a "
+                f"{b.max_tokens}-token generation. Nothing can be scored.")
+        fits = [r for r in rows if est(r) < budget]
         if not fits:
-            longest = min(len(r["prompt"]) // 4 for r in rows)
             raise ValueError(
                 f"{name}: every prompt exceeds the served context. Shortest is "
-                f"~{longest} tokens, max_model_len is {max_input_tokens}. The server "
-                f"would reject all of them and the benchmark would score 0.0 for every "
-                f"config -- indistinguishable from 'no quality change'.\n"
+                f"~{min(est(r) for r in rows)} tokens and the budget is {budget} "
+                f"(max_model_len {max_input_tokens} minus {b.max_tokens} for the "
+                f"generation). Every prompt would be rejected and the benchmark "
+                f"would score 0.0 for every config -- indistinguishable from "
+                f"'no quality change'.\n"
                 f"Regenerate at a context that fits:\n"
                 f"    python fetch_data.py --ruler-contexts {budget//2},{int(budget*0.9)}")
         if len(fits) < len(rows):
             print(f"        {name}: {len(rows)-len(fits)}/{len(rows)} prompts exceed "
-                  f"max_model_len={max_input_tokens}, scoring on {len(fits)}")
+                  f"the {budget}-token budget, scoring on {len(fits)}")
         rows = fits
-    return round(fn(rows, gen), 4)
+    return round(b.score(rows, gen, b.prompt), 4)
 
 
 def resolution(name: str, *, full: bool = False) -> float:
     """Smallest delta the sample size can express. Report it alongside the
     score: claiming a 0.5% regression on 100 items is claiming half an item."""
-    n = BENCHMARKS[name][2] if full else TRAVERSAL_N
+    n = BENCHMARKS[name].n_full if full else TRAVERSAL_N
     return 1.0 / n
