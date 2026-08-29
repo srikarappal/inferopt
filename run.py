@@ -147,7 +147,8 @@ def cmd_optimize(args) -> int:
     req = InferOptRequest(
         model=args.model, trace=args.trace,
         ttft_p99_ms=args.ttft_p99, itl_p99_ms=args.itl_p99,
-        allow_loss=args.allow_loss, adapters=args.adapter or [],
+        allow_loss=args.allow_loss, lossless_tolerance=args.lossless_tolerance,
+        adapters=args.adapter or [],
         budget_minutes=args.budget_minutes,
     )
     fp, slo = build_fingerprint(req)
@@ -399,7 +400,12 @@ def main() -> int:
     o.add_argument("--trace", required=True)
     o.add_argument("--ttft-p99", type=float, default=None)
     o.add_argument("--itl-p99", type=float, default=None)
-    o.add_argument("--allow-loss", type=float, default=None)
+    o.add_argument("--allow-loss", type=float, default=None,
+                   help="quality budget for the LOSSY branch, e.g. 0.1")
+    o.add_argument("--lossless-tolerance", type=float, default=0.03,
+                   help="how far the eval may move across the LOSSLESS branch before it "
+                        "is flagged. Default 0.03. A lossless step should not move the "
+                        "eval at all -- this is a defect threshold, not a budget.")
     o.add_argument("--adapter", action="append")
     o.add_argument("--dag", default="dag/llm.json")
     o.add_argument("--gpu", default="0")

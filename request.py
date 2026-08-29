@@ -103,6 +103,9 @@ class InferOptRequest(BaseModel):
     itl_p99_ms: float | None = Field(None, description="inter-token latency SLO")
     throughput_target_tok_s: float | None = Field(None, description="minimum acceptable throughput, if any")
 
+    lossless_tolerance: float = Field(0.03, ge=0.0, le=1.0,
+        description="how far the eval may move across the LOSSLESS branch before it is "
+                    "reported as a defect. Not a budget to spend.")
     allow_loss: float | None = Field(None, ge=0.0, le=1.0,
         description="quality budget for the lossy branch. None means explore it anyway and "
                     "return the frontier for you to pick from.")
@@ -352,5 +355,6 @@ def build_fingerprint(req: InferOptRequest) -> tuple[Fingerprint, SLO]:
         lora=detect_lora(req),
     )
     slo = SLO(ttft_p99_ms=req.ttft_p99_ms, itl_p99_ms=req.itl_p99_ms,
-              quality_budget=req.allow_loss)
+              quality_budget=req.allow_loss,
+              lossless_quality_budget=req.lossless_tolerance)
     return fp, slo

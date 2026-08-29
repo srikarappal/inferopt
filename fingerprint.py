@@ -410,7 +410,15 @@ class SLO(BaseModel):
     itl_p99_ms: float | None = Field(None, description="user |")
     throughput_target_tok_s: float | None = Field(None, description="user | minimum acceptable throughput")
     quality_budget: float | None = Field(None, ge=0.0, le=1.0,
-        description="user | allowed quality loss, or None to emit the frontier and let them pick")
+        description="user | allowed quality loss on the LOSSY branch (--allow-loss). "
+                    "None means explore anyway and return the frontier.")
+    lossless_quality_budget: float = Field(0.03, ge=0.0, le=1.0,
+        description="user | allowed quality movement on the LOSSLESS branch "
+                    "(--lossless-tolerance). A lossless step should not move the eval at "
+                    "all; anything above this is a defect worth failing on, not a budget "
+                    "to spend. Kept separate from quality_budget because conflating them "
+                    "is how the lossy gate ended up with zero width -- the measured "
+                    "lossless drift WAS the lossy budget.")
 
 
 class Fingerprint(BaseModel):
