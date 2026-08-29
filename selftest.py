@@ -99,6 +99,47 @@ def main() -> int:
     check("weights read from the single-file checkpoint, not arithmetic",
           0.5 < small.model.weight_gb < 5.0, f"{small.model.weight_gb} GB")
 
+    print("\n=== MoE and MLA across providers (config + headers only, no weights) ===")
+    from request import MoEReconciliationError, detect_model as _dm
+    from request import InferOptRequest as _R2
+    CASES = [
+        # model, published total B, published active B, expected attention
+        ("mistralai/Mixtral-8x7B-Instruct-v0.1", 46.7, 12.9, "gqa"),   # num_local_experts
+        ("Qwen/Qwen3-30B-A3B",                   30.5,  3.3, "gqa"),   # num_experts + sparse_step
+        ("moonshotai/Kimi-K2-Instruct",        1029.0, 32.0, "mla"),   # n_routed_experts + MLA
+        ("Qwen/Qwen3-14B",                       14.8, None, "gqa"),   # dense control
+    ]
+    for mid, pub_t, pub_a, attn in CASES:
+        try:
+            f = _dm(_R2(model=mid, trace="data/trace.jsonl"))
+        except Exception as ex:
+            check(f"{mid.split('/')[-1]}: fingerprints", False, f"{type(ex).__name__}: {ex}")
+            continue
+        short = mid.split("/")[-1]
+        check(f"{short}: attention_type is {attn}", f.attention_type == attn,
+              f"got {f.attention_type}")
+        check(f"{short}: total within 5% of published {pub_t}B",
+              abs(f.n_params_b - pub_t) / pub_t < 0.05, f"got {f.n_params_b:,.1f}B")
+        if pub_a:
+            act = f.active_params_b or f.n_params_b
+            check(f"{short}: active within 15% of published {pub_a}B",
+                  abs(act - pub_a) / pub_a < 0.15, f"got {act:,.1f}B")
+
+    # A MoE checkpoint whose weights do not add up must RAISE, not approximate.
+    # DeepSeek-V3's index reports 1369GB against 671B published parameters while
+    # its shard headers measure 1.22 bytes/param -- those cannot both be true.
+    raised = False
+    try:
+        _dm(_R2(model="deepseek-ai/DeepSeek-V3", trace="data/trace.jsonl"))
+    except MoEReconciliationError:
+        raised = True
+    except Exception:
+        pass
+    check("an unreconcilable MoE checkpoint RAISES rather than approximating",
+          raised,
+          "a wrong active count sets the roofline, the memory budget and the replica "
+          "count -- silently proceeding produces a whole run of confident wrong answers")
+
     print("\n=== _closed_loop: window excludes settle and drain ===")
     reqs, t0, t1 = asyncio.run(ev._closed_loop(
         "http://x", "m", ["p"] * 64, 8, 8, settle_s=0.3, window_s=0.6))
@@ -208,6 +249,32 @@ def main() -> int:
           uniq > 0.6 * len(seen),
           f"{uniq} unique of {len(seen)} issued -- replay inflates a warm prefix "
           f"cache to full-prompt hits that no production workload produces")
+
+    print("\n=== provenance: one record, shared by run.py and eval_repro ===")
+    import argparse as _ap
+    from provenance import banner as _banner, environment as _env, provenance as _prov
+    _p = _ap.ArgumentParser()
+    _p.add_argument("--alpha", default=1)
+    _p.add_argument("--beta", default="x")
+    _args = _p.parse_args(["--beta", "y"])
+    _m = _prov(_p, _args, fp, extra={"port": 8103})
+    check("records the command and cwd", "command" in _m and "cwd" in _m)
+    check("marks an EXPLICIT arg as explicit", _m["args"]["beta"]["explicit"] is True)
+    check("marks a DEFAULTED arg as not explicit", _m["args"]["alpha"]["explicit"] is False,
+          "reading a value back cannot say whether it was chosen or defaulted")
+    check("carries the default alongside the value",
+          _m["args"]["alpha"]["default"] == 1)
+    check("records the code version and whether the tree was dirty",
+          "inferopt_commit" in _m["environment"] and "inferopt_dirty" in _m["environment"])
+    check("records the resolved values the caller computed",
+          _m["resolved"]["port"] == 8103)
+    check("carries the full fingerprint",
+          set(_m["fingerprint"]) == {"model", "hardware", "workload", "lora"})
+    import pathlib as _pl
+    for f in ("run.py", "eval_repro.py"):
+        check(f"{f} uses the shared module",
+              "from provenance import" in _pl.Path(f).read_text(),
+              "two implementations of one record diverge")
 
     print("\n=== serving_metrics(): ONE implementation, used by both callers ===")
     ev.WINDOW_S, ev.WARMUP_S = 0.4, 0.1

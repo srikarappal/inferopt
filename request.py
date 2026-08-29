@@ -223,6 +223,252 @@ def _checkpoint_bytes(model: str) -> float | None:
         return None
 
 
+
+# safetensors dtype tags -> bytes. The header is the only authoritative statement
+# of what a checkpoint actually stores.
+_ST_BYTES = {"F64": 8, "I64": 8, "F32": 4, "I32": 4, "BF16": 2, "F16": 2, "I16": 2,
+             "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+             "F4": 0.5, "U4": 0.5, "I4": 0.5}
+
+
+def _stored_bytes_per_param(model: str, log=print, sample: int = 3) -> float | None:
+    """Bytes per parameter, computed from the checkpoint header. No inference.
+
+    quantization_config cannot be trusted: DeepSeek-V3 declares
+    `quant_method: fp8` and ships BF16 on the main branch -- 1369GB for 671B
+    parameters, 2.04 bytes each. Believing it gave 1369B parameters, double the
+    truth, and doubled every number downstream. Kimi-K2 declares the same thing
+    and genuinely stores FP8.
+
+    Nor is the dtype tag enough on its own. Picking the most common dtype by
+    COUNT reports F32 for Kimi-K2, because scale and norm tensors are numerous
+    and tiny while the weights they describe are few and enormous.
+
+    So the ratio is computed, not classified: a safetensors header names every
+    tensor's shape and its exact byte range, so
+
+        bytes_per_param = sum(byte ranges) / sum(prod(shape))
+
+    is exact for that shard. Several shards are sampled because a checkpoint can
+    mix widths. A header is a few KB; the weights are never touched.
+    """
+    import math
+    import struct
+
+    def _read_header(read_range):
+        raw = read_range(0, 7)
+        if not raw or len(raw) < 8:
+            return None
+        n = struct.unpack("<Q", raw[:8])[0]
+        if n <= 0 or n > 200_000_000:
+            return None
+        blob = read_range(8, 8 + n - 1)
+        return json.loads(blob) if blob else None
+
+    def _ratio(hdr) -> tuple[float, float]:
+        params = nbytes = 0.0
+        for k, v in hdr.items():
+            if k == "__metadata__" or not isinstance(v, dict):
+                continue
+            shape, off = v.get("shape"), v.get("data_offsets")
+            if not shape or not off:
+                continue
+            params += math.prod(shape)
+            nbytes += off[1] - off[0]
+        return params, nbytes
+
+    try:
+        local = Path(model)
+        readers = []
+        if local.is_dir():
+            for f in sorted(local.glob("*.safetensors"))[:sample]:
+                readers.append(lambda a2, b2, f=f: open(f, "rb").read()[a2:b2 + 1]
+                               if False else _slice(f, a2, b2))
+        else:
+            import requests
+            from huggingface_hub import hf_hub_url
+            try:
+                idx = json.loads(Path(hf_hub_download(
+                    model, "model.safetensors.index.json")).read_text())
+                shards = sorted(set(idx["weight_map"].values()))
+            except Exception:
+                shards = ["model.safetensors"]
+            # first, middle and last, so a mixed-width checkpoint is caught
+            picks = ([shards[0]] if shards else [])
+            if len(shards) > 2:
+                picks.append(shards[len(shards) // 2])
+            if len(shards) > 1:
+                picks.append(shards[-1])
+            for sh in picks[:sample]:
+                url = hf_hub_url(model, sh)
+                def rd(a2, b2, url=url):
+                    r = requests.get(url, headers={"Range": f"bytes={a2}-{b2}"}, timeout=30)
+                    return r.content if r.status_code in (200, 206) else None
+                readers.append(rd)
+
+        tot_p = tot_b = 0.0
+        for rd in readers:
+            hdr = _read_header(rd)
+            if not hdr:
+                continue
+            pp, bb = _ratio(hdr)
+            tot_p += pp
+            tot_b += bb
+        if tot_p <= 0:
+            return None
+        per = tot_b / tot_p
+        # Snap to the nearest real storage width; the raw ratio carries a little
+        # overhead from scales and padding.
+        cand = min((0.5, 1.0, 2.0, 4.0), key=lambda x: abs(x - per))
+        log(f"    checkpoint stores {per:.2f} bytes/param (measured over "
+            f"{len(readers)} shard header(s)) -> {cand}")
+        return cand
+    except Exception as e:
+        log(f"    could not read the safetensors header ({type(e).__name__}: {e})")
+        return None
+
+
+def _slice(path: Path, a: int, b: int) -> bytes:
+    with open(path, "rb") as fh:
+        fh.seek(a)
+        return fh.read(b - a + 1)
+
+
+class MoEReconciliationError(RuntimeError):
+    """A MoE model whose parameters do not add up.
+
+    Raised rather than warned. Every downstream number -- the roofline ITL floor,
+    the memory budget, the replica count, whether the SLO is reachable at all --
+    is computed from the active parameter count. Proceeding with one that does
+    not reconcile against the checkpoint produces a full run of confident wrong
+    answers, which is strictly worse than stopping.
+    """
+
+
+def _moe_shape(c: dict, n_layers: int) -> dict:
+    """Resolve MoE geometry across providers, or raise saying what is missing.
+
+    Four families, four spellings, and no two agree:
+
+      Mixtral      num_local_experts, FFN width from intermediate_size, every
+                   layer is MoE, no shared experts
+      Qwen3-MoE    num_experts, moe_intermediate_size, decoder_sparse_step for
+                   the period and mlp_only_layers for explicit dense exclusions
+      DeepSeek-V3  n_routed_experts, moe_intermediate_size, first_k_dense_replace
+                   leading dense layers, moe_layer_freq period, n_shared_experts
+      Kimi-K2      as DeepSeek, different counts
+
+    Handling only two of those spellings is what made a 384-expert 1T model
+    report n_experts=0 and is_dense=True, silently skipping every MoE decision.
+    """
+    n_routed = (c.get("num_experts") or c.get("num_local_experts")
+                or c.get("n_routed_experts") or 0)
+    if not n_routed:
+        return {}
+    n_active = c.get("num_experts_per_tok") or 0
+    if not n_active:
+        raise MoEReconciliationError(
+            f"{n_routed} experts but no num_experts_per_tok. Without it there is no "
+            f"active parameter count, and the roofline cannot be computed.")
+
+    hidden = c["hidden_size"]
+    # The MoE FFN width. Mixtral has no separate field and reuses intermediate_size;
+    # everyone else narrows each expert with moe_intermediate_size.
+    moe_inter = c.get("moe_intermediate_size") or c.get("intermediate_size")
+    if not moe_inter:
+        raise MoEReconciliationError(
+            "no moe_intermediate_size or intermediate_size; expert width unknown")
+
+    # Which layers actually hold experts.
+    if "mlp_only_layers" in c or "decoder_sparse_step" in c:          # Qwen3-MoE
+        step = int(c.get("decoder_sparse_step", 1) or 1)
+        dense_idx = set(c.get("mlp_only_layers") or [])
+        moe_idx = [i for i in range(n_layers) if i % step == 0 and i not in dense_idx]
+    elif "first_k_dense_replace" in c or "moe_layer_freq" in c:       # DeepSeek / Kimi
+        first_dense = int(c.get("first_k_dense_replace", 0) or 0)
+        freq = int(c.get("moe_layer_freq", 1) or 1)
+        moe_idx = [i for i in range(first_dense, n_layers) if (i - first_dense) % freq == 0]
+    else:                                                             # Mixtral
+        moe_idx = list(range(n_layers))
+    if not moe_idx:
+        raise MoEReconciliationError(
+            f"{n_routed} experts declared but no layer holds them "
+            f"(n_layers={n_layers}); the layer-selection fields disagree")
+
+    per_expert = 3 * hidden * moe_inter          # gate, up, down
+    routed_b = len(moe_idx) * n_routed * per_expert / 1e9
+
+    shared_b = 0.0
+    if c.get("n_shared_experts"):                                     # DeepSeek / Kimi
+        shared_b = len(moe_idx) * int(c["n_shared_experts"]) * per_expert / 1e9
+    elif c.get("shared_expert_intermediate_size"):                    # Qwen2-MoE
+        shared_b = len(moe_idx) * 3 * hidden * int(c["shared_expert_intermediate_size"]) / 1e9
+
+    return {"n_routed": n_routed, "n_active": n_active, "moe_layers": len(moe_idx),
+            "per_expert_b": per_expert / 1e9, "routed_b": routed_b, "shared_b": shared_b}
+
+
+def _reconcile_moe(shape: dict, total_b: float, from_checkpoint: bool, model: str) -> float:
+    """Active parameters, or raise if the arithmetic and the checkpoint disagree.
+
+    active = always_on + routed x (k / n)
+
+    Only the ROUTED experts scale with the routing ratio. Attention, embeddings
+    and any shared expert run on every token, and `always_on` is recovered by
+    subtracting the routed weights from the authoritative checkpoint total --
+    the checkpoint is right about bytes, the config arithmetic is only right
+    about shape.
+    """
+    routed_b, total = shape["routed_b"], total_b
+    if not from_checkpoint:
+        raise MoEReconciliationError(
+            f"{model}: MoE model with {shape['n_routed']} experts, but the parameter "
+            f"count came from arithmetic over config fields rather than the checkpoint "
+            f"index. There is nothing to reconcile the expert weights against, so the "
+            f"active count -- and every number derived from it -- would be a guess.\n"
+            f"  Fetch model.safetensors.index.json for this model, or pass a local path.")
+
+    always_on = total - routed_b
+    frac = always_on / total if total else 0.0
+    if always_on <= 0:
+        raise MoEReconciliationError(
+            f"{model}: routed experts alone come to {routed_b:,.1f}B against a checkpoint "
+            f"total of {total:,.1f}B. The expert geometry read from the config cannot be "
+            f"right, or the checkpoint is not what the config describes.\n"
+            f"  {shape['moe_layers']} MoE layers x {shape['n_routed']} experts x "
+            f"{shape['per_expert_b']*1e3:.1f}M params each")
+    # Routed experts must DOMINATE a MoE checkpoint. Measured on models that
+    # reconcile: Mixtral 96.6%, Qwen3-30B-A3B 95.1%, Kimi-K2 98.6%. A model where
+    # they account for less than 70% has weights this code cannot place, and the
+    # active count -- hence the roofline, the memory budget and the replica
+    # count -- would be built on the part it failed to explain.
+    #
+    # DeepSeek-V3 lands at 47.8% and is the reason the threshold is not looser:
+    # its index reports 1369GB against a published 671B parameters, 2.04
+    # bytes/param, while its shard headers measure 1.22. Those cannot both be
+    # right, so it is refused rather than approximated.
+    if routed_b / total < 0.70:
+        raise MoEReconciliationError(
+            f"{model}: MoE weights do not add up. Routed experts account for only "
+            f"{100*routed_b/total:.1f}% of the checkpoint ({routed_b:,.1f}B of "
+            f"{total:,.1f}B), leaving {always_on:,.1f}B this code cannot place.\n"
+            f"  geometry read: {shape['moe_layers']} MoE layers x {shape['n_routed']} "
+            f"experts x {shape['per_expert_b']*1e3:.1f}M params each\n"
+            f"  For a MoE model the experts should dominate -- models that reconcile "
+            f"sit at 95-99%. Either the expert geometry is being read wrong for this "
+            f"provider, or the checkpoint is not what the config describes.\n"
+            f"  Refusing rather than approximating: the active parameter count sets the "
+            f"roofline ITL floor, the memory budget and the replica count, and a wrong "
+            f"one produces a whole run of confident wrong answers.")
+
+    active = always_on + routed_b * (shape["n_active"] / shape["n_routed"])
+    print(f"    MoE reconciled: {routed_b:,.1f}B routed + {always_on:,.1f}B always-on "
+          f"= {total:,.1f}B; active = {active:,.1f}B "
+          f"({shape['n_active']}/{shape['n_routed']} experts over "
+          f"{shape['moe_layers']} layers)")
+    return active
+
+
 def detect_quantization_capability(sm_major: int, *, log=print) -> dict[str, bool]:
     """Which quantized variants this pipeline can PRODUCE from the served model.
 
@@ -273,17 +519,43 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
 
     n_heads = c["num_attention_heads"]
     n_kv = c.get("num_key_value_heads", n_heads)
-    attn = "mha" if n_kv == n_heads else ("mqa" if n_kv == 1 else "gqa")
+    # MLA is not detectable from the head ratio -- DeepSeek-V3 and Kimi-K2 both
+    # set num_key_value_heads == num_attention_heads, so the ratio test calls
+    # them MHA and the KV estimate comes out ~25x too high. kv_lora_rank is the
+    # actual signal.
+    if c.get("kv_lora_rank"):
+        attn = "mla"
+    elif n_kv == n_heads:
+        attn = "mha"
+    elif n_kv == 1:
+        attn = "mqa"
+    else:
+        attn = "gqa"
 
-    n_experts = c.get("num_experts") or c.get("num_local_experts") or 0
-    n_active = c.get("num_experts_per_tok") or 0
+    # Placeholders; _moe_shape below is the single source of truth for these.
+    n_experts, n_active = 0, 0
 
     # Prefer the real parameter count from the checkpoint index over arithmetic
     # on config fields, which silently omits embeddings and expert weights.
     ck_bytes = _checkpoint_bytes(req.model)
     dtype = c.get("torch_dtype") or c.get("dtype") or "bfloat16"
+
+    # torch_dtype is the COMPUTE dtype, not the STORED width. A checkpoint that
+    # ships pre-quantized stores fewer bytes per parameter, and dividing its
+    # bytes by the torch_dtype width undercounts: Kimi-K2 declares
+    # torch_dtype=bfloat16 while storing FP8, so 1029GB read as 514.6B
+    # parameters instead of ~1029B -- exactly half.
+    stored_bytes = _stored_bytes_per_param(req.model)
+    if stored_bytes is None:
+        stored_bytes = DTYPE_BYTES.get(dtype, 2)
+        qm = str((c.get("quantization_config") or {}).get("quant_method", "")).lower()
+        if qm:
+            print(f"    header unreadable and quantization_config says {qm!r}; falling back "
+                  f"to torch_dtype ({stored_bytes} bytes/param), which may be wrong -- "
+                  f"DeepSeek-V3 declares fp8 and stores BF16")
+
     if ck_bytes:
-        n_params_b = ck_bytes / DTYPE_BYTES.get(dtype, 2) / 1e9
+        n_params_b = ck_bytes / stored_bytes / 1e9
     else:
         h, L, V = c["hidden_size"], n_layers, c.get("vocab_size", 0)
         inter, kvh = c.get("intermediate_size", 4 * h), c.get("num_key_value_heads", c["num_attention_heads"])
@@ -299,9 +571,23 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
         tied = c.get("tie_word_embeddings", False)
         n_params_b = (L * (attn_params + 3 * h * inter) + (1 if tied else 2) * V * h) / 1e9
 
+    # ACTIVE PARAMETERS: what is READ per token, which bounds memory-bound decode.
+    #
+    # Only the ROUTED experts scale with the routing ratio; attention, embeddings
+    # and shared experts run on every token. The old formula scaled the WHOLE
+    # model -- total x k/n -- which on Kimi-K2 gave 21B against ~32B actual, a
+    # 35% underestimate flowing straight into the roofline.
+    #
+    # _reconcile_moe RAISES rather than guessing when the expert arithmetic and
+    # the checkpoint disagree, or when there is no checkpoint to reconcile
+    # against. A MoE model whose parameters do not add up produces a whole run of
+    # confident wrong answers -- the ITL floor, the memory budget, the replica
+    # count and whether the SLO is reachable all descend from this number.
+    shape = _moe_shape(c, n_layers)
     active_b = None
-    if n_experts:
-        active_b = n_params_b * (n_active / n_experts) if n_experts else n_params_b
+    if shape:
+        active_b = _reconcile_moe(shape, n_params_b, bool(ck_bytes), req.model)
+        n_experts, n_active = shape["n_routed"], shape["n_active"]
 
     return ModelFingerprint(
         id=req.model,
@@ -311,8 +597,11 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
         n_layers=n_layers, hidden_size=c["hidden_size"],
         n_heads=n_heads, n_kv_heads=n_kv, attention_type=attn,
         native_dtype=dtype, checkpoint_bytes=ck_bytes,
+        bytes_per_param=stored_bytes,
         full_attention_layers=full_attn,
         explicit_head_dim=c.get("head_dim"),
+        kv_lora_rank=c.get("kv_lora_rank"),
+        qk_rope_head_dim=c.get("qk_rope_head_dim"),
         is_multimodal=is_mm,
         has_mtp=bool(c.get("mtp_num_hidden_layers")),
         n_experts=n_experts, n_active_experts=n_active,

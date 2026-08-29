@@ -32,15 +32,15 @@
     "revert_semantics": "reverting discards the node's effect on the incumbent, NOT its measurements. A reverted config is still a Pareto candidate and may be the operating point the user wants.",
     "budget_guard": {
       "max_launches": {
-        "default": 20,
-        "multi_lora": 26
+        "default": 22,
+        "multi_lora": 28
       },
       "max_minutes": {
         "default": 240,
         "multi_lora": 280
       },
       "on_exceed": "stop traversal, emit the frontier from what was measured, list unvisited nodes",
-      "note": "Multi-LoRA genuinely costs more -- four extra nodes that a single-adapter or non-LoRA customer never sees. Budgeted separately rather than hidden in one averaged number. Minutes raised to accommodate graph_capture, whose single launch pays a ~40 min compile that no other node pays."
+      "note": "Raised from 20/26 when max_num_batched_tokens added two launches. The guard is a backstop against a DAG that cannot finish, not a target -- graph_capture's hint also dropped 40 -> 9 after measurement, so the minute estimate fell by ~31."
     },
     "skip_semantics": "A node is not executed when status != 'active' OR applicable_when evaluates false. In both cases the traverser follows its on_keep edge straight through. This keeps TODO and inapplicable nodes wired into the spine so enabling one is a predicate or status change, not a rewiring."
   },
@@ -317,14 +317,47 @@
       ],
       "cost_launches": 2,
       "on_keep": [
-        "kv_block_size"
+        "max_num_batched_tokens"
       ],
       "on_revert": [
-        "kv_block_size"
+        "max_num_batched_tokens"
       ],
       "sweep_note": "bracketed: 3rd interior point cost a launch and rarely moved the decision",
       "curve_crosses": true,
       "curve_note": "Negative at low concurrency -- chunking a prefill that could run in one shot is pure overhead -- and positive at high concurrency, where it stops a long prefill blocking every decode behind it. The curves cross, so a single-point measurement is a coin flip."
+    },
+    {
+      "id": "max_num_batched_tokens",
+      "title": "Scheduler token budget per step",
+      "class": "lossless",
+      "status": "active",
+      "applicable_when": "workload.p99_input_tokens > 512",
+      "rationale": "The number of tokens the scheduler may put in one forward pass, and the chunk size chunked_prefill actually uses -- the two are the same knob seen from different ends, which is why this sits next to it. vLLM's own auto_tune sweeps exactly this alongside max_num_seqs, and it was absent here entirely, so half of what the reference tool tunes was never touched. Gated on p99 input > 512 because below that a prefill fits in any budget and the knob does nothing.",
+      "curve_crosses": true,
+      "curve_note": "Crosses. A large budget lets one long prefill monopolise a step, which raises throughput at high concurrency and pushes TTFT out at low concurrency; a small budget does the reverse. Scored on its peak across the bracket, like the other crossing families.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "max_num_batched_tokens": 2048
+        },
+        {
+          "max_num_batched_tokens": 8192
+        }
+      ],
+      "sweep_note": "Values taken from vLLM's benchmarks/auto_tune ranges rather than invented, so a result here is comparable to that tool's.",
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "kv_block_size"
+      ],
+      "on_revert": [
+        "kv_block_size"
+      ]
     },
     {
       "id": "kv_block_size",
@@ -488,13 +521,14 @@
         "equivalence"
       ],
       "cost_launches": 1,
-      "cost_minutes_hint": 40,
+      "cost_minutes_hint": 9,
       "on_keep": [
         "lossless_complete"
       ],
       "on_revert": [
         "lossless_complete"
-      ]
+      ],
+      "cost_note": "~9 min measured on GB10/Qwen3-14B across runs 4, 7 and 9. Was 40, carried over from a different model on different hardware and never re-checked."
     },
     {
       "id": "lossless_complete",

@@ -365,6 +365,41 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 ref = ctx.quality_baseline.get(b)
                 if ref is not None:
                     ctx.quality_tolerance[b] = max(abs(ref - v), 1e-4)
+
+            # THE ZERO-WIDTH GATE CHECK. Both numbers exist for the first time
+            # here, so this is the first moment the lossy branch can be known to
+            # be un-passable.
+            #
+            # The gate is two thresholds: a delta at or under `tolerance` is
+            # dismissed as unresolvable, a delta over `budget` is rejected as
+            # unaffordable. If tolerance >= budget there is nothing in between --
+            # every lossy node is either ignored or rejected, and the branch
+            # cannot keep anything no matter how good it is.
+            #
+            # Run nine hit exactly this: measured tolerance 0.03 against an
+            # allow_loss of 0.03. It is the same shape as the accuracy gate that
+            # could never pass, and it must be loud rather than discovered after
+            # four launches produce nothing.
+            budget = ctx.slo.quality_budget
+            if budget is not None:
+                blocked = {b: t for b, t in ctx.quality_tolerance.items() if t >= budget}
+                if blocked:
+                    worst = max(blocked.values())
+                    log(f"\n  LOSSY BRANCH CANNOT PASS: measured quality tolerance "
+                        f"{worst:.4f} >= allow_loss {budget:.4f}")
+                    for b, t in sorted(blocked.items(), key=lambda kv: -kv[1]):
+                        log(f"    {b:22s} tolerance {t:.4f}")
+                    log(f"  Any loss at or under the tolerance is dismissed as "
+                        f"unresolvable; any loss above the budget is rejected as too "
+                        f"expensive.\n  With tolerance >= budget there is no band "
+                        f"between them, so no lossy node can be kept whatever it "
+                        f"measures.")
+                    log(f"  Raise --allow-loss above {worst:.4f}, raise the quality "
+                        f"sample size so the tolerance shrinks, or run "
+                        f"--lossless-only deliberately.")
+                    stopped = (f"lossy branch un-passable: tolerance {worst:.4f} >= "
+                               f"allow_loss {budget:.4f}")
+                    break
             log(f"        measured quality tolerance: "
                 + "  ".join(f"{k}={v:.4f}" for k, v in ctx.quality_tolerance.items()))
             ctx.quality_baseline.update(best.quality)

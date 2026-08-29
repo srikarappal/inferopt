@@ -199,6 +199,15 @@ def cmd_optimize(args) -> int:
     journal.write_text("")          # truncate once, here; traverse only appends
 
     port = free_port(args.port)
+    from provenance import banner, provenance
+    meta = provenance(ap_ref[0], args, fp, extra={
+        "port": port,
+        "seed_config": cfg,
+        "dag": args.dag,
+        "slo": slo.model_dump(),
+    })
+    (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
+    print(banner(meta, run_dir / "run_meta.json"))
     if port != args.port:
         print(f"  port      {args.port} is taken; using {port}")
     ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
@@ -362,6 +371,7 @@ def cmd_optimize(args) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     out = run_dir / "result.json"
     out.write_text(json.dumps({
+        **meta,
         "fingerprint": fp.model_dump(),
         "baseline": (baseline.__dict__ if baseline else None),
         "capacity_curve": curve,
@@ -379,8 +389,12 @@ def cmd_optimize(args) -> int:
     return 0
 
 
+ap_ref: list = [None]      # so cmd_optimize can read argument DEFAULTS for the record
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="inferopt")
+    ap_ref[0] = ap
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     t = sub.add_parser("trace", help="build a replayable workload trace")

@@ -94,10 +94,24 @@ class ModelFingerprint(BaseModel):
     # memory headroom and every decision that depends on them.
     full_attention_layers: int | None = Field(None,
         description="config | layers with a growing KV cache. None means all of them.")
+    bytes_per_param: float | None = Field(None,
+        description="registry | STORED bytes per parameter. Not the same as torch_dtype, "
+                    "which is the COMPUTE dtype: Kimi-K2 declares bfloat16 and stores FP8, "
+                    "so using torch_dtype halves the parameter count and doubles the "
+                    "roofline's view of how much has to be read per token.")
     checkpoint_bytes: float | None = Field(None,
         description="registry | weight bytes from the safetensors index. Preferred over "
                     "params x dtype: checkpoints mix precisions (fp32 norms, tied embeddings) "
                     "and the memory budget cares about bytes, not parameters.")
+    # MLA (DeepSeek-V3, Kimi-K2). Attention compresses K and V into a single
+    # low-rank latent plus a small RoPE key, so the cache is per-LAYER, not
+    # per-head. Without these the standard 2 x heads x head_dim formula
+    # overestimates by ~25x on Kimi-K2 -- 229GB per sequence at 128k context
+    # against 9.2GB actual, which mis-sizes context, batch and headroom.
+    kv_lora_rank: int | None = Field(None,
+        description="config | MLA latent dimension; presence of this IS the MLA signal")
+    qk_rope_head_dim: int | None = Field(None,
+        description="config | the RoPE key kept alongside the latent, also cached")
     explicit_head_dim: int | None = Field(None,
         description="config | head_dim when the config states it rather than implying "
                     "hidden_size/n_heads; the two disagree on some architectures")
@@ -147,7 +161,12 @@ class ModelFingerprint(BaseModel):
         is what bounds memory-bound decode -- an MoE model reads only its routed
         experts even though all of them occupy memory."""
         active = self.active_params_b if self.active_params_b is not None else self.n_params_b
-        return active * DTYPE_BYTES.get(self.native_dtype, 2)
+        # bytes_per_param, not torch_dtype. A pre-quantized checkpoint stores
+        # fewer bytes than its compute dtype implies, and this number goes
+        # straight into the roofline -- getting it wrong makes the ITL floor
+        # twice as pessimistic as physics for every FP8 checkpoint.
+        per = self.bytes_per_param or DTYPE_BYTES.get(self.native_dtype, 2)
+        return active * per
 
     @computed_field
     @property
@@ -157,11 +176,23 @@ class ModelFingerprint(BaseModel):
         The number that decides how much context fits in a given KV budget, and
         why GQA models tolerate long context so much better than MHA ones.
         """
+        if self.attention_type == "mla" and self.kv_lora_rank:
+            # MLA caches ONE compressed latent plus a RoPE key per layer, shared
+            # across heads -- not K and V per head. There is no factor of 2 and
+            # no n_kv_heads: that is the whole point of the architecture.
+            per_layer = self.kv_lora_rank + (self.qk_rope_head_dim or 0)
+            return int(self.kv_layers * per_layer
+                       * DTYPE_BYTES.get(self.native_dtype, 2))
         return int(2 * self.kv_layers * self.n_kv_heads * self.head_dim
                    * DTYPE_BYTES.get(self.native_dtype, 2))
 
     @model_validator(mode="after")
     def _check(self):
+        if self.attention_type == "mla" and not self.kv_lora_rank:
+            raise ValueError(
+                "attention_type='mla' requires kv_lora_rank -- without it the KV "
+                "formula silently falls back to the per-head one and overestimates "
+                "the cache by more than an order of magnitude")
         if self.has_compatible_draft and not self.draft_model:
             raise ValueError("has_compatible_draft=True but draft_model is unset")
         if self.n_kv_heads > self.n_heads:
