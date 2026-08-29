@@ -127,6 +127,66 @@ def _answer_of(row) -> object:
     return row.get("answer") if "answer" in row else row.get("answers")
 
 
+def provenance(ap, a, fp, tests, port, rows, bench) -> dict:
+    """Everything needed to reproduce this invocation, or to distrust it later.
+
+    Written BEFORE any measurement, so a crashed run still records what was
+    attempted. A results file that does not say which model, which flags, which
+    code and which machine produced it is a number without a claim attached --
+    and this project has already lost one measurement that way.
+
+    Args are recorded with their default alongside the value, and a flag for
+    whether it was explicit, so reading it back answers "did they set that, or
+    did it just happen to be the default at the time" -- which matters when a
+    default later changes.
+    """
+    import platform
+    import subprocess
+    import time
+
+    def _v(mod):
+        try:
+            return __import__(mod).__version__
+        except Exception:
+            return None
+
+    def _git(*args):
+        try:
+            return subprocess.run(["git", *args], capture_output=True, text=True,
+                                  timeout=10, cwd=Path(__file__).parent).stdout.strip()
+        except Exception:
+            return None
+
+    return {
+        "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "command": " ".join(sys.argv),
+        "args": {k: {"value": v, "default": ap.get_default(k),
+                     "explicit": v != ap.get_default(k)}
+                 for k, v in sorted(vars(a).items())},
+        "resolved": {
+            "port": port,                       # free_port may differ from --port
+            "configs": {name: cfg for name, cfg in tests},
+            "benchmark": {"name": a.benchmark, "metric": bench.metric,
+                          "max_tokens": bench.max_tokens,
+                          "file": str(Path("data") / f"{a.benchmark}.jsonl"),
+                          "problems_scored": len(rows)},
+        },
+        "fingerprint": {
+            "model": fp.model.model_dump(),
+            "hardware": fp.hw.model_dump(),
+        },
+        "environment": {
+            "python": platform.python_version(),
+            "executable": sys.executable,
+            "platform": platform.platform(),
+            "vllm": _v("vllm"), "torch": _v("torch"),
+            "transformers": _v("transformers"),
+            "inferopt_commit": _git("rev-parse", "HEAD"),
+            "inferopt_dirty": bool(_git("status", "--porcelain")),
+        },
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="eval_repro",
@@ -194,9 +254,17 @@ def main() -> int:
               f"unified-memory part, not a tuning choice")
     print()
 
-    ev = VllmEvaluator(fp, slo, a.trace, a.run_dir, gpu=a.gpu, port=free_port(a.port))
+    port = free_port(a.port)
+    ev = VllmEvaluator(fp, slo, a.trace, a.run_dir, gpu=a.gpu, port=port)
     outdir = Path(a.run_dir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    meta = provenance(ap, a, fp, tests, port, rows, bench)
+    (outdir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
+    print(f"  provenance -> {outdir/'run_meta.json'}  "
+          f"(commit {(meta['environment']['inferopt_commit'] or '?')[:8]}"
+          f"{', DIRTY' if meta['environment']['inferopt_dirty'] else ''}, "
+          f"vllm {meta['environment']['vllm']})\n")
     out: dict[str, dict] = {}
     keep_v: dict[str, list] = {}
     keep_t: dict[str, list] = {}
@@ -298,10 +366,7 @@ def main() -> int:
         print(f"  between them -- the only ones attributable to the change. See {ab}")
 
     p = outdir / "eval.json"
-    p.write_text(json.dumps({
-        "model": a.model, "benchmark": a.benchmark, "metric": bench.metric,
-        "n": len(rows), "repeats": a.repeats, "concurrency": a.concurrency,
-        "configs": out}, indent=2, default=str))
+    p.write_text(json.dumps({**meta, "results": out}, indent=2, default=str))
     print(f"\n  wrote {p}")
     return 0
 
