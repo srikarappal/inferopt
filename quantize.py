@@ -282,20 +282,42 @@ if kind.startswith("autoquant@"):
             verbose=True,
         )
     except ValueError as e:
-        if "infeasible" in str(e) and "minimum achievable" in str(e):
-            import re as _re
-            m = _re.search(r"minimum achievable effective bits is ([\d.]+)", str(e))
-            floor = m.group(1) if m else "?"
-            raise SystemExit(
-                f"[job] effective_bits={bits} is INFEASIBLE for {model_id}. The minimum "
-                f"achievable is {floor}, because embeddings, lm_head and routers are "
-                f"excluded from quantization and set a floor over the whole model. "
-                f"Use a budget above {floor}, or accept that this model cannot be "
-                f"compressed further with these formats.")
-        raise
+        # An infeasible budget is NOT a reason to refuse. The floor is a property
+        # of the model -- modelopt never quantizes embeddings, lm_head, routers or
+        # norms, so the whole-model average cannot go below what those force. On a
+        # 0.6B that is 7.5 bits, on a 14B roughly 4.6.
+        #
+        # Refusing here would mean the sweep silently loses a point and the eval
+        # never gets to judge anything. Produce at the floor instead and record
+        # both numbers, so the comparison says what was actually built rather
+        # than what was asked for.
+        import re as _re
+        m = _re.search(r"minimum achievable effective bits is ([\d.]+)", str(e))
+        if not ("infeasible" in str(e) and m):
+            raise
+        floor = float(m.group(1))
+        achieved = round(floor + 0.01, 4)      # clear the boundary
+        print(f"[job] effective_bits={bits} is below this model's floor of {floor}. "
+              f"Producing at {achieved} instead -- the floor is set by the "
+              f"embeddings, lm_head and routers that are never quantized.", flush=True)
+        model, state = mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": achieved},
+            quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
+            data_loader=batches,
+            forward_step=lambda m, b: m(**b).logits,
+            method="kl_div",
+            disabled_layers=ignore or None,
+            num_calib_steps=min(512, len(batches)),
+            num_score_steps=min(128, len(batches)),
+            verbose=True,
+        )
+        bits_achieved = achieved
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     (Path(out_dir) / "autoquantize_search.json").write_text(
-        json.dumps({"effective_bits": bits,
+        json.dumps({"effective_bits_requested": bits,
+                    "effective_bits_achieved": locals().get("bits_achieved", bits),
+                    "clamped_to_model_floor": "bits_achieved" in locals(),
                     "state": {k: str(v)[:4000] for k, v in (state or {}).items()}},
                    indent=2, default=str))
 elif kind in SINGLE:
