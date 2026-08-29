@@ -1,0 +1,4 @@
+{
+  "gpu_memory_utilization": 0.75,
+  "quantization": "fp8"
+}
