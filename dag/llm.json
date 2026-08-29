@@ -32,12 +32,12 @@
     "revert_semantics": "reverting discards the node's effect on the incumbent, NOT its measurements. A reverted config is still a Pareto candidate and may be the operating point the user wants.",
     "budget_guard": {
       "max_launches": {
-        "default": 22,
-        "multi_lora": 28
+        "default": 24,
+        "multi_lora": 30
       },
       "max_minutes": {
-        "default": 240,
-        "multi_lora": 280
+        "default": 480,
+        "multi_lora": 520
       },
       "on_exceed": "stop traversal, emit the frontier from what was measured, list unvisited nodes",
       "note": "Raised from 20/26 when max_num_batched_tokens added two launches. The guard is a backstop against a DAG that cannot finish, not a target -- graph_capture's hint also dropped 40 -> 9 after measurement, so the minute estimate fell by ~31."
@@ -652,7 +652,7 @@
       "cost_launches": 1,
       "cost_note": "1 launch, not 2 -- the merged arm was already measured by the incumbent at this point in the traversal, so only the alternative needs running.",
       "on_keep": [
-        "weight_fp8"
+        "weight_autoquantize"
       ],
       "on_revert": [
         "frontier"
@@ -663,99 +663,33 @@
       ]
     },
     {
-      "id": "weight_fp8",
-      "title": "FP8 weights",
+      "id": "weight_autoquantize",
+      "title": "Weight quantization: AutoQuantize search plus fixed-format references",
       "class": "lossy",
       "status": "active",
-      "requires": [
-        "lora_unmerge_for_weight_quant"
-      ],
-      "applicable_when": "fingerprint.model.can_quantize_fp8 and (fingerprint.lora.n_adapters == 0 or measurements.lora_unmerge_for_weight_quant.kept)",
-      "rationale": "First rung of the precision ladder. Halves weight bandwidth, which is the dominant cost in memory-bound decode.",
-      "constraint": "No artifact and no conversion time: vLLM quantizes the bf16 weights to FP8 during model load. Works on the CUSTOMER'S OWN model -- nothing is downloaded.",
-      "action": {
-        "set": {
-          "quantization": "fp8"
-        }
-      },
-      "sweep": null,
-      "probes": [
-        "goodput",
-        "quality"
-      ],
-      "quality_benchmarks": [
-        "math_500",
-        "ruler_multineedle"
-      ],
-      "cost_launches": 1,
-      "on_keep": [
-        "weight_int4_awq"
-      ],
-      "on_revert": [
-        "weight_int4_awq"
-      ],
-      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all. If the adapter was merged upstream, note that merging into an already-quantized base is a distinct lossy step: merge into the BF16 base first, then quantize the merged model -- never quantize then merge.",
-      "checkpoint_constraint": "The published checkpoint is of the ORIGINAL base model. It is only usable when the served weights are still the base -- i.e. no LoRA, or LoRA served unmerged on top. A merged model needs calibration, which v1 does not do.",
-      "quality_benchmarks_todo": [
-        "humaneval_plus (needs a sandboxed pass@1 runner)"
-      ],
-      "cost_minutes_hint": 0
-    },
-    {
-      "id": "weight_int4_awq",
-      "title": "INT4 weights (AWQ)",
-      "class": "lossy",
-      "status": "active",
-      "requires": [
-        "weight_fp8"
-      ],
       "applicable_when": "fingerprint.model.can_quantize_int4_awq and (fingerprint.lora.n_adapters == 0 or measurements.lora_unmerge_for_weight_quant.kept)",
-      "rationale": "Second rung. Largest memory win available, and the first point where quality damage is usually visible rather than marginal - which is exactly why it belongs on the frontier as an operating point rather than as a default.",
-      "constraint": "Produced LOCALLY from the served checkpoint by llmcompressor, calibrated on the user's own trace. Never a published -AWQ repo: the customer's model has none, and measuring someone else's would benchmark their calibration job.",
+      "rationale": "Replaces three separate single-format nodes (fp8, int4_awq, nvfp4) with one search over a BIT BUDGET. NVIDIA's AutoQuantize scores each layer's sensitivity -- KL divergence between unquantized and quantized outputs -- then solves a constrained assignment for a per-layer format: FP8 where it matters, NVFP4 where it does not, skipped where nothing survives. Fully deterministic: same model, same calibration data, same effective_bits gives the same checkpoint. It also answers 'which layers to protect' by measurement, replacing a hand-picked ignore list that was never validated.",
+      "constraint": "Produced LOCALLY from the served checkpoint, calibrated on the user's own trace. Never a published quantized repo: the customer's model has none, and measuring someone else's would benchmark their calibration job.",
       "action": {
-        "set": {
-          "quantize": "int4_awq"
-        }
+        "set": {}
       },
-      "sweep": null,
-      "probes": [
-        "goodput",
-        "quality"
-      ],
-      "quality_benchmarks": [
-        "math_500",
-        "ruler_multineedle"
-      ],
-      "cost_launches": 1,
-      "on_keep": [
-        "weight_nvfp4"
-      ],
-      "on_revert": [
-        "weight_nvfp4"
-      ],
-      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all. If the adapter was merged upstream, note that merging into an already-quantized base is a distinct lossy step: merge into the BF16 base first, then quantize the merged model -- never quantize then merge.",
-      "checkpoint_constraint": "The published checkpoint is of the ORIGINAL base model. It is only usable when the served weights are still the base -- i.e. no LoRA, or LoRA served unmerged on top. A merged model needs calibration, which v1 does not do.",
-      "quality_benchmarks_todo": [
-        "humaneval_plus (needs a sandboxed pass@1 runner)"
-      ],
-      "cost_minutes_hint": 35
-    },
-    {
-      "id": "weight_nvfp4",
-      "title": "NVFP4 weights",
-      "class": "lossy",
-      "status": "active",
-      "requires": [
-        "weight_int4_awq"
-      ],
-      "applicable_when": "fingerprint.model.can_quantize_nvfp4 and (fingerprint.lora.n_adapters == 0 or measurements.lora_unmerge_for_weight_quant.kept)",
-      "rationale": "Blackwell-class FP4 with hardware support. Expected to dominate INT4 on both speed and quality where the silicon supports it.",
-      "action": {
-        "set": {
+      "sweep": [
+        {
+          "quantize": "autoquant",
+          "quantize_bits": 6.0
+        },
+        {
+          "quantize": "autoquant",
+          "quantize_bits": 4.5
+        },
+        {
+          "quantize": "int4_awq"
+        },
+        {
           "quantize": "nvfp4"
         }
-      },
-      "sweep": null,
+      ],
+      "sweep_note": "Two bit budgets and two fixed formats, measured the same way.\n\nThe budgets are what AutoQuantize searches: effective_bits 6.0 is roughly FP8-with-headroom, 4.5 roughly NVFP4-with-protected-layers. Each is a distinct point on the size/quality curve.\n\nint4_awq and nvfp4 are whole-model single formats and are here as REFERENCES, not as candidates in their own right. AutoQuantize assigns per layer across these same formats, so it should beat both -- and if it does not, that is worth knowing, because it means the sensitivity scoring is not paying for its cost on this model. A search you never compare against the thing it replaced is a search you cannot evaluate.\n\nEvery point is MEASURED on goodput AND on the eval set. AutoQuantize optimises an internal sensitivity proxy; it cannot know whether the result helps goodput at this SLO or survives MATH-500.",
       "probes": [
         "goodput",
         "quality"
@@ -764,19 +698,20 @@
         "math_500",
         "ruler_multineedle"
       ],
-      "cost_launches": 1,
+      "quality_note": "MANDATORY. Quality on the eval set is the only thing that says whether a quantization did a good job -- goodput alone would keep a checkpoint that serves twice as fast and cannot do arithmetic. Measured against the tolerance established at lossless_complete, so a drop inside the eval's own resolution limit is not mistaken for damage.",
+      "cost_launches": 4,
+      "cost_minutes_hint": 240,
+      "cost_note": "Four conversions, four launches, four quality probes. The conversion dominates: AutoQuantize scores sensitivity with a forward pass per candidate format before calibrating the chosen assignment, so a budget point costs more than a fixed-format one. Roughly 45-80 min each on a 14B model.",
       "on_keep": [
         "retune_batching_after_weight"
       ],
       "on_revert": [
         "retune_batching_after_weight"
       ],
-      "lora_caveat": "Under multi-LoRA the quality probe must run WITH adapters applied and with a request mix matching fingerprint.lora.request_distribution. A published base-model quantization benchmark understates the damage: the adapter was trained against unquantized weights, so it is correcting for weights that no longer exist. Verify the runtime supports quantized base + LoRA for this format before trusting the node at all. If the adapter was merged upstream, note that merging into an already-quantized base is a distinct lossy step: merge into the BF16 base first, then quantize the merged model -- never quantize then merge.",
-      "quality_benchmarks_todo": [
-        "humaneval_plus (needs a sandboxed pass@1 runner)"
-      ],
-      "constraint": "Blackwell-native FP4, produced locally like int4_awq. Needs cc>=10.",
-      "cost_minutes_hint": 35
+      "reference_formats": [
+        "int4_awq",
+        "nvfp4"
+      ]
     },
     {
       "id": "retune_batching_after_weight",
@@ -784,9 +719,9 @@
       "class": "lossless",
       "status": "active",
       "requires": [
-        "weight_int4_awq"
+        "weight_autoquantize"
       ],
-      "applicable_when": "measurements.weight_fp8.kept or measurements.weight_int4_awq.kept or measurements.weight_nvfp4.kept",
+      "applicable_when": "measurements.weight_autoquantize.kept",
       "rationale": "Second interaction node, same reason as the first: quantized weights free memory and shift the arithmetic intensity, so the batching optimum moves again.",
       "action": {
         "set": {}

@@ -77,17 +77,31 @@ HERE = Path(__file__).resolve().parent
 QUANT_PKGS = HERE / ".quant-pkgs"
 ARTIFACTS = HERE / "artifacts"
 
-LLMCOMPRESSOR = "llmcompressor==0.13.0"
-# Installed alongside it because the serving env does not have them at all.
-# Everything else llmcompressor requires -- torch, transformers, datasets,
-# numpy, accelerate's peers -- is already present at a satisfying version and is
-# reused rather than duplicated. compressed-tensors is the one deliberate
-# shadow: the env has 0.17.0 (vLLM's pin) and the producer needs 0.18.0.
+# NVIDIA's own quantizer, replacing llmcompressor. Two reasons beyond provenance:
+#
+#   no pin conflicts   llmcompressor needs compressed-tensors==0.18.0 against
+#                      vLLM's ==0.17.0, which forced an isolated --target
+#                      directory and a subprocess. modelopt pins only torch>=2.8
+#                      and an unpinned numpy, so it installs into the serving env
+#                      and runs in-process.
+#   one tool           FP8, INT4-AWQ and NVFP4 from one library, plus
+#                      AutoQuantize -- a per-layer mixed-precision search that
+#                      answers "which layers to protect" by measurement rather
+#                      than by the hand-picked list below.
+#
+# setuptools is pinned because installing modelopt pulls 81.0.0 and vLLM requires
+# <81.0.0; without this the serving environment breaks on the next launch.
 PRODUCER_PKGS = [
-    LLMCOMPRESSOR,
-    "compressed-tensors==0.18.0",
-    "accelerate<=1.14.0,>=1.6.0",
-    "auto-round<=0.14.2,>=0.14.1",
+    "nvidia-modelopt",
+    # transformers needs accelerate for device_map="auto", which is how a model
+    # too large for one GPU gets loaded for calibration. Loose pins: torch>=2.0,
+    # numpy>=1.17, nothing that collides with vLLM.
+    "accelerate",
+    # LAST, and deliberately. Installing modelopt pulls setuptools 81.0.0 while
+    # vLLM requires <81.0.0; without pinning it back the serving environment
+    # breaks on the next launch -- a quantizer that silently disables the server
+    # it is quantizing for.
+    "setuptools<81.0.0",
 ]
 
 # A small model with the same architecture family as the targets, used only to
@@ -103,8 +117,12 @@ CALIB_MAX_TOKENS = 2048
 # --------------------------------------------------------------------------
 
 def producer_available() -> bool:
-    """True if the isolated producer is installed and importable."""
-    return (QUANT_PKGS / "llmcompressor").is_dir()
+    """True if modelopt is importable. No isolated directory -- see PRODUCER_PKGS."""
+    try:
+        import modelopt.torch.quantization  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def setup(log=print) -> bool:
@@ -116,12 +134,10 @@ def setup(log=print) -> bool:
     is installed here, where it shadows the env's 0.17.0 for this subprocess
     only. Installing full deps would pull a second ~2.5GB torch for no benefit.
     """
-    QUANT_PKGS.mkdir(parents=True, exist_ok=True)
     for pkg in PRODUCER_PKGS:
-        log(f"  installing {pkg} -> {QUANT_PKGS.name}/")
+        log(f"  installing {pkg}")
         r = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet",
-             "--target", str(QUANT_PKGS), "--no-deps", "--upgrade", pkg],
+            [sys.executable, "-m", "pip", "install", "--quiet", pkg],
             capture_output=True, text=True)
         if r.returncode != 0:
             log(f"  FAILED: {r.stderr.strip()[-500:]}")
@@ -131,13 +147,14 @@ def setup(log=print) -> bool:
 
 
 def _child_env() -> dict:
-    """PYTHONPATH puts .quant-pkgs FIRST so its compressed-tensors shadows the
-    env's 0.17.0. Everything else resolves to the serving env as normal."""
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(QUANT_PKGS) + os.pathsep + env.get("PYTHONPATH", "")
-    # The producer must not silently reach for a published quantization.
-    env["HF_HUB_OFFLINE"] = env.get("HF_HUB_OFFLINE", "0")
-    return env
+    """The serving env, plus PATH so the child can find ninja.
+
+    modelopt needs no shadowing -- it has no pin conflicts with vLLM, which is
+    most of why it replaced llmcompressor. The subprocess remains only to keep a
+    multi-GB model load out of the parent process.
+    """
+    from evaluator import child_env
+    return child_env()
 
 
 # --------------------------------------------------------------------------
@@ -188,16 +205,28 @@ def sensitivity_ignore(fp, *, log=print) -> list[str]:
     return ignore
 
 
+# modelopt config per format. These are NVIDIA's own presets, not hand-rolled
+# recipes -- the point of switching from llmcompressor was to stop maintaining a
+# second opinion about how to quantize.
+MODELOPT_CFG = {
+    "fp8":      "FP8_DEFAULT_CFG",
+    "int4_awq": "INT4_AWQ_CFG",
+    "nvfp4":    "NVFP4_DEFAULT_CFG",
+}
+
 _JOB = r'''
-import json, sys, os
+import json, sys
 from pathlib import Path
 model_id, kind, out_dir, calib_path, ignore_json = sys.argv[1:6]
 ignore = json.loads(ignore_json)
+CALIB_MAX_TOKENS = 2048
 
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from llmcompressor import oneshot
-from llmcompressor.modifiers.awq import AWQModifier
-from llmcompressor.modifiers.quantization import QuantizationModifier
+import modelopt.torch.quantization as mtq
+from modelopt.torch.export import export_hf_checkpoint
+
+SINGLE = {"fp8": "FP8_DEFAULT_CFG", "int4_awq": "INT4_AWQ_CFG", "nvfp4": "NVFP4_DEFAULT_CFG"}
 
 tok = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
@@ -205,28 +234,69 @@ model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", devic
 prompts = [json.loads(l)["prompt"] for l in open(calib_path) if l.strip()]
 print(f"[job] {len(prompts)} calibration prompts from the workload trace", flush=True)
 
-from datasets import Dataset
-ds = Dataset.from_dict({"text": prompts})
-ds = ds.map(lambda r: tok(r["text"], truncation=True, max_length=%(maxtok)d))
+batches = []
+for p in prompts:
+    enc = tok(p, return_tensors="pt", truncation=True, max_length=CALIB_MAX_TOKENS)
+    batches.append({k: v.to(model.device) for k, v in enc.items()})
 
-print(f"[job] keeping at full precision: {ignore}", flush=True)
+if kind.startswith("autoquant@"):
+    bits = float(kind.split("@", 1)[1])
+    # AutoQuantize: score every layer's sensitivity, then solve for a per-layer
+    # format assignment that hits `effective_bits`. Sensitive layers keep FP8,
+    # tolerant ones drop to NVFP4, and the truly sensitive are skipped entirely.
+    #
+    # method="kl_div" measures the divergence between unquantized and quantized
+    # outputs. The alternative, "gradient", is more principled but needs labels
+    # and a backward pass -- and we have prompts from a workload trace, not a
+    # labelled set. KL needs only a forward pass returning logits.
+    print(f"[job] auto_quantize to effective_bits={bits}, method=kl_div", flush=True)
+    model, state = mtq.auto_quantize(
+        model,
+        constraints={"effective_bits": bits},
+        quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
+        data_loader=batches,
+        forward_step=lambda m, b: m(**b).logits,
+        method="kl_div",
+        disabled_layers=ignore or None,
+        num_calib_steps=min(512, len(batches)),
+        num_score_steps=min(128, len(batches)),
+        verbose=True,
+    )
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    (Path(out_dir) / "autoquantize_search.json").write_text(
+        json.dumps({"effective_bits": bits,
+                    "state": {k: str(v)[:4000] for k, v in (state or {}).items()}},
+                   indent=2, default=str))
+elif kind in SINGLE:
+    # Single-format PTQ. modelopt's presets already exclude lm_head, *router*,
+    # *mlp.gate.*, vision towers and MTP heads, so `ignore` only adds to that.
+    cfg = getattr(mtq, SINGLE[kind])
+    print(f"[job] {SINGLE[kind]}; additionally disabling {ignore}", flush=True)
 
-if kind == "int4_awq":
-    # W4A16: 4-bit weights, 16-bit activations. Group size 128 is the AWQ
-    # default and what awq_marlin kernels expect. Asymmetric because weight
-    # distributions after fine-tuning are rarely centred on zero.
-    recipe = AWQModifier(ignore=ignore, scheme="W4A16_ASYM", targets=["Linear"])
-elif kind == "nvfp4":
-    recipe = QuantizationModifier(ignore=ignore, scheme="NVFP4", targets=["Linear"])
+    def forward_loop(m):
+        for i, b in enumerate(batches):
+            with torch.no_grad():
+                m(**b)
+            if (i + 1) % 32 == 0:
+                print(f"[job] calibrated {i+1}/{len(batches)}", flush=True)
+
+    if ignore:
+        import copy
+        cfg = copy.deepcopy(cfg)
+        # quant_cfg is a LIST of {quantizer_name, ...} entries in modelopt 0.46,
+        # not a pattern-keyed dict.
+        for pat in ignore:
+            key = pat[3:] if pat.startswith("re:") else pat
+            cfg["quant_cfg"].append(
+                {"quantizer_name": f"*{key.strip('*.^$')}*", "enable": False})
+    model = mtq.quantize(model, cfg, forward_loop)
 else:
     raise SystemExit(f"[job] unknown kind {kind!r}")
 
-oneshot(model=model, dataset=ds, recipe=recipe,
-        max_seq_length=%(maxtok)d, num_calibration_samples=len(prompts),
-        output_dir=out_dir)
+export_hf_checkpoint(model, export_dir=out_dir)
 tok.save_pretrained(out_dir)
 print(f"[job] wrote {out_dir}", flush=True)
-''' % {"maxtok": CALIB_MAX_TOKENS}
+'''
 
 
 def _write_calibration(trace_path: str, dest: Path, n: int = N_CALIB) -> int:
@@ -252,14 +322,16 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
     measuring the unquantized model while reporting it as quantized.
     """
     if kind == "fp8":
-        return None
+        return None      # a load-time flag, no artifact
     if not producer_available():
         raise RuntimeError(
             f"cannot produce {kind}: the producer is not installed.\n"
             f"    python quantize.py --setup")
 
     model_id = fp.model.id
-    out = ARTIFACTS / f"{model_id.replace('/', '__')}--{kind}"
+    # The bit budget is part of the identity: autoquant@6.0 and autoquant@4.5 are
+    # different checkpoints and must not share a directory or a cache hit.
+    out = ARTIFACTS / f"{model_id.replace('/', '__')}--{kind.replace('@', '_')}"
     if (out / "config.json").exists():
         log(f"  quant     reusing {out.relative_to(HERE)}")
         return str(out)
@@ -306,8 +378,19 @@ def smoke(log=print) -> bool:
 
     calib = ARTIFACTS / "smoke.trace.jsonl"
     calib.parent.mkdir(parents=True, exist_ok=True)
+    # A COMPLETE trace record, not just prompts. The same file is handed to
+    # build_fingerprint, and WorkloadFingerprint.from_trace needs input_tokens,
+    # output_tokens and arrival_ts to exist -- a prompts-only file raised
+    # KeyError: 'input_tokens' before the producer was ever reached.
     calib.write_text("\n".join(
-        json.dumps({"prompt": f"Explain in one sentence why item {i} matters."})
+        json.dumps({
+            "prompt": f"Explain in one or two sentences why consideration {i} "
+                      f"matters when designing a distributed system, and give one "
+                      f"concrete example.",
+            "input_tokens": 32, "output_tokens": 64,
+            "arrival_ts": round(i * 0.1, 3),
+            "prefix_id": None, "adapter_id": None, "temperature": 0.0,
+        })
         for i in range(64)) + "\n")
 
     ok = True

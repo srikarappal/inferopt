@@ -433,6 +433,14 @@ class VllmEvaluator:
         # launch, and never to a downloaded checkpoint -- see quantize.py.
         config = dict(config)
         kind = config.pop("quantize", None)
+        # effective_bits travels as its own key: "autoquant@6.0" in a sweep value
+        # gets parsed as a predicate expression by validate_dag, where @ is
+        # MatMult. The producer still wants them joined.
+        bits = config.pop("quantize_bits", None)
+        if kind == "autoquant":
+            if bits is None:
+                raise LaunchError("quantize=autoquant requires quantize_bits")
+            kind = f"autoquant@{float(bits)}"
         if kind:
             from quantize import ensure_variant
             path = ensure_variant(self.fp, kind, self.trace_path, log=self.log)
