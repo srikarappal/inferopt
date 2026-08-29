@@ -526,6 +526,59 @@ class VllmEvaluator:
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
     # --- capacity ---
+    def serving_metrics(self, model, concurrency: int, *, el=lambda: "",
+                        cursor: list[int] | None = None, warmup: bool = True):
+        """THE serving measurement. One implementation, used by everything.
+
+        Open loop at the trace's arrival rate with a semaphore cap of
+        `concurrency`, a fixed WINDOW_S window, REPEATS passes, aggregated
+        direction-aware -- min for goodput and throughput, MAX for TTFT and ITL,
+        so every metric is reported at its least flattering observed value.
+
+        Extracted because eval_repro.py had a second, DIFFERENT measurement
+        bolted on: a single closed-loop point with no warmup, no repeats and no
+        direction-aware aggregation, described in its own comment as "directly
+        comparable" to a traversal. It was not. Two implementations of the same
+        measurement diverge -- that is how the prompt-building bug got in, and
+        how a number gets reported against a claim it does not support.
+
+        Returns (aggregated, per-pass) so a caller can report the worst case and
+        still see the spread behind it.
+        """
+        cursor = [0] if cursor is None else cursor
+        if warmup:
+            self.log(f"        {el()} warming up {WARMUP_S:.0f}s")
+            asyncio.run(_load(self.base_url, model, self.prompts, self.max_tokens,
+                              self.qps, self.conc, WARMUP_S, cursor=cursor))
+        passes = []
+        for i in range(REPEATS):
+            reqs, t0, t1, offered, started = asyncio.run(
+                _load(self.base_url, model, self.prompts, self.max_tokens,
+                      self.qps, concurrency, WINDOW_S, cursor=cursor))
+            m = summarize(reqs, t0, t1, self.slo)
+            m["concurrency"] = concurrency
+            m["offered"], m["started"] = offered, started
+            passes.append(m)
+            self.log(f"        {el()} pass {i+1}/{REPEATS}  "
+                     f"goodput {m['goodput']:7.1f} tok/s "
+                     f"({m['goodput_req_s']:.2f} req/s)  "
+                     f"thru {m['throughput']:7.1f}  "
+                     f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  "
+                     f"itl_p99 {m['itl_p99_ms']:6.1f}ms  "
+                     f"slo {m['slo_attainment']:.0%}  "
+                     f"({m['completed']} ok/{m['failed']} fail, "
+                     f"{started}/{offered} started)")
+        med = aggregate(passes)
+        med["concurrency"] = concurrency
+        spread = ((max(p["goodput"] for p in passes) - min(p["goodput"] for p in passes))
+                  / max(1e-9, abs(min(p["goodput"] for p in passes))))
+        med["pass_spread"] = spread
+        if spread > 0.10:
+            self.log(f"        {el()} NOTE pass-to-pass goodput spread {spread:.0%} "
+                     f"at L={concurrency} -- larger than the accept band, so a "
+                     f"keep/revert decision here is not resolvable at this sample size")
+        return med, passes
+
     def _point(self, model, L: int, el, label: str = "",
                cursor: list[int] | None = None) -> dict:
         """One closed-loop measurement at concurrency L on a live server.
@@ -623,32 +676,9 @@ class VllmEvaluator:
                     # the window opens on a drained server rather than a settled
                     # one.
                     conc = fixed_concurrency
-                    passes, pts = [], []
-                    for i in range(REPEATS):
-                        reqs, t0, t1, offered, started = asyncio.run(
-                            _load(self.base_url, model, self.prompts,
-                                  self.max_tokens, self.qps, conc, WINDOW_S,
-                                  cursor=cursor))
-                        m = summarize(reqs, t0, t1, self.slo)
-                        m["concurrency"] = conc
-                        passes.append(m)
-                        self.log(f"        {el()} pass {i+1}/{REPEATS}  "
-                                 f"goodput {m['goodput']:7.1f} tok/s "
-                                 f"({m['goodput_req_s']:.2f} req/s)  "
-                                 f"thru {m['throughput']:7.1f}  "
-                                 f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  "
-                                 f"slo {m['slo_attainment']:.0%}  "
-                                 f"({m['completed']} ok/{m['failed']} fail, "
-                                 f"{started}/{offered} started)")
-                    med = aggregate(passes)
-                    spread = ((max(p["goodput"] for p in passes)
-                               - min(p["goodput"] for p in passes))
-                              / max(1e-9, abs(min(p["goodput"] for p in passes))))
-                    if spread > 0.10:
-                        self.log(f"        {el()} NOTE pass-to-pass goodput spread "
-                                 f"{spread:.0%} at L={conc} -- larger than the accept "
-                                 f"band, so a keep/revert decision here is not "
-                                 f"resolvable at this sample size")
+                    pts = []
+                    med, passes = self.serving_metrics(
+                        model, conc, el=el, cursor=cursor, warmup=False)
                     diag = self._metrics()
                     div = self._equivalence(model) if "equivalence" in probes else None
                     if div is not None:

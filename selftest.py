@@ -209,6 +209,30 @@ def main() -> int:
           f"{uniq} unique of {len(seen)} issued -- replay inflates a warm prefix "
           f"cache to full-prompt hits that no production workload produces")
 
+    print("\n=== serving_metrics(): ONE implementation, used by both callers ===")
+    ev.WINDOW_S, ev.WARMUP_S = 0.4, 0.1
+    med, passes = e.serving_metrics("m", 12, warmup=False)
+    check("returns an aggregate and the passes behind it",
+          isinstance(med, dict) and len(passes) == ev.REPEATS,
+          f"{len(passes)} passes, expected {ev.REPEATS}")
+    check("aggregate is direction-aware: ttft is the WORST pass",
+          med["ttft_p99_ms"] == max(p["ttft_p99_ms"] for p in passes),
+          "an optimistic TTFT is exactly backwards for an SLO gate")
+    check("and goodput is the worst (lowest) pass",
+          med["goodput"] == min(p["goodput"] for p in passes))
+    check("concurrency is recorded on the aggregate", med.get("concurrency") == 12)
+    check("pass-to-pass spread is reported", "pass_spread" in med)
+    import inspect as _i
+    src_ev = _i.getsource(ev.VllmEvaluator.measure)
+    check("measure() delegates rather than keeping its own copy",
+          "self.serving_metrics(" in src_ev,
+          "two implementations of one measurement diverge -- that is how a "
+          "number gets reported against a claim it does not support")
+    import pathlib as _p
+    check("eval_repro uses the same function, not a lookalike",
+          "ev.serving_metrics(" in _p.Path("eval_repro.py").read_text()
+          and "ev._point(" not in _p.Path("eval_repro.py").read_text())
+
     print("\n=== aggregate(): worst case in BOTH directions ===")
     a = {"goodput": 200.0, "ttft_p99_ms": 400.0, "slo_attainment": 1.0, "concurrency": 30}
     b = {"goodput": 150.0, "ttft_p99_ms": 900.0, "slo_attainment": 0.8, "concurrency": 30}

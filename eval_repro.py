@@ -295,25 +295,24 @@ def main() -> int:
                 s, v, t = score_once(ev, model, rows, bench, a.concurrency)
                 scores.append(s); verdicts.append(v); texts.append(t)
                 print(f"      repeat {i+1}/{a.repeats}   {s:.4f}   ({sum(v)}/{len(v)})")
-            # SERVING METRICS, in the same launch, on the TRACE.
+            # SERVING METRICS -- the traversal's exact instrument, not a
+            # lookalike. serving_metrics() is the same function run.py's
+            # --fixed-concurrency path calls: open loop at the trace's arrival
+            # rate with a semaphore cap, WINDOW_S windows, REPEATS passes,
+            # aggregated direction-aware so TTFT is the WORST pass rather than
+            # the best.
             #
-            # Accuracy alone cannot say whether an optimization was worth it, and
-            # the accuracy probe cannot supply the other half: it issues
-            # NON-STREAMING requests, where ttft is set equal to the full request
-            # latency, so every timing it collects is meaningless as a TTFT. It
-            # also runs the benchmark's prompts, not production traffic.
-            #
-            # So the serving numbers come from a closed-loop measurement on the
-            # workload trace at a fixed concurrency -- the same instrument the
-            # traversal uses, so a checkpoint measured here is directly
-            # comparable to a config measured there.
+            # This previously called a single closed-loop _point with no warmup,
+            # no repeats and no direction-aware aggregation, while a comment
+            # claimed it was "directly comparable" to a traversal. It was a
+            # different instrument, and the claim was wrong.
             serving = None
             if not a.no_serving:
                 import time as _t
-                t_start = _t.time()
-                serving = ev._point(model, a.serving_concurrency,
-                                    lambda: f"+{(_t.time()-t_start)/60:4.1f}m",
-                                    cursor=[0])
+                t0_ = _t.time()
+                serving, serving_passes = ev.serving_metrics(
+                    model, a.serving_concurrency,
+                    el=lambda: f"+{(_t.time()-t0_)/60:4.1f}m", cursor=[0])
 
         flips = sum(1 for i in range(len(rows)) if len({v[i] for v in verdicts}) > 1)
         moved = sum(1 for i in range(len(rows)) if len({t[i] for t in texts}) > 1)
