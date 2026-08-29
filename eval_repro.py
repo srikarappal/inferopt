@@ -44,6 +44,17 @@ and a token near a decision boundary flips. Measured flip rate on this rig is
 changes the final boxed answer entirely. `--concurrency 1` serialises the probe
 so there is a single batch composition; if it still moves, look elsewhere.
 
+BOTH HALVES, ONE LAUNCH. Accuracy alone cannot say whether an optimization was
+worth it, so each config is also measured for goodput, throughput, TTFT p99 and
+ITL p99 -- on the workload TRACE at a fixed concurrency, using the same
+closed-loop instrument the traversal uses, so a quantized checkpoint scored here
+is directly comparable to a config measured there.
+
+The accuracy probe cannot supply those numbers itself: it issues NON-STREAMING
+requests, where ttft is set equal to the whole request latency, so every timing
+it collects is meaningless as a TTFT. It also runs the benchmark's prompts rather
+than production traffic. --no-serving skips it.
+
 Every generation is written to disk. A summary statistic cannot be reopened, and
 the first question after "the score moved" is "moved how".
 """
@@ -210,6 +221,12 @@ def main() -> int:
                     help="only used to build the hardware/model fingerprint")
     ap.add_argument("--gpu", default="0")
     ap.add_argument("--port", type=int, default=8100)
+    ap.add_argument("--serving-concurrency", type=int, default=30,
+                    help="in-flight requests for the serving measurement. 30 matches "
+                         "--fixed-concurrency in the traversal runs, so the numbers are "
+                         "directly comparable.")
+    ap.add_argument("--no-serving", action="store_true",
+                    help="score accuracy only, skip the goodput/TTFT/ITL measurement")
     ap.add_argument("--run-dir", default="runs/eval")
     a = ap.parse_args()
 
@@ -278,11 +295,36 @@ def main() -> int:
                 s, v, t = score_once(ev, model, rows, bench, a.concurrency)
                 scores.append(s); verdicts.append(v); texts.append(t)
                 print(f"      repeat {i+1}/{a.repeats}   {s:.4f}   ({sum(v)}/{len(v)})")
+            # SERVING METRICS, in the same launch, on the TRACE.
+            #
+            # Accuracy alone cannot say whether an optimization was worth it, and
+            # the accuracy probe cannot supply the other half: it issues
+            # NON-STREAMING requests, where ttft is set equal to the full request
+            # latency, so every timing it collects is meaningless as a TTFT. It
+            # also runs the benchmark's prompts, not production traffic.
+            #
+            # So the serving numbers come from a closed-loop measurement on the
+            # workload trace at a fixed concurrency -- the same instrument the
+            # traversal uses, so a checkpoint measured here is directly
+            # comparable to a config measured there.
+            serving = None
+            if not a.no_serving:
+                import time as _t
+                t_start = _t.time()
+                serving = ev._point(model, a.serving_concurrency,
+                                    lambda: f"+{(_t.time()-t_start)/60:4.1f}m",
+                                    cursor=[0])
+
         flips = sum(1 for i in range(len(rows)) if len({v[i] for v in verdicts}) > 1)
         moved = sum(1 for i in range(len(rows)) if len({t[i] for t in texts}) > 1)
         spread = max(scores) - min(scores)
         print(f"      score {statistics.fmean(scores):.4f}   spread {spread:.4f}   "
               f"verdict flips {flips}/{len(rows)}   text changed {moved}/{len(rows)}")
+        if serving:
+            print(f"      serving  goodput {serving['goodput']:.1f} tok/s "
+                  f"({serving['goodput_req_s']:.2f} req/s)  thru {serving['throughput']:.1f}  "
+                  f"ttft_p99 {serving['ttft_p99_ms']:.0f}ms  itl_p99 {serving['itl_p99_ms']:.1f}ms  "
+                  f"slo {serving['slo_attainment']:.0%}  at L={a.serving_concurrency}")
 
         # Every generation to disk. A summary statistic cannot be reopened, and
         # the first question after "the score moved" is "moved how".
@@ -309,13 +351,27 @@ def main() -> int:
             print(f"      wrote {fl}  ({flips} problems that disagreed with THEMSELVES)")
         print()
         out[name] = {"scores": scores, "mean": statistics.fmean(scores), "spread": spread,
-                     "verdict_flips": flips, "text_changed": moved, "config": cfg}
+                     "verdict_flips": flips, "text_changed": moved, "config": cfg,
+                     "serving": serving}
         keep_v[name], keep_t[name] = verdicts, texts
 
     print(f"  {'='*70}")
     print(f"  {a.model}   {a.benchmark}   n={len(rows)}")
+    hdr = f"    {'config':12s} {'accuracy':>9s} {'spread':>7s}"
+    if not a.no_serving:
+        hdr += f" {'goodput':>9s} {'thru':>8s} {'ttft p99':>9s} {'itl p99':>8s} {'slo':>5s}"
+    print(hdr)
     for name, o in out.items():
-        print(f"    {name:12s} {o['mean']:.4f}   spread {o['spread']:.4f}")
+        line = f"    {name:12s} {o['mean']:9.4f} {o['spread']:7.4f}"
+        sv = o.get("serving")
+        if sv:
+            line += (f" {sv['goodput']:9.1f} {sv['throughput']:8.1f} "
+                     f"{sv['ttft_p99_ms']:8.0f}m {sv['itl_p99_ms']:7.1f}m "
+                     f"{sv['slo_attainment']:5.0%}")
+        print(line)
+    if not a.no_serving:
+        print(f"    serving numbers measured on {a.trace} at concurrency "
+              f"{a.serving_concurrency}, not on the benchmark")
 
     if len(tests) == 1:
         o = next(iter(out.values()))
