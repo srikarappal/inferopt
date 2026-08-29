@@ -240,7 +240,8 @@ async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
     return r
 
 
-async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds):
+async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds,
+                cursor: list[int] | None = None):
     """Offer load for `seconds`, then drain only the requests that started.
 
     The window is open-loop: requests are submitted at `qps` whether or not the
@@ -268,10 +269,19 @@ async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds):
             async with sem:
                 live.add(asyncio.current_task())
                 out.append(await _one(c, base_url, model, p, max_tokens))
+        # The prompt index ADVANCES ACROSS PHASES. It used to restart at 0 on
+        # every call, so warmup, pass 1 and pass 2 all served prompts 0..59 --
+        # identical full prompts, which a warm prefix cache hits completely.
+        # That inflated the measured hit rate to 72% where real prefix sharing
+        # in this trace accounts for 20%, and it was most of the prefix_caching
+        # win. A cursor shared across one measure() call keeps the phases
+        # disjoint; it resets per node, so every config still sees the same
+        # prompt sequence and comparisons stay paired.
+        base = cursor[0] if cursor is not None else 0
         tasks, i = [], 0
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < seconds:
-            tasks.append(asyncio.create_task(go(prompts[i % len(prompts)])))
+            tasks.append(asyncio.create_task(go(prompts[(base + i) % len(prompts)])))
             i += 1
             await asyncio.sleep(interval) if interval else await asyncio.sleep(0)
         t1 = time.perf_counter()
@@ -279,11 +289,14 @@ async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds):
             if t not in live and not t.done():
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+    if cursor is not None:
+        cursor[0] = base + len(live)      # advance by what actually ran
     return out, t0, t1, len(tasks), len(live)
 
 
 async def _closed_loop(base_url, model, prompts, max_tokens, conc,
-                       settle_s: float, window_s: float):
+                       settle_s: float, window_s: float,
+                       cursor: list[int] | None = None):
     """Hold exactly `conc` requests in flight, replacing each as it completes.
 
     The open-loop driver above fixes the ARRIVAL RATE and lets concurrency
@@ -316,6 +329,8 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
     after it simply fall outside.
     """
     out: list[Req] = []
+    issued = [0]
+    base = cursor[0] if cursor is not None else 0
     start = time.perf_counter()
     t0 = start + settle_s                 # measurement window opens
     t1 = t0 + window_s                    # and closes
@@ -323,10 +338,17 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
         async def worker(slot: int):
             i = slot
             while time.perf_counter() < t1:
-                out.append(await _one(c, base_url, model, prompts[i % len(prompts)], max_tokens))
+                # Same reason as _load: phases must not replay the same prompts,
+                # or a warm prefix cache scores full-prompt hits that no
+                # production workload would produce.
+                issued[0] += 1
+                out.append(await _one(c, base_url, model,
+                                      prompts[(base + i) % len(prompts)], max_tokens))
                 i += conc
         await asyncio.gather(*[asyncio.create_task(worker(k)) for k in range(conc)],
                              return_exceptions=True)
+    if cursor is not None:
+        cursor[0] = base + issued[0]
     return out, t0, t1
 
 
@@ -504,7 +526,8 @@ class VllmEvaluator:
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
     # --- capacity ---
-    def _point(self, model, L: int, el, label: str = "") -> dict:
+    def _point(self, model, L: int, el, label: str = "",
+               cursor: list[int] | None = None) -> dict:
         """One closed-loop measurement at concurrency L on a live server.
 
         Settle and window are a single continuous run so the window observes a
@@ -512,7 +535,7 @@ class VllmEvaluator:
         """
         reqs, t0, t1 = asyncio.run(_closed_loop(
             self.base_url, model, self.prompts, self.max_tokens, L,
-            getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S))
+            getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S, cursor=cursor))
         m = summarize(reqs, t0, t1, self.slo)
         m["concurrency"] = L
         self.log(f"        {el()} L={L:<4d} goodput {m['goodput']:7.1f} tok/s "
@@ -574,11 +597,15 @@ class VllmEvaluator:
         el = lambda: f"+{(time.time()-t_start)/60:4.1f}m"
         changed = {k: v for k, v in config.items() if k != "model"}
         self.log(f"        {el()} launching  {json.dumps(changed, default=str)[:88]}")
+        # Reset per node, advanced across the phases WITHIN a node. Paired
+        # comparison between configs is preserved; replay within a node is not.
+        cursor = [0]
         try:
             with self._serve(config, tag) as model:
                 self.log(f"        {el()} healthy, warming up {WARMUP_S:.0f}s")
                 asyncio.run(_load(self.base_url, model, self.prompts,
-                                  self.max_tokens, self.qps, self.conc, WARMUP_S))
+                                  self.max_tokens, self.qps, self.conc, WARMUP_S,
+                                  cursor=cursor))
 
                 if fixed_concurrency:
                     # RUN-FOUR REPRODUCTION MODE.
@@ -600,7 +627,8 @@ class VllmEvaluator:
                     for i in range(REPEATS):
                         reqs, t0, t1, offered, started = asyncio.run(
                             _load(self.base_url, model, self.prompts,
-                                  self.max_tokens, self.qps, conc, WINDOW_S))
+                                  self.max_tokens, self.qps, conc, WINDOW_S,
+                                  cursor=cursor))
                         m = summarize(reqs, t0, t1, self.slo)
                         m["concurrency"] = conc
                         passes.append(m)
@@ -682,7 +710,7 @@ class VllmEvaluator:
                     {max(2, base_L // 2), base_L, base_L * 2})
                 pts: list[dict] = []
                 for L in use:
-                    pts.append(self._point(model, L, el))
+                    pts.append(self._point(model, L, el, cursor=cursor))
 
                 # If the best sits at an endpoint the bracket did not contain the
                 # peak; walk outward rather than reporting a boundary as a
@@ -695,11 +723,11 @@ class VllmEvaluator:
                         if nxt > 1024:
                             break
                         self.log(f"        {el()} peak at the top of the bracket, extending to L={nxt}")
-                        pts.append(self._point(model, nxt, el))
+                        pts.append(self._point(model, nxt, el, cursor=cursor))
                     elif best_i == 0 and pts[0]["concurrency"] > 2:
                         nxt = max(2, pts[0]["concurrency"] // 2)
                         self.log(f"        {el()} peak at the bottom of the bracket, extending to L={nxt}")
-                        pts.insert(0, self._point(model, nxt, el))
+                        pts.insert(0, self._point(model, nxt, el, cursor=cursor))
                     else:
                         break
 
@@ -710,11 +738,11 @@ class VllmEvaluator:
                 # A second pass at the peak only. The bracket points establish
                 # WHERE the peak is; the repeat establishes how noisy it is, and
                 # only the peak's noise matters for the keep/revert gate.
-                passes = [peak, self._point(model, conc, el, label="repeat")]
+                passes = [peak, self._point(model, conc, el, label="repeat", cursor=cursor)]
                 cand = max(pts, key=lambda m: m["goodput"])
                 if cand["concurrency"] != conc:
                     conc = cand["concurrency"]
-                    passes = [cand, self._point(model, conc, el, label="repeat")]
+                    passes = [cand, self._point(model, conc, el, label="repeat", cursor=cursor)]
 
                 # MIN across the peak's passes, not median and definitely not max.
                 #

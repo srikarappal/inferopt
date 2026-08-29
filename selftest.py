@@ -180,6 +180,25 @@ def main() -> int:
           f"wide L={high.concurrency} of {sorted(c['concurrency'] for c in high.curve)} "
           f"-- a peak at the top edge means the search stopped before finding it")
 
+    print("\n=== prompt cursor: phases must not replay the same prompts ===")
+    seen: list[str] = []
+    orig = ev._one
+    async def recording(c, base_url, model, prompt, max_tokens, stream=True):
+        seen.append(prompt)
+        return await orig(c, base_url, model, prompt, max_tokens, stream)
+    ev._one = recording
+    cur = [0]
+    for _ in range(3):                       # warmup + two passes
+        asyncio.run(ev._closed_loop("http://x", "m", [f"p{i}" for i in range(400)],
+                                    8, 6, 0.1, 0.3, cursor=cur))
+    ev._one = orig
+    uniq = len(set(seen))
+    check("the cursor advanced across phases", cur[0] > 0, f"cursor={cur[0]}")
+    check("phases served mostly DISJOINT prompts, not the same ones replayed",
+          uniq > 0.6 * len(seen),
+          f"{uniq} unique of {len(seen)} issued -- replay inflates a warm prefix "
+          f"cache to full-prompt hits that no production workload produces")
+
     print("\n=== aggregate(): worst case in BOTH directions ===")
     a = {"goodput": 200.0, "ttft_p99_ms": 400.0, "slo_attainment": 1.0, "concurrency": 30}
     b = {"goodput": 150.0, "ttft_p99_ms": 900.0, "slo_attainment": 0.8, "concurrency": 30}
