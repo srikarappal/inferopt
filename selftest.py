@@ -89,6 +89,16 @@ def main() -> int:
         model="Qwen/Qwen3-14B", trace="data/trace.jsonl",
         ttft_p99_ms=500, itl_p99_ms=250, allow_loss=0.03))
 
+    print("\n=== fingerprint: single-file checkpoints (no index) ===")
+    from request import InferOptRequest as _R, build_fingerprint as _bf
+    small, _ = _bf(_R(model="Qwen/Qwen3-0.6B", trace="data/trace.jsonl"))
+    check("attention_type is a TYPE, not a parameter count",
+          small.model.attention_type in ("mha", "gqa", "mqa", "mla"),
+          f"got {small.model.attention_type!r} -- the fallback param-count branch "
+          f"reused the variable holding the attention type")
+    check("weights read from the single-file checkpoint, not arithmetic",
+          0.5 < small.model.weight_gb < 5.0, f"{small.model.weight_gb} GB")
+
     print("\n=== _closed_loop: window excludes settle and drain ===")
     reqs, t0, t1 = asyncio.run(ev._closed_loop(
         "http://x", "m", ["p"] * 64, 8, 8, settle_s=0.3, window_s=0.6))

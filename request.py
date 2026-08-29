@@ -196,6 +196,23 @@ def _checkpoint_bytes(model: str) -> float | None:
         raw = idx.read_text() if idx.exists() else \
             Path(hf_hub_download(model, "model.safetensors.index.json")).read_text()
         return float(json.loads(raw)["metadata"]["total_size"])
+    except Exception:
+        pass
+
+    # No index means a SINGLE-FILE checkpoint, not a missing one. Small models
+    # ship one model.safetensors with no index at all, and treating that as a
+    # failure sent every one of them down the arithmetic fallback.
+    try:
+        local = Path(model) / "model.safetensors"
+        if local.exists():
+            return float(local.stat().st_size)
+        from huggingface_hub import HfApi
+        info = HfApi().model_info(model, files_metadata=True)
+        sizes = [f.size for f in info.siblings
+                 if f.rfilename.endswith(".safetensors") and f.size]
+        if sizes:
+            return float(sum(sizes))
+        raise FileNotFoundError("no .safetensors with a readable size")
     except Exception as e:
         print(f"    could not read the checkpoint index ({type(e).__name__}: {e}); "
               f"falling back to arithmetic over config fields, which over-counts "
@@ -270,9 +287,14 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
         hd = c.get("head_dim") or h // c["num_attention_heads"]
         # q + o are full width; k + v are narrowed by GQA. The naive 4*h*h
         # assumes MHA and over-counts every grouped-query model.
-        attn = 2 * h * (c["num_attention_heads"] * hd) + 2 * h * (kvh * hd)
+        # attn_params, NOT attn. This used to reuse the name of the attention
+        # TYPE computed above, silently replacing "gqa" with a parameter count.
+        # It only fired when the checkpoint index was unreadable -- i.e. on any
+        # single-file model -- and surfaced as a pydantic literal_error naming an
+        # integer, which reads like a schema problem and is not.
+        attn_params = 2 * h * (c["num_attention_heads"] * hd) + 2 * h * (kvh * hd)
         tied = c.get("tie_word_embeddings", False)
-        n_params_b = (L * (attn + 3 * h * inter) + (1 if tied else 2) * V * h) / 1e9
+        n_params_b = (L * (attn_params + 3 * h * inter) + (1 if tied else 2) * V * h) / 1e9
 
     active_b = None
     if n_experts:
