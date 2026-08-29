@@ -67,16 +67,36 @@ def cmd_trace(args) -> int:
     rng.shuffle(prompts)
     prompts = prompts[: args.n]
 
+    # REAL shared prefixes, not just labels.
+    #
+    # This used to tag 30% of rows with a prefix_id and change nothing about the
+    # prompt text. The fingerprint then reported prefix_overlap=32% while the
+    # actual prompts shared 1.2% of their leading characters, so the
+    # prefix_caching node was gated on a number that described nothing. Worse,
+    # the load generator replays the same prompt indices in every phase, so what
+    # the 4x prefix-caching win actually measured was DUPLICATE-REQUEST caching
+    # -- identical full prompts served again from a warm cache -- not prefix
+    # sharing. Production traffic does not do that; it shares system prompts.
     rows, t = [], 0.0
-    shared = [f"sys{i}" for i in range(5)]
+    shared = {
+        f"sys{i}": (
+            f"You are a careful assistant operating under policy set {i}. "
+            f"Answer accurately and concisely. If you are unsure, say so rather "
+            f"than guessing. Do not fabricate citations, figures or quotations. "
+            f"Prefer concrete examples over abstract description. When a question "
+            f"has several reasonable readings, state which one you are answering. "
+            f"Keep responses focused on what was asked.\n\n" * args.prefix_tokens_mult
+        ) for i in range(5)
+    }
     for p in prompts:
         t += rng.expovariate(args.qps)
+        pid = rng.choice(list(shared)) if rng.random() < args.prefix_share else None
         rows.append({
-            "prompt": p,
-            "input_tokens": len(p) // 4,
+            "prompt": (shared[pid] + p) if pid else p,
+            "input_tokens": (len(shared[pid]) if pid else 0) // 4 + len(p) // 4,
             "output_tokens": int(rng.lognormvariate(5.4, 0.6)),
             "arrival_ts": round(t, 4),
-            "prefix_id": rng.choice(shared) if rng.random() < args.prefix_share else None,
+            "prefix_id": pid,
             "adapter_id": None,
             "temperature": 0.0,
         })
@@ -368,6 +388,9 @@ def main() -> int:
     t.add_argument("--n", type=int, default=800)
     t.add_argument("--qps", type=float, default=16.0)
     t.add_argument("--prefix-share", type=float, default=0.30)
+    t.add_argument("--prefix-tokens-mult", type=int, default=8,
+                   help="repeats of the shared system prompt; 8 gives ~800 tokens, "
+                        "a realistic system-prompt length")
     t.add_argument("--seed", type=int, default=0)
     t.set_defaults(fn=cmd_trace)
 
