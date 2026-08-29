@@ -680,16 +680,16 @@
         },
         {
           "quantize": "autoquant",
-          "quantize_bits": 4.5
+          "quantize_bits": 5.0
         },
         {
-          "quantize": "int4_awq"
+          "quantize": "w4a16"
         },
         {
           "quantize": "nvfp4"
         }
       ],
-      "sweep_note": "Two bit budgets and two fixed formats, measured the same way.\n\nThe budgets are what AutoQuantize searches: effective_bits 6.0 is roughly FP8-with-headroom, 4.5 roughly NVFP4-with-protected-layers. Each is a distinct point on the size/quality curve.\n\nint4_awq and nvfp4 are whole-model single formats and are here as REFERENCES, not as candidates in their own right. AutoQuantize assigns per layer across these same formats, so it should beat both -- and if it does not, that is worth knowing, because it means the sensitivity scoring is not paying for its cost on this model. A search you never compare against the thing it replaced is a search you cannot evaluate.\n\nEvery point is MEASURED on goodput AND on the eval set. AutoQuantize optimises an internal sensitivity proxy; it cannot know whether the result helps goodput at this SLO or survives MATH-500.",
+      "sweep_note": "Two bit budgets and two fixed formats, measured the same way.\n\nThe budgets are what AutoQuantize searches: effective_bits 6.0 is roughly FP8-with-headroom, 4.5 roughly NVFP4-with-protected-layers. Each is a distinct point on the size/quality curve.\n\nint4 (W4A16_NVFP4) and nvfp4 are whole-model single formats and are here as REFERENCES, not as candidates in their own right. AutoQuantize assigns per layer across these same formats, so it should beat both -- and if it does not, that is worth knowing, because it means the sensitivity scoring is not paying for its cost on this model. A search you never compare against the thing it replaced is a search you cannot evaluate.\n\nEvery point is MEASURED on goodput AND on the eval set. AutoQuantize optimises an internal sensitivity proxy; it cannot know whether the result helps goodput at this SLO or survives MATH-500.",
       "probes": [
         "goodput",
         "quality"
@@ -709,9 +709,11 @@
         "retune_batching_after_weight"
       ],
       "reference_formats": [
-        "int4_awq",
+        "w4a16",
         "nvfp4"
-      ]
+      ],
+      "format_note": "w4a16 is W4A16_NVFP4_CFG: 4-bit FLOAT weights (NVFP4) with 16-bit activations. nvfp4 is NVFP4_DEFAULT_CFG: 4-bit weights AND activations. The pair brackets how aggressive to be about activations, which is where quality usually goes first.\n\nTrue INT4-AWQ is unavailable. INT4_AWQ_CFG emits quant_algo W4A16_AWQ and vLLM's modelopt loader accepts only FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO, NVFP4, W4A16_NVFP4, MXFP8 and MIXED_PRECISION. Found by producing the checkpoint and watching vLLM refuse it -- both surviving 4-bit paths are verified to load and generate. AutoQuantize emits MIXED_PRECISION, which is on the list.",
+      "bits_note": "The achievable effective_bits FLOOR is model-dependent, so these values may be infeasible on some models. modelopt never quantizes embeddings, lm_head, routers or vision towers, and the floor is set by what fraction of parameters those are: ~21% on Qwen3-0.6B gives a floor of 7.5 bits, ~5% on a 14B gives roughly 4.6. An infeasible budget fails with the actual floor named rather than a stack trace."
     },
     {
       "id": "retune_batching_after_weight",

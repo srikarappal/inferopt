@@ -208,10 +208,14 @@ def sensitivity_ignore(fp, *, log=print) -> list[str]:
 # modelopt config per format. These are NVIDIA's own presets, not hand-rolled
 # recipes -- the point of switching from llmcompressor was to stop maintaining a
 # second opinion about how to quantize.
+# Named for what they ARE, not for what they resemble. "int4" was misleading:
+# W4A16_NVFP4 is 4-bit FLOAT weights (NVFP4, E2M1 with block scales), not 4-bit
+# integer. True INT4-AWQ is unavailable -- vLLM's modelopt loader refuses
+# W4A16_AWQ, which INT4_AWQ_CFG emits.
 MODELOPT_CFG = {
-    "fp8":      "FP8_DEFAULT_CFG",
-    "int4_awq": "INT4_AWQ_CFG",
-    "nvfp4":    "NVFP4_DEFAULT_CFG",
+    "fp8":   "FP8_DEFAULT_CFG",      # 8-bit weights and activations
+    "w4a16": "W4A16_NVFP4_CFG",      # 4-bit weights, 16-bit activations -- safer
+    "nvfp4": "NVFP4_DEFAULT_CFG",    # 4-bit weights AND activations -- faster
 }
 
 _JOB = r'''
@@ -226,7 +230,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import modelopt.torch.quantization as mtq
 from modelopt.torch.export import export_hf_checkpoint
 
-SINGLE = {"fp8": "FP8_DEFAULT_CFG", "int4_awq": "INT4_AWQ_CFG", "nvfp4": "NVFP4_DEFAULT_CFG"}
+# W4A16_NVFP4, not INT4_AWQ. Both are 4-bit weight-only, but vLLM's modelopt
+# loader accepts only FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO, NVFP4,
+# W4A16_NVFP4, MXFP8 and MIXED_PRECISION -- and INT4_AWQ_CFG emits W4A16_AWQ,
+# which is not on that list. Verified the hard way: the checkpoint produced fine
+# and vLLM refused it with a pydantic ValidationError naming the supported set.
+SINGLE = {"fp8":   "FP8_DEFAULT_CFG",
+          "w4a16": "W4A16_NVFP4_CFG",   # 4-bit weights, 16-bit activations
+          "nvfp4": "NVFP4_DEFAULT_CFG"} # 4-bit weights AND activations
 
 tok = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
@@ -250,18 +261,38 @@ if kind.startswith("autoquant@"):
     # and a backward pass -- and we have prompts from a workload trace, not a
     # labelled set. KL needs only a forward pass returning logits.
     print(f"[job] auto_quantize to effective_bits={bits}, method=kl_div", flush=True)
-    model, state = mtq.auto_quantize(
-        model,
-        constraints={"effective_bits": bits},
-        quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
-        data_loader=batches,
-        forward_step=lambda m, b: m(**b).logits,
-        method="kl_div",
-        disabled_layers=ignore or None,
-        num_calib_steps=min(512, len(batches)),
-        num_score_steps=min(128, len(batches)),
-        verbose=True,
-    )
+    # The achievable floor is MODEL-DEPENDENT. effective_bits is computed over the
+    # whole model, and modelopt excludes embeddings, lm_head, routers and vision
+    # towers from quantization -- so the floor is set by what fraction of the
+    # parameters cannot be touched. On Qwen3-0.6B that is ~21% and the floor is
+    # 7.5 bits; on a 14B the same tensors are ~5% and it drops to ~4.6. A budget
+    # that works on one model is infeasible on another, so the failure is caught
+    # and reported with the actual floor rather than surfacing as a stack trace.
+    try:
+        model, state = mtq.auto_quantize(
+            model,
+            constraints={"effective_bits": bits},
+            quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
+            data_loader=batches,
+            forward_step=lambda m, b: m(**b).logits,
+            method="kl_div",
+            disabled_layers=ignore or None,
+            num_calib_steps=min(512, len(batches)),
+            num_score_steps=min(128, len(batches)),
+            verbose=True,
+        )
+    except ValueError as e:
+        if "infeasible" in str(e) and "minimum achievable" in str(e):
+            import re as _re
+            m = _re.search(r"minimum achievable effective bits is ([\d.]+)", str(e))
+            floor = m.group(1) if m else "?"
+            raise SystemExit(
+                f"[job] effective_bits={bits} is INFEASIBLE for {model_id}. The minimum "
+                f"achievable is {floor}, because embeddings, lm_head and routers are "
+                f"excluded from quantization and set a floor over the whole model. "
+                f"Use a budget above {floor}, or accept that this model cannot be "
+                f"compressed further with these formats.")
+        raise
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     (Path(out_dir) / "autoquantize_search.json").write_text(
         json.dumps({"effective_bits": bits,
@@ -394,7 +425,10 @@ def smoke(log=print) -> bool:
         for i in range(64)) + "\n")
 
     ok = True
-    for kind in ("int4_awq", "nvfp4"):
+    # 8.0, not 4.5: Qwen3-0.6B's floor is 7.5 because its embeddings are ~21% of
+    # the model and are never quantized. The point here is that the PATH works,
+    # not that the budget is aggressive.
+    for kind in ("nvfp4", "w4a16", "autoquant@8.0"):
         log(f"\n  --- {kind} on {SMOKE_MODEL} ---")
         try:
             from request import InferOptRequest, build_fingerprint
@@ -424,7 +458,9 @@ def smoke(log=print) -> bool:
         r = subprocess.run([sys.executable, str(probe), path],
                            env=child_env(), capture_output=True, text=True, timeout=1800)
         if "[load] OK" in r.stdout:
-            log(f"  vLLM LOADED the {kind} artifact -- format round-trips")
+            gen = next((l for l in r.stdout.splitlines() if "[load] OK" in l), "")
+            log(f"  vLLM LOADED and SERVED the {kind} artifact")
+            log(f"    generated: {gen.split('->', 1)[-1].strip()}")
         else:
             blob = (r.stdout or "") + (r.stderr or "")
             # Report the actual exception, not the "see root cause above" wrapper.
@@ -433,13 +469,17 @@ def smoke(log=print) -> bool:
                      and "core_client" not in l and "launch_core" not in l]
             log(f"  vLLM COULD NOT LOAD the {kind} artifact:")
             log(textwrap.indent("\n".join(cause[-6:]) or blob.strip()[-800:], "    "))
-            if "quantization=compressed-tensors" in blob or "quantization=awq" in blob:
-                log(f"  -> vLLM RECOGNISED the format, so this is not a version "
-                    f"mismatch; read the exception above.")
+            if "ModelOpt currently only supports" in blob:
+                log(f"  -> vLLM's modelopt loader REFUSED this quant_algo. The listed "
+                    f"set in the error is what it accepts; pick a config in MODELOPT_CFG "
+                    f"that emits one of those.")
+            elif "quantization=modelopt" in blob:
+                log(f"  -> vLLM recognised the format and failed later; read the "
+                    f"exception above rather than assuming a format problem.")
             else:
-                log(f"  -> vLLM did not recognise the format. The producer's "
-                    f"compressed-tensors (0.18.0) may be ahead of vLLM's reader "
-                    f"(0.17.0); retry with llmcompressor==0.12.0.")
+                log(f"  -> vLLM did not reach the quantization config at all. Check for "
+                    f"'ninja' in the trace: a subprocess without child_env() dies there "
+                    f"and it reads like a format problem.")
             ok = False
     return ok
 
@@ -450,8 +490,10 @@ def main() -> int:
     ap.add_argument("--setup", action="store_true", help="install the isolated producer")
     ap.add_argument("--smoke", action="store_true",
                     help="produce a tiny model and verify vLLM can load it")
-    ap.add_argument("--produce", metavar="KIND", choices=["int4_awq", "nvfp4"],
-                    help="produce one variant of --model")
+    ap.add_argument("--produce", metavar="KIND",
+                    help="fp8 | w4a16 | nvfp4 | autoquant@<effective_bits>, "
+                         "e.g. autoquant@5.0. Not a fixed choice list: the bit budget "
+                         "is continuous, and the achievable floor is model-dependent.")
     ap.add_argument("--model")
     ap.add_argument("--trace", default="data/trace.jsonl")
     a = ap.parse_args()
@@ -463,7 +505,17 @@ def main() -> int:
     if a.produce:
         if not a.model:
             ap.error("--produce needs --model")
-        print(ensure_variant(a.model, a.produce, a.trace))
+        valid = set(MODELOPT_CFG) | {"autoquant"}
+        base = a.produce.split("@", 1)[0]
+        if base not in valid:
+            ap.error(f"unknown kind {a.produce!r}; expected one of "
+                     f"{sorted(MODELOPT_CFG)} or autoquant@<bits>")
+        if base == "autoquant" and "@" not in a.produce:
+            ap.error("autoquant needs a bit budget, e.g. autoquant@5.0")
+        from request import InferOptRequest, build_fingerprint
+        fp, _ = build_fingerprint(InferOptRequest(model=a.model, trace=a.trace))
+        path = ensure_variant(fp, a.produce, a.trace)
+        print(path or f"{a.produce}: no artifact -- this is a load-time vLLM flag")
         return 0
     ap.print_help()
     return 0
