@@ -292,10 +292,20 @@ if kind.startswith("autoquant@"):
         # both numbers, so the comparison says what was actually built rather
         # than what was asked for.
         import re as _re
-        m = _re.search(r"minimum achievable effective bits is ([\d.]+)", str(e))
+        # \d+(?:\.\d+)? and NOT [\d.]+ -- the latter is greedy and swallows the
+        # sentence's full stop, so "is 5.1395." parses as "5.1395." and float()
+        # raises inside the handler. That turned a recoverable condition into a
+        # crash that killed the variant.
+        m = _re.search(r"minimum achievable effective bits is (\d+(?:\.\d+)?)", str(e))
         if not ("infeasible" in str(e) and m):
             raise
-        floor = float(m.group(1))
+        try:
+            floor = float(m.group(1))
+        except ValueError:
+            raise SystemExit(
+                f"[job] effective_bits={bits} was refused as infeasible, but the floor "
+                f"could not be read from modelopt's message. Raise the budget and "
+                f"retry.\n  message: {str(e).splitlines()[0][:200]}")
         achieved = round(floor + 0.01, 4)      # clear the boundary
         print(f"[job] effective_bits={bits} is below this model's floor of {floor}. "
               f"Producing at {achieved} instead -- the floor is set by the "
