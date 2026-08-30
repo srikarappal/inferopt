@@ -30,7 +30,27 @@ from pathlib import Path
 # The commit that made eval_repro use the traversal's serving measurement rather
 # than a single closed-loop point. Anything older is not comparable on the
 # serving columns.
-SERVING_UNIFIED_AT = "ae41dbe"
+#
+# Identified by MESSAGE, not by hash. The hash was hardcoded as ae41dbe and then
+# every hash in the repo changed when history was rewritten to correct commit
+# authorship -- so the ancestry check silently failed and flagged every row as
+# incomparable, including the ones that share the instrument.
+SERVING_UNIFIED_SUBJECT = "One serving measurement"
+
+
+def _serving_unified_commit() -> str | None:
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "log", "--format=%H %s", "--all"],
+            capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            h, _, subj = line.partition(" ")
+            if subj.startswith(SERVING_UNIFIED_SUBJECT):
+                return h
+    except Exception:
+        pass
+    return None
 
 # Where to look, and what to call it. Order is the story: what you start with,
 # what costs nothing, then increasingly aggressive weight changes.
@@ -48,11 +68,22 @@ SOURCES = [
 DEMAND_TOK_S = 15.36 * 259      # what this workload needs served on time
 
 
+MODEL_PREFIX = "Qwen__Qwen3-14B"
+
+
 def artifact_gb(tag: str) -> str:
-    for p in Path("artifacts").glob(f"*--{tag.replace('@', '_')}"):
-        n = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-        return f"{n / 1e9:.1f}"
-    return ""
+    """Size of THIS model's artifact.
+
+    The glob was `*--{tag}`, which also matched the Qwen3-0.6B directories left
+    by the smoke test -- so nvfp4 reported 0.6GB, the size of a different model.
+    Anchoring on the model prefix stops a leftover test artifact being read as a
+    production result.
+    """
+    p = Path("artifacts") / f"{MODEL_PREFIX}--{tag.replace('@', '_')}"
+    if not p.is_dir():
+        return ""
+    n = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    return f"{n / 1e9:.1f}"
 
 
 def main() -> int:
@@ -115,11 +146,25 @@ def main() -> int:
                   f"produced at {a['effective_bits_achieved']} -- this model's floor.")
             print(f"    Embeddings, lm_head and routers are never quantized and set it.")
 
-    stale = [l for l, w, r, c, wh in rows
-             if r is not None and c and not c.startswith(SERVING_UNIFIED_AT[:7])]
+    # Chronological, not a string match. The old check flagged every commit whose
+    # hash merely differed from ae41dbe -- including every commit AFTER it, which
+    # are exactly the comparable ones. Anything at or after the unifying commit
+    # shares the instrument.
+    import subprocess
+    unified = _serving_unified_commit()
+    def _at_or_after(commit: str) -> bool:
+        if not commit or not unified:
+            return False
+        try:
+            r = subprocess.run(["git", "merge-base", "--is-ancestor", unified, commit],
+                               capture_output=True, timeout=10)
+            return r.returncode == 0
+        except Exception:
+            return False
+    stale = [l for l, w, r, c, wh in rows if r is not None and not _at_or_after(c)]
     if stale:
         print(f"\n  NOTE: serving columns are only comparable across runs measured at or after")
-        print(f"  {SERVING_UNIFIED_AT}, which unified eval_repro's measurement with the")
+        print(f"  {(unified or '?')[:7]}, which unified eval_repro's measurement with the")
         print(f"  traversal's. Rows from other commits: {', '.join(stale)}.")
         print(f"  Accuracy is unaffected -- that path has not changed.")
     return 0
