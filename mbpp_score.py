@@ -80,6 +80,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -120,7 +121,7 @@ def main() -> int:
         lines = {json.loads(l)["task_id"]: l
                  for l in full.read_text().splitlines() if l.strip()}
         if set(wanted) < set(lines):
-            subset = HERE / ".mbpp-subset.jsonl"
+            subset = Path(tempfile.mkdtemp(prefix="mbpp-ds-")) / "subset.jsonl"
             subset.write_text("\n".join(lines[t] for t in wanted if t in lines) + "\n")
             os.environ["MBPP_OVERRIDE_PATH"] = str(subset)
         else:
@@ -153,6 +154,18 @@ def main() -> int:
                    Path(a.samples).read_text().splitlines() if l.strip()]
     problems = get_mbpp_plus()
 
+    # EVERY intermediate goes in a private temp directory. They used to be fixed
+    # names in the repo root -- .mbpp-samples.jsonl and the
+    # .mbpp-samples_eval_results.json that evaluate() derives from it -- which
+    # made two concurrent invocations silently corrupt each other. That is not
+    # hypothetical: a seven-config ladder ran while a selftest was scoring in the
+    # same checkout, the ladder read the selftest's results file, found none of
+    # its own task_ids, and recorded 0.0000 for all seven configs with no error
+    # anywhere. Identical code re-judging the same generations afterwards gave
+    # 0.7169. A scorer must be safe to run twice at once in one directory.
+    tmpdir = tempfile.TemporaryDirectory(prefix="mbpp-score-")
+    work = Path(tmpdir.name)
+
     # Sanitize into evalplus's expected shape: {"task_id", "solution"}, where
     # solution is standalone runnable code. This is what `evalplus.sanitize`
     # does; sanitize() walks a tree-sitter parse and keeps the entry-point
@@ -161,7 +174,7 @@ def main() -> int:
     #
     # A sample that cannot be sanitized becomes the empty string rather than an
     # exception: it must fail as one sample, never abort the other 377.
-    prepared = HERE / ".mbpp-samples.jsonl"
+    prepared = work / "samples.jsonl"
     n_blank = 0
     with open(prepared, "w") as fh:
         for s in raw_samples:
@@ -205,9 +218,7 @@ def main() -> int:
         "status": status,
     }
     Path(a.out).write_text(json.dumps(out, indent=2))
-    prepared.unlink(missing_ok=True)
-    result_path.unlink(missing_ok=True)
-    (HERE / ".mbpp-subset.jsonl").unlink(missing_ok=True)
+    tmpdir.cleanup()
 
     # Every sample producing no code at all is a broken pipeline, not a bad
     # model: a model can genuinely score 0 on MBPP+, but not by emitting

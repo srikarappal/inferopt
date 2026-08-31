@@ -465,6 +465,29 @@ def main() -> int:
         else:
             check("real-generation fixture present", False, f"{fixture} missing")
 
+        # TWO JUDGES AT ONCE IN ONE CHECKOUT. This is the bug that cost a
+        # seven-config ladder: the scorer wrote .mbpp-samples.jsonl and the
+        # _eval_results.json evaluate() derives from it at FIXED paths in the
+        # repo root, so a selftest scoring in the same directory as a running
+        # ladder clobbered its results file. The ladder found none of its own
+        # task_ids, scored every problem False, and reported 0.0000 for all
+        # seven configs with no error anywhere -- while identical code, run
+        # alone afterwards, gave 0.7169 on the same generations.
+        from concurrent.futures import ThreadPoolExecutor
+        j = BENCHMARKS["mbpp_plus"].judge
+        big = ([{"task_id": r["task_id"]} for r in rows], good)
+        small = (big[0][:6], good[:6])
+        solo_big = sum(j(*big)) / len(big[1])
+        solo_small = sum(j(*small)) / len(small[1])
+        with ThreadPoolExecutor(2) as _ex:
+            f1 = _ex.submit(lambda: sum(j(*big)) / len(big[1]))
+            f2 = _ex.submit(lambda: sum(j(*small)) / len(small[1]))
+            con_big, con_small = f1.result(), f2.result()
+        check("two concurrent judges in one checkout do not corrupt each other",
+              con_big == solo_big and con_small == solo_small,
+              f"solo {solo_big:.4f}/{solo_small:.4f} vs "
+              f"concurrent {con_big:.4f}/{con_small:.4f}")
+
         check("mbpp_plus uses the chat template", BENCHMARKS["mbpp_plus"].chat,
               "raw completions on an instruct model score prompt format, not capability")
         check("math_500 does NOT use the chat template",
