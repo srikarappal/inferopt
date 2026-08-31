@@ -442,6 +442,29 @@ def main() -> int:
                   v[0] is False and v[3] is False and all(v[i] for i in (1, 2, 4, 5)),
                   f"got {v}")
 
+        # REAL model output, frozen. The synthetic checks above prove the judge
+        # can tell correct code from prose; they cannot catch a change that
+        # shifts the SCORE on the messy middle -- fenced blocks with commentary
+        # around them, helper functions, near-misses.
+        #
+        # These 60 generations are Qwen3-14B's actual answers, captured when the
+        # scorer drove untrusted_check by hand. The rewrite to evalplus's own
+        # evaluate() had to reproduce every verdict, and did: 60/60. Pinning it
+        # here means the next change to the scorer must too.
+        fixture = Path("fixtures/mbpp_real_generations.jsonl")
+        if fixture.exists():
+            fx = [json.loads(l) for l in fixture.read_text().splitlines() if l.strip()]
+            v = BENCHMARKS["mbpp_plus"].judge(
+                [{"task_id": r["task_id"]} for r in fx], [r["text"] for r in fx])
+            want = [r["expected"] for r in fx]
+            agree = sum(1 for a, b in zip(v, want) if a == b)
+            check(f"real generations reproduce pass@1 {sum(want)/len(want):.4f}",
+                  v == want,
+                  f"{agree}/{len(fx)} verdicts agree; got "
+                  f"{sum(v)/len(v):.4f}, expected {sum(want)/len(want):.4f}")
+        else:
+            check("real-generation fixture present", False, f"{fixture} missing")
+
         check("mbpp_plus uses the chat template", BENCHMARKS["mbpp_plus"].chat,
               "raw completions on an instruct model score prompt format, not capability")
         check("math_500 does NOT use the chat template",

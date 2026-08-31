@@ -60,7 +60,26 @@ echo "  benchmark $BENCH   n=$N   repeats=$REPEATS   -> $OUT"
 run_one() {   # name, then the eval_repro args
     local name="$1"; shift
     if [ -f "$OUT/$name/eval.json" ]; then
-        note "$name already evaluated, skipping"; record "$name" cached; return
+        # A cached row is only reusable if it is a RESULT. A score of exactly
+        # 0.0000 is not one -- no working probe produces it, and this ladder has
+        # already been poisoned once by rows cached from a run whose scorer was
+        # broken. Re-running is cheap; reading a stale zero as a measurement is
+        # what cost the last four hours.
+        if python - "$OUT/$name/eval.json" <<'PY'
+import json, sys
+r = json.loads(open(sys.argv[1]).read())
+res = next(iter(r["results"].values()))
+commit = (r.get("environment", {}).get("inferopt_commit") or "")[:8]
+if res["mean"] == 0.0:
+    print(f"      cached score is 0.0000 (from {commit}) -- re-running, "
+          f"that is a broken probe, not a result")
+    sys.exit(1)
+print(f"      reusing {res['mean']:.4f} from {commit}")
+PY
+        then
+            note "$name already evaluated, skipping"; record "$name" cached; return
+        fi
+        rm -rf "$OUT/$name"
     fi
     note "evaluating $name"
     if python eval_repro.py --benchmark "$BENCH" --n "$N" --repeats "$REPEATS" \
