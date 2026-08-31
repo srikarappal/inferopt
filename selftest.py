@@ -1,4 +1,9 @@
-"""Exercise the measurement path against a fake server. No GPU, seconds to run.
+"""Exercise the measurement path against a fake server. No GPU, ~2 minutes.
+
+Most of it runs in seconds against a synthetic server. The mbpp_plus section
+is the slow part and is meant to be: it actually EXECUTES generated code
+through evalplus, because the only way to know a code scorer works is to
+watch it pass correct code and fail incorrect code.
 
     python selftest.py
 
