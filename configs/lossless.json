@@ -1,0 +1,13 @@
+{
+  "max_num_seqs": 512,
+  "gpu_memory_utilization": 0.75,
+  "max_model_len": 7168,
+  "enable_prefix_caching": true,
+  "enable_chunked_prefill": false,
+  "enforce_eager": true,
+  "speculative_config": {
+    "method": "ngram",
+    "num_speculative_tokens": 5,
+    "prompt_lookup_max": 8
+  }
+}

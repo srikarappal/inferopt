@@ -74,9 +74,21 @@ run_one() {   # name, then the eval_repro args
     python summarize.py "$OUT" || true
 }
 
-# The two with no artifact: bf16 defaults, and fp8 applied at model load.
-run_one q_stock --model "$MODEL" --config configs/stock.json
-run_one q_fp8   --model "$MODEL" --config configs/fp8.json
+# The three with no artifact, in the order that makes the ladder readable:
+#
+#   stock     bf16, vLLM defaults -- the number a user starts from
+#   lossless  launch flags only, weights untouched. Quality CANNOT move here by
+#             construction, so this row doubles as a check on the instrument: if
+#             it moves, the eval drifted and every lossy delta below it is
+#             suspect. On MATH-500 it was 4.0x goodput at zero accuracy cost.
+#   fp8       the first row that rewrites weights, applied at model load
+#
+# lossless is not optional. Without it every quantized row gets compared against
+# stock and is silently credited with the speedup that flags already delivered
+# for free -- the whole lossless-before-lossy point of the project, inverted.
+run_one q_stock    --model "$MODEL" --config configs/stock.json
+run_one q_lossless --model "$MODEL" --config configs/lossless.json
+run_one q_fp8      --model "$MODEL" --config configs/fp8.json
 
 # Then whatever was actually built, in whatever precision it landed at.
 for DIR in artifacts/${SAFE}--*; do
