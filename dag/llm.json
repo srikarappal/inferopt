@@ -64,11 +64,21 @@
   },
   "benchmarks": [
     {
+      "id": "mbpp_plus",
+      "metric": "pass@1",
+      "scoring": "test execution in a subprocess (mbpp_score.py), greedy decode, chat template with thinking disabled",
+      "why": "code breaks on a single wrong token - highest sensitivity per sample to quantization damage. MBPP+ adds ~35x the test cases of original MBPP, so a solution that only fits the example assertion is caught.",
+      "n_full": 378,
+      "contamination_note": "MBPP predates the models under test and is likely in pretraining data. That does not matter here: every row of the frontier is the SAME model against ITSELF under different serving configs, so a memorised problem is memorised equally on both sides and cancels. Contamination would only matter for an absolute claim about the model's coding ability.",
+      "sandbox": "evalplus rlimits + signal timeouts in a separate process. Guards against runaway generated code, NOT against an adversary. Run mbpp_score.py inside a container if that changes."
+    },
+    {
       "id": "humaneval_plus",
       "metric": "pass@1",
       "scoring": "test execution, greedy decode",
       "why": "code breaks on a single wrong token - highest sensitivity per sample to quantization damage",
-      "n_full": 164
+      "n_full": 164,
+      "status": "NOT WIRED. No longer blocked on a sandbox -- mbpp_score.py is one, and evalplus serves HumanEval+ from the same API. Unregistered because mbpp_plus already covers this axis and a second code benchmark costs a full ladder of GPU time to repeat it."
     },
     {
       "id": "math_500",
@@ -556,7 +566,7 @@
       "reuse_server_if": "previous_node.kept",
       "on_measure": "If the quality delta exceeds what per_token_flip_rate predicts, something in the lossless branch was not lossless. Stop and report rather than entering the lossy branch on a corrupted incumbent.",
       "quality_benchmarks_todo": [
-        "humaneval_plus (needs a sandboxed pass@1 runner)"
+        "mbpp_plus is wired and executes in a sandbox (mbpp_score.py); humaneval_plus remains unregistered by choice, not by blocker"
       ]
     },
     {
@@ -659,7 +669,7 @@
       ],
       "revert_note": "Reverting means staying merged, which leaves no published checkpoint to quantize from. The lossy branch ends here with KV quantization already applied; weight quantization needs the calibration pipeline (see future.conversion_pipeline).",
       "quality_benchmarks_todo": [
-        "humaneval_plus (needs a sandboxed pass@1 runner)"
+        "mbpp_plus is wired and executes in a sandbox (mbpp_score.py); humaneval_plus remains unregistered by choice, not by blocker"
       ]
     },
     {

@@ -28,6 +28,7 @@ HISTORY
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -53,6 +54,49 @@ def fetch_math_500() -> None:
     _write("math_500", rows)
     print(f"    answers are LaTeX, not numbers (e.g. {rows[0]['answer']!r}) -- "
           f"scored by normalized string match, not numeric extraction")
+
+
+def fetch_mbpp_plus() -> None:
+    """MBPP+ prompts. The TESTS deliberately stay in evalplus's own cache.
+
+    Only what is needed to build a prompt is copied here -- task_id, the
+    docstring, and the entry point. The 100-plus test inputs per problem stay
+    where evalplus put them, because scoring runs in a different process with a
+    different dependency set (see mbpp_score.py) and duplicating the test data
+    into data/ would create a second copy to drift out of sync with it.
+
+    evalplus is imported through .evalplus-pkgs rather than the serving
+    environment: it pulls openai, anthropic and google-generativeai for its own
+    generation backends, and this project has twice been broken by a dependency
+    installed for a side feature.
+    """
+    import subprocess
+    pkgs = Path(__file__).parent / ".evalplus-pkgs"
+    if not pkgs.is_dir():
+        raise RuntimeError(
+            f"{pkgs} not found. Install evalplus isolated -- NOT into the serving "
+            f"environment:\n"
+            f"    python -m pip install --target .evalplus-pkgs --no-deps \\\n"
+            f"        evalplus tempdir appdirs multipledispatch wget termcolor \\\n"
+            f"        fire tree-sitter tree-sitter-python")
+
+    # A subprocess, not an import: putting .evalplus-pkgs on this process's
+    # sys.path would shadow the serving env's transformers/datasets for whatever
+    # runs next in the same interpreter.
+    code = ("import json,sys;from evalplus.data import get_mbpp_plus;"
+            "print(json.dumps([{'task_id':k,'prompt':v['prompt'],"
+            "'entry_point':v['entry_point'],'assertion':v.get('assertion','')}"
+            " for k,v in get_mbpp_plus().items()]))")
+    r = subprocess.run([sys.executable, "-c", code],
+                       capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(pkgs)}, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"evalplus failed to load MBPP+:\n{r.stderr[-2000:]}")
+    rows = json.loads(r.stdout.strip().splitlines()[-1])
+    _write("mbpp_plus", rows)
+    print(f"    {len(rows)} problems; tests stay in evalplus's cache and are read "
+          f"by mbpp_score.py")
+    print(f"    scored by EXECUTING generated code -- pass@1, in a subprocess")
 
 
 def _haystack(rng: random.Random) -> list[str]:
@@ -132,6 +176,7 @@ def main() -> int:
 
     failed = []
     for label, fn in (("math_500  (HuggingFaceH4/MATH-500)", fetch_math_500),
+                      ("mbpp_plus  (evalplus MBPP+)", fetch_mbpp_plus),
                       ("ruler_multineedle  (generated)", build_ruler_multineedle)):
         print(f"{label} ...")
         try:
@@ -144,8 +189,9 @@ def main() -> int:
         print(f"incomplete: {', '.join(failed)}")
         return 1
     print(f"data ready under {DATA}")
-    print("note: humaneval_plus is intentionally absent -- pass@1 needs sandboxed "
-          "code execution, see quality.py")
+    print("note: humaneval_plus is still absent -- mbpp_plus now covers code via")
+    print("      evalplus, executing in a subprocess (mbpp_score.py). humaneval_plus")
+    print("      would work the same way but has not been wired up.")
     return 0
 
 

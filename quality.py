@@ -38,21 +38,120 @@ HISTORY -- gates that could not be passed
   MATH-500 answers are LaTeX, not numbers. '\\left( 3, \\frac{\\pi}{2} \\right)'
   does not survive numeric extraction, hence _norm_latex and string matching.
 
-  HumanEval+ deliberately raises. Generation is implemented; pass@1 scoring
-  needs a real sandbox, and wiring it to bare exec() would be the most dangerous
-  line in this project.
+  HumanEval+ deliberately raised for a year, because pass@1 scoring needs a real
+  sandbox and wiring it to bare exec() would be the most dangerous line in this
+  project. That refusal was right, and MBPP+ is how it was finally paid off:
+  execution happens in mbpp_score.py, in a separate process, under evalplus's
+  own guards. HumanEval+ is now unregistered by CHOICE, not by blocker.
+
+  JUDGING WAS IN THREE PLACES. quality.py scored a benchmark, and
+  eval_repro.score_once scored it again -- picking the rule by sniffing whether
+  a row had an "answers" key -- because it needed per-item verdicts for its flip
+  analysis. That is the same duplication that put MATH-500's prompt text in two
+  places, let them disagree, and killed a traversal nine launches in. A code
+  benchmark made it untenable rather than merely risky: its judge is a
+  subprocess, and no amount of row-sniffing reproduces one. Benchmarks now own a
+  `judge(rows, texts) -> [bool]` and every caller uses it.
+
+  MAX_TOKENS WAS IN TWO PLACES. Benchmark.max_tokens sized the context filter
+  while each scorer passed its own literal to gen(). They agreed by luck.
+
+  THE GROUNDTRUTH CACHE CAN BE POISONED. evalplus caches expected outputs in a
+  pickle keyed by a hash of the DATASET. Computing them from a 5-problem subset
+  while passing the full dataset's hash -- which is what an interactive probe
+  does -- writes 5 problems' expectations under the key that 378 problems will
+  later be read from. It surfaced as a KeyError deep in scoring. mbpp_score.py
+  now checks coverage up front and says which file to delete. Hit while building
+  MBPP+, by exactly the shortcut its own docstring warned against.
+
+  CONTAMINATION IS NOT A PROBLEM HERE, and it is worth being explicit about why,
+  because it is the first objection anyone raises about MBPP. Every row of the
+  frontier compares the SAME model against ITSELF under different serving
+  configs. A memorised problem is memorised identically on both sides and
+  cancels out of the delta. Contamination would only invalidate an ABSOLUTE
+  claim about the model's coding ability, which this project never makes.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-DATA = Path(__file__).parent / "data"
+HERE = Path(__file__).resolve().parent
+DATA = HERE / "data"
 TRAVERSAL_N = 100
+
+# Chat templates, cached per model. Building one costs a tokenizer load.
+_TEMPLATES: dict[str, object] = {}
+
+
+def _chat_wrapper(prompt: Callable, model: str | None) -> Callable:
+    """Wrap a prompt builder so its text is sent as a chat turn, not a raw completion.
+
+    The evaluator talks to /v1/completions, which does NOT apply a chat
+    template. For MATH-500 that is fine and is what every number in this project
+    was measured with.
+
+    WHY IT IS ON FOR CODE, measured rather than assumed. The reason first written
+    here was that an instruct model asked to continue a bare docstring would
+    write prose instead of a function. That was a guess, and it was WRONG: on 60
+    MBPP+ problems both styles emitted a fenced code block 60/60 times, and
+    accuracy differed by 0.0167 -- one problem, exactly the resolution limit at
+    n=60, so not a difference at all.
+
+    The real reason showed up in the output LENGTHS:
+
+        raw   pass@1 0.8167   mean 653 output tokens, p95 894
+        chat  pass@1 0.8333   mean  37 output tokens, p95  73
+
+    A raw completion has no stop token, so every generation runs to max_tokens --
+    the model answers, then keeps going. The chat template ends the turn at
+    <|im_end|>. Same answers, 18x the tokens to get them, and a decode-bound
+    workload profile that belongs to the prompt format rather than to the model.
+    Keeping it raw would have made a code benchmark cost 18x its own weight in
+    GPU time and reported serving numbers shaped by that.
+
+    The template is applied HERE, in text, and the request still goes through the
+    same completions path as every other measurement. Nothing about the serving
+    instrument changes -- only the characters in the prompt.
+
+    THINKING IS DISABLED. Qwen3's template defaults to emitting a <think> block,
+    which would (a) blow past max_tokens on most problems and (b) change output
+    length by an order of magnitude, making the serving numbers incomparable to
+    every other row in the table. `enable_thinking` is Qwen-specific; other
+    templates ignore an unknown kwarg, and if one raises we retry without it.
+    """
+    if not model:
+        return prompt
+    if model not in _TEMPLATES:
+        try:
+            from transformers import AutoTokenizer
+            _TEMPLATES[model] = AutoTokenizer.from_pretrained(
+                model, trust_remote_code=True)
+        except Exception as e:
+            print(f"        no chat template for {model} ({type(e).__name__}); "
+                  f"sending raw text")
+            _TEMPLATES[model] = None
+    tok = _TEMPLATES[model]
+    if tok is None or not getattr(tok, "chat_template", None):
+        return prompt
+
+    def wrapped(r):
+        msgs = [{"role": "user", "content": prompt(r)}]
+        for kw in ({"enable_thinking": False}, {}):
+            try:
+                return tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True, **kw)
+            except Exception:
+                continue
+        return prompt(r)
+    return wrapped
 
 
 class Generate(Protocol):
@@ -104,44 +203,105 @@ def _ruler_prompt(r) -> str:
     return r["prompt"]
 
 
-def _math_500(rows, gen: Generate, prompt) -> float:
+def _judge_math_500(rows, texts) -> list[bool]:
     """exact_match on the final boxed answer -- MATH-500's own metric."""
-    outs = gen([prompt(r) for r in rows], 1024)
-    hit = 0
-    for r, o in zip(rows, outs):
-        m = _BOXED.findall(o.text)
-        if not m:
-            continue          # no boxed answer produced == wrong, not skipped
-        hit += _norm_latex(m[-1]) == _norm_latex(r["answer"])
-    return hit / len(rows)
+    out = []
+    for r, t in zip(rows, texts):
+        m = _BOXED.findall(t)
+        # no boxed answer produced == wrong, not skipped
+        out.append(bool(m) and _norm_latex(m[-1]) == _norm_latex(r["answer"]))
+    return out
 
 
-def _ruler(rows, gen: Generate, prompt) -> float:
+def _judge_ruler(rows, texts) -> list[bool]:
     """accuracy -- every needle must appear. Multi-needle on purpose: the
     single-needle variant saturates at 1.00 and cannot show a regression."""
-    outs = gen([prompt(r) for r in rows], 64)
-    hit = 0
-    for r, o in zip(rows, outs):
+    out = []
+    for r, t in zip(rows, texts):
         needles = r["answers"] if isinstance(r.get("answers"), list) else [r["answer"]]
-        hit += all(str(n).strip().lower() in o.text.lower() for n in needles)
-    return hit / len(rows)
+        out.append(all(str(n).strip().lower() in t.lower() for n in needles))
+    return out
 
 
-def _humaneval_plus(rows, gen: Generate, prompt) -> float:
-    """pass@1 by executing the generated code against the tests.
+def _mbpp_plus_prompt(r) -> str:
+    """The user turn. Row `prompt` is MBPP+'s own docstring, assertion included.
 
-    Generation is implemented; SCORING is not, and deliberately so: running
-    model-written code requires a real sandbox. Wiring it to bare exec() would
-    be the single most dangerous line in this project.
+    The assertion is left in deliberately -- it is the only thing that pins the
+    function NAME, and evalplus scores by calling `entry_point`. Strip it and a
+    correct solution under a different name scores zero, which would read as
+    quantization damage.
     """
-    outs = gen([prompt(r) for r in rows], 512)
-    raise NotImplementedError(
-        f"generated {len(outs)} completions, but pass@1 needs sandboxed execution.\n"
-        f"Wire this to a container/nsjail runner (or the evalplus harness) before "
-        f"enabling humaneval_plus. Until then, drop it from quality_benchmarks in "
-        f"dag/llm.json -- MATH-500 and RULER cover reasoning and long-context recall, "
-        f"and running it unsandboxed is not an acceptable shortcut."
+    return (
+        "Write a self-contained Python function that solves this problem.\n\n"
+        f"{r['prompt'].strip()}\n\n"
+        "Respond with only the code, in a single Python markdown block. "
+        "Do not include tests or explanation."
     )
+
+
+def _judge_mbpp_plus(rows, texts) -> list[bool]:
+    """pass@1 -- MBPP+'s own metric, by EXECUTING the generated code.
+
+    Execution happens in mbpp_score.py, in a separate process, under evalplus's
+    guards. See that file for why the boundary is there and what it does and does
+    not protect against. The short version: this project spent a year refusing to
+    call exec() on model output, and the refusal was correct; a subprocess is the
+    cheapest thing that is actually a boundary.
+
+    Scoring is a SUBSET of the dataset during traversal (100 of 378) and the full
+    set for a finalist, exactly like every other benchmark here. mbpp_score
+    computes groundtruth over all 378 regardless, because evalplus caches it
+    under a hash of the dataset -- caching a subset's expectations under the full
+    set's key would silently corrupt every later run.
+    """
+    with tempfile.TemporaryDirectory(prefix="mbpp-") as td:
+        samples = Path(td) / "samples.jsonl"
+        verdicts = Path(td) / "verdicts.json"
+        samples.write_text("\n".join(
+            json.dumps({"task_id": r["task_id"], "raw": t})
+            for r, t in zip(rows, texts)) + "\n")
+
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "mbpp_score.py"),
+             "--samples", str(samples), "--out", str(verdicts)],
+            capture_output=True, text=True, timeout=3600, cwd=HERE)
+        if not verdicts.exists():
+            raise RuntimeError(
+                f"MBPP+ scoring produced no verdicts (exit {proc.returncode}).\n"
+                f"Scoring silently returning 0.0 would read as 'quality unchanged' "
+                f"for every config, so this raises instead.\n"
+                f"--- stderr ---\n{proc.stderr[-2000:]}")
+
+        v = json.loads(verdicts.read_text())
+
+    if v["n_scored"] != len(rows):
+        print(f"        mbpp_plus: {v['n_scored']}/{len(rows)} scored -- "
+              f"task_ids missing from the dataset were dropped")
+    # Back into ROW ORDER. mbpp_score runs a process pool and returns verdicts as
+    # they complete, so its dict order is arrival order, not row order. Callers
+    # zip these against rows to find which problem flipped -- returning them
+    # unordered would attribute every flip to the wrong problem.
+    return [bool(v["verdicts"].get(r["task_id"], False)) for r in rows]
+
+
+def _judge_humaneval_plus(rows, texts) -> list[bool]:
+    """Still not wired -- but no longer for want of a sandbox.
+
+    The blocker named here for a year ("pass@1 needs sandboxed execution") is
+    solved: mbpp_score.py is that runner, and evalplus serves HumanEval+ from the
+    same API (`get_human_eval_plus`, and `untrusted_check` already takes the
+    dataset as its first argument). Finishing this is roughly: teach
+    mbpp_score.py a --dataset flag, add a fetch_human_eval_plus to fetch_data.py,
+    and register the benchmark.
+
+    It stays unregistered because nothing has asked for it. MBPP+ covers code
+    generation, and a second code benchmark measuring the same axis costs a full
+    ladder of GPU time to tell us what the first one already did.
+    """
+    raise NotImplementedError(
+        f"humaneval_plus has {len(rows)} rows to judge but is not wired up.\n"
+        f"The sandbox exists now -- see mbpp_score.py -- so this is a small job, "
+        f"not a blocked one. Use mbpp_plus for code quality in the meantime.")
 
 
 @dataclass(frozen=True)
@@ -158,22 +318,47 @@ class Benchmark:
     for the GENERATION, and MATH-500 asks for 1024 tokens where RULER asks 64.
     A fixed reserve would be wrong for one of them.
     """
-    score: Callable
+    judge: Callable
+    """(rows, texts) -> [bool], one verdict per row, IN ROW ORDER.
+
+    Judging is separated from generation so that the two callers who need it --
+    run_benchmark here, and eval_repro's score_once, which generates
+    non-streaming with its own semaphore -- share one implementation. They did
+    not: score_once sniffed the row shape ("answers" in r) to pick between
+    RULER's and MATH-500's rule, a third copy of logic that already lives here.
+    A code benchmark makes that untenable, since its judge is a subprocess.
+    """
     prompt: Callable
     metric: str
     n_full: int
     max_tokens: int
+    chat: bool = False
+    """Whether to send the prompt through the model's chat template.
+
+    False for math_500 and ruler on purpose. Every accuracy number this project
+    has recorded was measured raw, and turning the template on for them would
+    make new rows incomparable to old ones for a reason unrelated to the config
+    being tested. mbpp_plus is new, so it starts on the correct setting.
+    """
 
 
 BENCHMARKS: dict[str, Benchmark] = {
-    "math_500": Benchmark(_math_500, _math_500_prompt, "exact_match", 500, 1024),
-    "ruler_multineedle": Benchmark(_ruler, _ruler_prompt, "accuracy", 200, 64),
-    "humaneval_plus": Benchmark(_humaneval_plus, _ruler_prompt, "pass@1", 164, 512),
+    "math_500": Benchmark(_judge_math_500, _math_500_prompt, "exact_match", 500, 1024),
+    "ruler_multineedle": Benchmark(_judge_ruler, _ruler_prompt, "accuracy", 200, 64),
+    # max_tokens 512: measured p95 output is 73 tokens and the longest seen was
+    # 142, so this is ~3.5x the worst observed. It is a runaway cap, not a
+    # target. It matters most if a model with no chat template falls back to raw
+    # completion, where nothing emits a stop token and every generation runs to
+    # the cap.
+    "mbpp_plus": Benchmark(_judge_mbpp_plus, _mbpp_plus_prompt, "pass@1", 378, 512,
+                           chat=True),
+    "humaneval_plus": Benchmark(_judge_humaneval_plus, _ruler_prompt, "pass@1", 164, 512),
 }
 
 
 def run_benchmark(name: str, gen: Generate, *, full: bool = False,
-                  max_input_tokens: int | None = None) -> float:
+                  max_input_tokens: int | None = None,
+                  model: str | None = None) -> float:
     """Score one benchmark, refusing to score prompts the server cannot take.
 
     RULER generates long documents. Served under a right-sized max_model_len,
@@ -187,11 +372,17 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
     b = BENCHMARKS[name]
     rows = _load(name, None if full else TRAVERSAL_N)
 
+    # ONE prompt builder from here down -- the context filter and the scorer must
+    # see identical text. They did not once before: the scorer built its own
+    # string while the filter guessed at row["prompt"], and MATH-500 rows carry
+    # "problem", so a full traversal died on KeyError after it had finished.
+    prompt = _chat_wrapper(b.prompt, model) if b.chat else b.prompt
+
     if max_input_tokens:
         # Reserve room for the generation: the prompt plus what the model is
         # asked to produce must both fit inside max_model_len.
         budget = max_input_tokens - b.max_tokens
-        est = lambda r: len(b.prompt(r)) // 4
+        est = lambda r: len(prompt(r)) // 4
         if budget <= 0:
             raise ValueError(
                 f"{name}: max_model_len={max_input_tokens} leaves no room for a "
@@ -211,7 +402,14 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
             print(f"        {name}: {len(rows)-len(fits)}/{len(rows)} prompts exceed "
                   f"the {budget}-token budget, scoring on {len(fits)}")
         rows = fits
-    return round(b.score(rows, gen, b.prompt), 4)
+
+    # max_tokens comes from the Benchmark, not from a literal inside each scorer.
+    # It was in both places -- Benchmark.max_tokens sized the context filter while
+    # the scorer passed its own constant to gen() -- so changing one silently left
+    # the filter reserving room for a generation length nothing would produce.
+    outs = gen([prompt(r) for r in rows], b.max_tokens)
+    verdicts = b.judge(rows, [o.text for o in outs])
+    return round(sum(verdicts) / len(verdicts), 4)
 
 
 def resolution(name: str, *, full: bool = False) -> float:

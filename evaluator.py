@@ -698,7 +698,8 @@ class VllmEvaluator:
                         for b in benchmarks:
                             qual[b] = run_benchmark(
                                 b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
-                                max_input_tokens=config.get("max_model_len"))
+                                max_input_tokens=config.get("max_model_len"),
+                                model=self.fp.model.id)
                             self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
                                      f"(+/- {resolution(b):.1%} resolution)")
                     mem = self._gpu_memory_gb()
@@ -824,7 +825,8 @@ class VllmEvaluator:
                     for b in benchmarks:
                         qual[b] = run_benchmark(
                             b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
-                            max_input_tokens=config.get("max_model_len"))
+                            max_input_tokens=config.get("max_model_len"),
+                                model=self.fp.model.id)
                         self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
                                  f"(+/- {resolution(b):.1%} resolution at this sample size)")
                 mem = self._gpu_memory_gb()

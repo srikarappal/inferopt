@@ -105,14 +105,25 @@ def configs_under_test(a, fp) -> list[tuple[str, dict]]:
     return [("stock", stock_config(fp))]
 
 
-def score_once(ev, model, rows, bench, concurrency):
-    """One pass over the problem list. Returns (score, per-item verdicts, texts)."""
+def score_once(ev, model, rows, bench, concurrency, prompt=None):
+    """One pass over the problem list. Returns (score, per-item verdicts, texts).
+
+    JUDGING IS NOT DONE HERE. It used to be: this function picked between
+    RULER's rule and MATH-500's by sniffing whether the row had an "answers"
+    key, which was a third copy of logic that already existed in quality.py --
+    the same duplication that once put MATH-500's prompt in two places, let them
+    disagree, and killed a traversal nine launches in with a KeyError.
+
+    Now the benchmark owns its judge and both callers use it. That is also what
+    makes a code benchmark possible at all: MBPP+'s judge shells out to a
+    sandboxed runner, and no amount of row-sniffing here could reproduce it.
+    """
     import httpx
 
     from evaluator import _one
-    from quality import _BOXED, _norm_latex
 
-    prompts = [bench.prompt(r) for r in rows]
+    prompt = prompt or bench.prompt
+    prompts = [prompt(r) for r in rows]
 
     async def go_all():
         sem = asyncio.Semaphore(concurrency)
@@ -123,19 +134,22 @@ def score_once(ev, model, rows, bench, concurrency):
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
     outs = asyncio.run(go_all())
-    verdicts = []
-    for r, o in zip(rows, outs):
-        if "answers" in r:                  # RULER: every needle must appear
-            needles = r["answers"] if isinstance(r["answers"], list) else [r["answers"]]
-            verdicts.append(all(str(n).strip().lower() in o.text.lower() for n in needles))
-        else:                               # MATH-500: the final boxed answer
-            m = _BOXED.findall(o.text)
-            verdicts.append(bool(m) and _norm_latex(m[-1]) == _norm_latex(r["answer"]))
-    return sum(verdicts) / len(verdicts), verdicts, [o.text for o in outs]
+    texts = [o.text for o in outs]
+    verdicts = bench.judge(rows, texts)
+    return sum(verdicts) / len(verdicts), verdicts, texts
 
 
 def _answer_of(row) -> object:
-    return row.get("answer") if "answer" in row else row.get("answers")
+    """What the dump records as 'the right answer'.
+
+    Code benchmarks have no answer string -- correctness is whether the tests
+    passed -- so the task_id is recorded instead, which is what you need to look
+    the problem up.
+    """
+    for k in ("answer", "answers", "task_id"):
+        if k in row:
+            return row[k]
+    return None
 
 
 def main() -> int:
@@ -146,7 +160,9 @@ def main() -> int:
     ap.add_argument("--model", required=True,
                     help="HF id or local path, including a quantized checkpoint")
     ap.add_argument("--benchmark", default="math_500",
-                    help="math_500 | ruler_multineedle (see quality.py)")
+                    help="math_500 | mbpp_plus | ruler_multineedle (see quality.py). "
+                         "mbpp_plus EXECUTES generated code in a subprocess -- see "
+                         "mbpp_score.py for the isolation boundary.")
     ap.add_argument("--n", type=int, default=100, help="problems to score")
     ap.add_argument("--repeats", type=int, default=3,
                     help=">1 measures the eval's own resolution limit")
@@ -184,13 +200,21 @@ def main() -> int:
     bench = BENCHMARKS[a.benchmark]
     rows = _load(a.benchmark, a.n)
 
+    # ONE prompt builder for the filter, the generation and the flips dump.
+    # A code benchmark on an instruct model needs the chat template applied (see
+    # _chat_wrapper); measuring the filter against untemplated text while
+    # generating from templated text would under-count the prompt by the
+    # template's own tokens.
+    from quality import _chat_wrapper
+    prompt = _chat_wrapper(bench.prompt, a.model) if bench.chat else bench.prompt
+
     # Every config is scored on the IDENTICAL problem list. A traversal filters
     # by max_model_len, and two configs can differ there -- scoring them on
     # separately-filtered sets manufactures a difference belonging to neither.
     limits = [c["max_model_len"] for _, c in tests if c.get("max_model_len")]
     if limits:
         budget = min(limits) - bench.max_tokens
-        keep = [r for r in rows if len(bench.prompt(r)) // 4 < budget]
+        keep = [r for r in rows if len(prompt(r)) // 4 < budget]
         if len(keep) < len(rows):
             print(f"  dropping {len(rows)-len(keep)} problems over the tightest config's "
                   f"{budget}-token budget, so all configs see the same set")
@@ -236,7 +260,7 @@ def main() -> int:
         scores, verdicts, texts = [], [], []
         with ev._serve({**cfg, "model": a.model}, f"eval-{tag}") as model:
             for i in range(a.repeats):
-                s, v, t = score_once(ev, model, rows, bench, a.concurrency)
+                s, v, t = score_once(ev, model, rows, bench, a.concurrency, prompt)
                 scores.append(s); verdicts.append(v); texts.append(t)
                 print(f"      repeat {i+1}/{a.repeats}   {s:.4f}   ({sum(v)}/{len(v)})")
             # SERVING METRICS -- the traversal's exact instrument, not a
@@ -288,7 +312,7 @@ def main() -> int:
                     if len({v[i] for v in verdicts}) > 1:
                         fh.write(json.dumps({
                             "problem": i, "answer": _answer_of(rows[i]),
-                            "prompt": bench.prompt(rows[i])[:400],
+                            "prompt": prompt(rows[i])[:400],
                             "verdicts": [v[i] for v in verdicts],
                             "texts": [t[i] for t in texts]}) + "\n")
             print(f"      wrote {fl}  ({flips} problems that disagreed with THEMSELVES)")
@@ -356,7 +380,7 @@ def main() -> int:
                     n_stable += 1
                     fh.write(json.dumps({
                         "problem": i, "answer": _answer_of(rows[i]),
-                        "prompt": bench.prompt(rows[i])[:400],
+                        "prompt": prompt(rows[i])[:400],
                         f"{names[0]}_correct": next(iter(va)),
                         f"{names[1]}_correct": next(iter(vb)),
                         f"{names[0]}_text": keep_t[names[0]][0][i],

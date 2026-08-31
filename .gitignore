@@ -1,9 +1,16 @@
 # Isolated toolchains. Both exist because their pins CANNOT coexist with vLLM's:
 #   .aic-pkgs    aiconfigurator wants numpy~=1.26.4, vLLM wants <2.4
 #   .quant-pkgs  llmcompressor wants compressed-tensors==0.18.0, vLLM pins ==0.17.0
-# Rebuild with: python quantize.py --setup
+#   .evalplus-pkgs  evalplus drags in openai/anthropic/google-generativeai for ITS
+#                   generation backends, which we do not use -- we generate with
+#                   vLLM. Kept out of the serving env on principle: this project
+#                   has been broken twice by a dep installed for a side feature.
+# Rebuild with: python quantize.py --setup, or for evalplus:
+#   pip install --target .evalplus-pkgs --no-deps evalplus tempdir appdirs \
+#       multipledispatch wget termcolor fire tree-sitter tree-sitter-python
 .aic-pkgs/
 .quant-pkgs/
+.evalplus-pkgs/
 .venv-aic/
 
 # Measurement output and generated inputs -- machine-specific, and large.

@@ -55,15 +55,24 @@ def _serving_unified_commit() -> str | None:
 # Where to look, and what to call it. Order is the story: what you start with,
 # what costs nothing, then increasingly aggressive weight changes.
 SOURCES = [
-    ("stock",         "runs/quantize/q_stock",              "bf16, vLLM defaults"),
-    ("stock (older)", "runs/eval_repro/base",               "bf16, earlier run"),
-    ("lossless",      "runs/eval_repro/base_after_runNine", "flags only: prefix cache + ngram"),
-    ("fp8",           "runs/quantize/q_fp8",                "load-time flag, no artifact"),
-    ("autoquant@6.0", "runs/quantize/q_autoquant_6.0",      "mixed precision, 6 effective bits"),
-    ("autoquant@5.0", "runs/quantize/q_autoquant_5.0",      "mixed precision, 5 effective bits"),
-    ("w4a16",         "runs/quantize/q_w4a16",              "4-bit weights, 16-bit activations"),
-    ("nvfp4",         "runs/quantize/q_nvfp4",              "4-bit weights AND activations"),
+    # LOSSLESS -- weights untouched, flags only
+    ("stock",          "runs/quantize/q_stock",              "bf16, vLLM defaults"),
+    ("stock n=500",    "runs/quantize/q_stock_n500",         "bf16, 500-problem eval"),
+    ("stock (older)",  "runs/eval_repro/base",               "bf16, earlier run"),
+    ("lossless",       "runs/eval_repro/base_after_runNine", "prefix cache + ngram spec decode"),
+    # LOSSY -- weights rewritten
+    ("fp8",            "runs/quantize/q_fp8",                "8-bit, load-time flag, no artifact"),
+    ("autoquant@6.0",  "runs/quantize/q_autoquant_6.0",      "mixed precision, 6.0 effective bits"),
+    ("autoquant@5.15", "runs/quantize/q_autoquant_5.15",     "mixed precision, at this model's floor"),
+    ("w4a16",          "runs/quantize/q_w4a16",              "4-bit weights, 16-bit activations"),
+    ("nvfp4",          "runs/quantize/q_nvfp4",              "4-bit weights AND activations"),
+    ("nvfp4 n=500",    "runs/quantize/q_nvfp4_n500",         "nvfp4, 500-problem eval"),
 ]
+
+# Which rows changed the weights. The distinction the table exists to make: a
+# lossless row cannot move quality by construction, so any movement there is
+# measurement noise; a lossy row can, so movement there has to be judged.
+LOSSY = {"fp8", "autoquant@6.0", "autoquant@5.15", "w4a16", "nvfp4", "nvfp4 n=500"}
 
 DEMAND_TOK_S = 15.36 * 259      # what this workload needs served on time
 

@@ -24,8 +24,11 @@ It asserts on structure and invariants, not on exact numbers.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
 import time
+from pathlib import Path
 
 FAILURES: list[str] = []
 
@@ -360,6 +363,86 @@ def main() -> int:
     check("report prints the BASELINE block", "BASELINE" in blob)
     check("report prints replicas", "replicas" in blob)
     check("report prints the concurrency column", " L " in blob or "L*" in blob)
+
+    # ----------------------------------------------------------------------
+    # Benchmarks judge in ONE place, and a code benchmark actually executes.
+    #
+    # Two failures are being guarded against, both of which have happened here:
+    # scoring logic living in two files and drifting apart, and a probe that
+    # returns 0.0 for every config -- which reads as "quality unchanged" rather
+    # than "the probe is broken".
+    # ----------------------------------------------------------------------
+    print("\n=== benchmarks: one judge per benchmark, shared by both callers ===")
+    import inspect as _inspect
+
+    from quality import BENCHMARKS
+
+    src = Path("eval_repro.py").read_text()
+    check("score_once calls bench.judge rather than re-deriving verdicts",
+          "bench.judge(rows, texts)" in src)
+    check("score_once no longer sniffs the row shape",
+          '"answers" in r' not in src,
+          "picking the metric by inspecting the row is a second copy of quality.py")
+    check("run_benchmark takes max_tokens from the Benchmark",
+          "gen([prompt(r) for r in rows], b.max_tokens)" in Path("quality.py").read_text())
+
+    for name, b in BENCHMARKS.items():
+        sig = list(_inspect.signature(b.judge).parameters)
+        check(f"{name}: judge takes (rows, texts)", sig[:2] == ["rows", "texts"],
+              f"got {sig}")
+
+    # MATH-500's judge, on hand-built texts, in both directions.
+    m_rows = [{"answer": "42"}, {"answer": "7"}]
+    got = BENCHMARKS["math_500"].judge(
+        m_rows, [r"the answer is \boxed{42}", "I could not solve it"])
+    check("math_500 judge: right answer True, no boxed answer False", got == [True, False])
+
+    print("\n=== mbpp_plus: the code benchmark actually executes ===")
+    mbpp_data = Path("data/mbpp_plus.jsonl")
+    if not mbpp_data.exists():
+        check("mbpp_plus dataset present", False,
+              "run `python fetch_data.py` -- mbpp_plus checks skipped")
+    else:
+        import subprocess as _sp
+        rows = [json.loads(l) for l in mbpp_data.read_text().splitlines()[:12]]
+        r = _sp.run([sys.executable, "-c",
+                     "import json;from evalplus.data import get_mbpp_plus;"
+                     "print(json.dumps({k:v['prompt']+v['canonical_solution'] "
+                     "for k,v in get_mbpp_plus().items()}))"],
+                    capture_output=True, text=True, timeout=600,
+                    env={**os.environ, "PYTHONPATH": str(Path(".evalplus-pkgs").resolve())})
+        if r.returncode != 0:
+            check("evalplus is importable from .evalplus-pkgs", False, r.stderr[-300:])
+        else:
+            canon = json.loads(r.stdout.strip().splitlines()[-1])
+            judge = BENCHMARKS["mbpp_plus"].judge
+
+            good = [f"```python\n{canon[x['task_id']]}\n```" for x in rows]
+            check("canonical solutions all PASS", all(judge(rows, good)),
+                  "a judge that fails correct code would read as quantization damage")
+
+            prose = ["This problem compares two lists element-wise."] * len(rows)
+            check("prose with no code all FAILS", not any(judge(rows, prose)),
+                  "a judge that passes non-code cannot detect damage either")
+
+            # Row order. mbpp_score runs a process pool and returns verdicts as
+            # they COMPLETE, so its dict is in arrival order. Callers zip the
+            # result against rows to find which problem flipped; unordered
+            # verdicts would blame the wrong problem every time.
+            mixed = list(good)
+            mixed[0] = "nope"
+            mixed[3] = "also nope"
+            v = judge(rows, mixed)
+            check("verdicts come back in ROW order, not completion order",
+                  v[0] is False and v[3] is False and all(v[i] for i in (1, 2, 4, 5)),
+                  f"got {v}")
+
+        check("mbpp_plus uses the chat template", BENCHMARKS["mbpp_plus"].chat,
+              "raw completions on an instruct model score prompt format, not capability")
+        check("math_500 does NOT use the chat template",
+              not BENCHMARKS["math_500"].chat,
+              "every recorded MATH-500 number was measured raw; changing it "
+              "makes new rows incomparable to old ones")
 
     print()
     if FAILURES:

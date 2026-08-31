@@ -54,6 +54,7 @@ DEFAULT_ACCEPT_BAND = 0.05
 DEFAULT_QUALITY_TOLERANCE = {
     "ruler_multineedle": 0.01,   # short extractive output, least room to drift
     "humaneval_plus": 0.03,      # ~150 tokens, and one bad token fails a test
+    "mbpp_plus": 0.03,           # same shape: pass/fail on execution, no partial credit
     "math_500": 0.04,            # long CoT, most chances to derail
 }
 
