@@ -95,9 +95,54 @@ def artifact_gb(tag: str) -> str:
     return f"{n / 1e9:.1f}"
 
 
+def discover(root: Path) -> list[tuple[str, str, str]]:
+    """Every eval.json under `root`, labelled from what actually ran.
+
+    The SOURCES table below is a hand-written story about ONE ladder: which
+    variants, in which order, with a sentence each. It cannot describe a ladder
+    that has not been run yet, and hardcoding a second copy for every benchmark
+    is how the artifact glob and the commit check both went stale.
+
+    So: given a directory, read the labels off the runs themselves. run_meta.json
+    records the model and benchmark that produced each result, which is exactly
+    the description a discovered row needs.
+    """
+    out = []
+    for f in sorted(root.glob("*/eval.json")):
+        d = f.parent
+        label = d.name[2:] if d.name.startswith("q_") else d.name
+        what = ""
+        meta = d / "run_meta.json"
+        if meta.exists():
+            try:
+                m = json.loads(meta.read_text())
+                args = m.get("args", {})
+                model = (args.get("model") or {}).get("value", "")
+                bench = (args.get("benchmark") or {}).get("value", "")
+                n = (args.get("n") or {}).get("value", "")
+                what = f"{Path(str(model)).name}   {bench} n={n}"
+            except Exception:
+                pass
+        out.append((label, str(d), what))
+    return out
+
+
 def main() -> int:
+    import sys
+    if len(sys.argv) > 1:
+        root = Path(sys.argv[1])
+        if not root.is_dir():
+            print(f"  {root} is not a directory")
+            return 1
+        sources = discover(root)
+        if not sources:
+            print(f"  no eval.json under {root} yet")
+            return 0
+    else:
+        sources = SOURCES
+
     rows = []
-    for label, d, what in SOURCES:
+    for label, d, what in sources:
         f = Path(d) / "eval.json"
         if not f.exists():
             rows.append((label, what, None, None, None))
