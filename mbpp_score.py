@@ -34,6 +34,20 @@ place, at batch granularity rather than per problem. Containerising per
 execution -- which is what llm-sandbox does -- would pay container startup ~7000
 times for a single six-variant ladder, and startup would dominate the run.
 
+NOTHING HERE TOUCHES THE NETWORK
+
+The dataset is read from data/mbpp_plus_full.jsonl via MBPP_OVERRIDE_PATH, and
+expected outputs are computed locally by executing the canonical solutions --
+about 30s cold, then cached. That is deliberate and was learned the hard way:
+the tests originally stayed in evalplus's machine-local cache, so on a second
+machine the first ladder run tried to DOWNLOAD MBPP+ in the middle of judging
+and died on an SSL certificate failure, after the model had loaded and 378
+completions had been generated. A benchmark must not need the network at the
+moment it is judging. `rsync data/` now makes another machine work offline.
+
+The groundtruth pickle is ~750MB. It is a cache, not an input: delete it and it
+recomputes in 30s.
+
 GROUNDTRUTH IS COMPUTED ON THE FULL SET, ALWAYS
 
 evalplus caches expected outputs in a pickle keyed by a hash of the DATASET, not
@@ -48,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -115,6 +130,27 @@ def main() -> int:
 
     if PKGS.is_dir() and str(PKGS) not in sys.path:
         sys.path.insert(0, str(PKGS))
+
+    # Point evalplus at the local dataset BEFORE importing it -- MBPP_OVERRIDE_PATH
+    # is read at import time, and without it evalplus downloads MBPP+ into a
+    # machine-local cache. That download is a network call in the middle of
+    # judging: on a fresh machine the first ladder run died on an SSL certificate
+    # failure AFTER loading the model and generating 378 completions. Scoring must
+    # not need the network.
+    full = HERE / "data" / "mbpp_plus_full.jsonl"
+    if full.exists():
+        os.environ.setdefault("MBPP_OVERRIDE_PATH", str(full))
+    elif "MBPP_OVERRIDE_PATH" not in os.environ:
+        print(f"{full} not found -- evalplus would try to DOWNLOAD MBPP+ while "
+              f"scoring.\nMaterialize it first (costs nothing, needs the network "
+              f"once):\n    python fetch_data.py\n"
+              f"If this box cannot verify SSL certificates:\n"
+              f"    export SSL_CERT_FILE=$(python -m certifi)\n"
+              f"or copy the 2.6MB file from a machine that has it:\n"
+              f"    rsync <other-host>:<repo>/data/mbpp_plus_full.jsonl {full}",
+              file=sys.stderr)
+        return 4
+
     try:
         from evalplus.data import get_mbpp_plus, get_mbpp_plus_hash
         from evalplus.evaluate import get_groundtruth
