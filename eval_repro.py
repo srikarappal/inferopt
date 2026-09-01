@@ -69,6 +69,22 @@ import sys
 from pathlib import Path
 
 
+def memory_fraction(fp) -> float:
+    """gpu_memory_utilization, decided by the hardware rather than hardcoded.
+
+    On a DEDICATED GPU this is a fraction of that GPU's own memory and 0.90 is
+    the usual safe ceiling. On a UNIFIED-memory part (GB10) it is a fraction of
+    SYSTEM memory that the CPU also competes for: 0.90 there leaves ~1.6 GB of
+    headroom on a 122 GB box and runs into the OOM killer. 0.75 is a boot
+    requirement on that hardware, not a tuning choice.
+
+    It was hardcoded to 0.75 in three config files, which silently wasted ~20 GB
+    per card on an H100 -- the number was right for the machine it was written on
+    and wrong everywhere else.
+    """
+    return 0.75 if fp.hw.unified_memory else 0.90
+
+
 def stock_config(fp) -> dict:
     """vLLM defaults, plus only what this hardware needs in order to boot.
 
@@ -82,7 +98,7 @@ def stock_config(fp) -> dict:
     That is a requirement to start at all, not a tuning decision, and it is
     printed so it is never mistaken for one.
     """
-    return {"gpu_memory_utilization": 0.75} if fp.hw.unified_memory else {}
+    return {"gpu_memory_utilization": memory_fraction(fp)}
 
 
 def load_config(path: str) -> dict:
@@ -101,7 +117,14 @@ def configs_under_test(a, fp) -> list[tuple[str, dict]]:
         before = (r.get("baseline") or {}).get("config") or stock_config(fp)
         return [("A before", before), ("B after", r["incumbent"])]
     if a.config:
-        return [(f"cfg{i+1}", load_config(p)) for i, p in enumerate(a.config)]
+        # The memory fraction is injected from the fingerprint unless the config
+        # names one explicitly, so a config file is portable across hardware.
+        out = []
+        for i, p in enumerate(a.config):
+            c = load_config(p)
+            c.setdefault("gpu_memory_utilization", memory_fraction(fp))
+            out.append((Path(p).stem, c))
+        return out
     return [("stock", stock_config(fp))]
 
 

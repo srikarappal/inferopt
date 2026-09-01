@@ -109,6 +109,12 @@ run_one q_stock    --model "$MODEL" --config configs/stock.json
 run_one q_lossless --model "$MODEL" --config configs/lossless.json
 run_one q_fp8      --model "$MODEL" --config configs/fp8.json
 
+# What this GPU can actually run. NVFP4 needs Blackwell (sm100+/sm120+); on an
+# H100 (sm90) the engine refuses to load, so the row would burn a model load and
+# a launch timeout to discover what the fingerprint already knows.
+SKIP=$(python check_support.py 2>/dev/null || echo "")
+[ -n "$SKIP" ] && echo "  NOTE: unsupported on this GPU, skipping: $SKIP"
+
 # Then whatever was actually built, in whatever precision it landed at.
 for DIR in artifacts/${SAFE}--*; do
     [ -d "$DIR" ] || continue
@@ -116,7 +122,13 @@ for DIR in artifacts/${SAFE}--*; do
     # conversion that died mid-write, not a variant to measure.
     [ -f "$DIR/hf_quant_config.json" ] || {
         echo "  skipping $(basename "$DIR") -- incomplete conversion"; continue; }
-    run_one "q_$(basename "$DIR" | sed "s/^${SAFE}--//")" --model "$DIR"
+    BASE=$(basename "$DIR" | sed "s/^${SAFE}--//")
+    if [ -n "$SKIP" ] && echo " $SKIP " | grep -q " $BASE "; then
+        echo "  skipping $BASE -- not supported on this GPU"
+        record "q_$BASE" unsupported
+        continue
+    fi
+    run_one "q_$BASE" --model "$DIR"
 done
 
 note "final"
