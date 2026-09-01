@@ -402,6 +402,25 @@ def main() -> int:
         m_rows, [r"the answer is \boxed{42}", "I could not solve it"])
     check("math_500 judge: right answer True, no boxed answer False", got == [True, False])
 
+    # RULER prompts must fit the window the server will actually run. When they
+    # do not, EVERY prompt is rejected and the benchmark scores 0.0 for every
+    # config -- which reads as "quality unchanged" rather than "probe broken".
+    # fetch_data.py rebuilds all datasets together, so fetching one benchmark
+    # silently regenerated this corpus at 16k/32k and left 0/200 fitting.
+    print("\n=== ruler: the corpus fits the served context ===")
+    rp = Path("data/ruler_multineedle.jsonl")
+    if not rp.exists():
+        check("ruler corpus present", False, "run python fetch_data.py")
+    else:
+        rr = [json.loads(l) for l in rp.read_text().splitlines() if l.strip()]
+        est = [len(x["prompt"]) // 4 for x in rr]
+        for mml in (6144, 7168):
+            fits = sum(1 for e in est if e < mml - 64)
+            check(f"all {len(rr)} ruler prompts fit max_model_len {mml}",
+                  fits == len(rr),
+                  f"only {fits}/{len(rr)} fit (longest ~{max(est)} tokens). "
+                  f"Regenerate: python fetch_data.py --ruler-contexts 2048,4096")
+
     print("\n=== mbpp_plus: the code benchmark actually executes ===")
     mbpp_data = Path("data/mbpp_plus.jsonl")
     if not mbpp_data.exists():

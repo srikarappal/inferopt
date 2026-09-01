@@ -36,7 +36,26 @@ from pathlib import Path
 DATA = Path(__file__).parent / "data"
 N_RULER = 200
 NEEDLES_PER_DOC = 4
-CONTEXTS = (16384, 32768)
+
+# RULER context lengths, in tokens. These MUST fit under the max_model_len the
+# server will actually run, minus room for the generation.
+#
+# The default was (16384, 32768), which fits nothing this project serves: the
+# traversal right-sizes max_model_len to 6144-7168 for this workload, so every
+# prompt is rejected, run_benchmark raises, and the traversal dies at its first
+# quality node.
+#
+# That is not hypothetical and the failure mode is nasty. Fetching MBPP+ meant
+# running fetch_data.py, which silently regenerated a WORKING corpus into a
+# broken one -- the datasets are rebuilt together, so a fetch for one benchmark
+# replaced another. Run nine had scored ruler at 1.00 against a smaller corpus;
+# afterwards 0/200 prompts fit and nothing said so until the lengths were
+# measured directly.
+#
+# 2048/4096 fits under both 6144 and 7168 with room for a 64-token generation,
+# and is still long enough to be a genuine long-context probe. Override with
+# --ruler-contexts when serving a larger window.
+CONTEXTS = (2048, 4096)
 DEPTHS = (0.12, 0.37, 0.62, 0.88)
 
 
