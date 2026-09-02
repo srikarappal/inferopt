@@ -139,12 +139,79 @@ def _configure_memory_guard() -> str:
         return msg
     else:
         os.environ["EVALPLUS_MAX_MEMORY_BYTES"] = "-1"
-        msg = (f"memory guard DISABLED -- this shell's hard rlimit is "
-               f"{usable/1024**2:.0f} MiB, too small to be useful. Executions are "
-               f"still bounded by evalplus's timeout. `ulimit -s unlimited` "
-               f"restores the cap.")
+        own = _install_own_cap()
+        msg = (f"evalplus's memory guard is unusable here (hard rlimit "
+               f"{usable/1024**2:.0f} MiB, it wants 4 GiB); {own}")
         print(f"  {msg}")
         return msg
+
+
+def _install_own_cap() -> str:
+    """Cap address space ourselves, since evalplus's guard could not be applied.
+
+    This works where evalplus's does not for one reason: it only LOWERS the soft
+    limit of RLIMIT_AS, which is always permitted, where evalplus tries to raise
+    the HARD limit of three separate limits to the same 4 GiB -- absurd for
+    RLIMIT_STACK, and forbidden when the hard limit is lower. Worker processes
+    inherit rlimits, so a cap set here applies to every execution.
+
+    Leaving it uncapped is not a neutral choice on this hardware. Ten workers run
+    concurrently, and while a slow allocation LOOP is bounded by evalplus's
+    few-second timeout, a single large allocation is not -- time_limit uses
+    signals, which cannot interrupt a C-level allocation in flight. MBPP+ is full
+    of combinatorial problems (Mbpp/255 and Mbpp/630 time out on their own
+    reference solutions), and a model-written `list(permutations(range(15)))`
+    asks for 1.3 trillion tuples in one call. On a unified-memory part that
+    competes with the GPU: exhausting host RAM can take down the vLLM server
+    holding the model, not just the test process.
+
+    The cap is per process, so the worst case is n_workers x cap rather than the
+    whole machine. Sized to leave the box usable, and generous enough that the
+    parent can still hold the groundtruth table.
+    """
+    import resource
+    try:
+        import psutil
+        total = psutil.virtual_memory().total
+    except Exception:
+        total = 16 * 1024 ** 3
+    workers = max(1, (os.cpu_count() or 4) // 2)
+
+    # SIZED FROM MEASUREMENT, and the numbers argue for a SMALL cap:
+    #
+    #   largest MBPP+ test-input set          0.19 MB   (Mbpp/301)
+    #   median across all 378 problems        0.004 MB
+    #   peak allocation running the heaviest  0.1 MB
+    #   parent process holding groundtruth    1.85 GB   <- the real floor
+    #
+    # No legitimate solution needs even a megabyte; these are one-line problems.
+    # The floor is set by the PARENT, which holds the groundtruth table, not by
+    # anything the generated code does.
+    #
+    # Raising the cap does not help anything and costs the guard its point: at
+    # 20 GiB, ten workers could ask for 200 GiB on a 131 GiB machine, so the cap
+    # could no longer prevent exhaustion. A ceiling is not a reservation --
+    # capping at 6 GiB does not consume 6 GiB, and healthy usage stays near
+    # 0.2 GB per worker.
+    #
+    # Override with INFEROPT_MBPP_MEM_CAP_GB if a workload genuinely needs it.
+    env_cap = os.environ.get("INFEROPT_MBPP_MEM_CAP_GB")
+    if env_cap:
+        per = int(float(env_cap) * 1024 ** 3)
+    else:
+        # Half the machine shared across workers, clamped to [3, 8] GiB: above
+        # the 1.85 GB floor with real headroom, far below what hurts.
+        per = int(min(8 * 1024 ** 3, max(3 * 1024 ** 3, total * 0.5 / workers)))
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard != resource.RLIM_INFINITY:
+        per = min(per, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (per, hard))
+        return (f"capped address space at {per/1024**3:.1f} GiB per process "
+                f"instead ({workers} workers)")
+    except (ValueError, OSError) as e:
+        return (f"and our own cap failed too ({type(e).__name__}) -- executions "
+                f"are bounded only by the timeout")
 
 
 def main() -> int:
