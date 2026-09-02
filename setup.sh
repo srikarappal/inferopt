@@ -41,9 +41,17 @@ for m in ("torch", "vllm", "transformers", "httpx", "pydantic", "datasets"):
         print(f"  {m:12s} MISSING")
         missing.append(m)
 if missing:
-    print(f"\n  Install these before running a ladder: {', '.join(missing)}")
-    print(f"  vLLM and torch are CUDA-version specific -- follow vLLM's install")
-    print(f"  guide for this host rather than letting this script guess.")
+    print(f"\n  MISSING: {', '.join(missing)}")
+    print(f"  Install them into THIS interpreter -- not another env:")
+    print(f"      {sys.executable} -m pip install -r requirements.txt")
+    if "torch" in missing or "vllm" in missing:
+        print(f"  torch must match this host's CUDA (cu126/cu128 for H100 sm90,")
+        print(f"  cu130 for GB10 sm121). Install the matching wheel from")
+        print(f"  pytorch.org FIRST if pip's default build is wrong for this box.")
+    print(f"\n  Then verify with the SAME interpreter:")
+    print(f"      {sys.executable} -c 'import vllm; print(vllm.__version__)'")
+    print(f"  Running run.py with a different python than the one vLLM lives in")
+    print(f"  is the most common failure on a new host.")
 PY
 
 note "GPU"
