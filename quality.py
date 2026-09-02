@@ -87,6 +87,9 @@ HERE = Path(__file__).resolve().parent
 DATA = HERE / "data"
 TRAVERSAL_N = 100
 
+# Said once per process: a caveat repeated 21 times in a ladder is noise.
+_WARNED: set[str] = set()
+
 # Chat templates, cached per model. Building one costs a tokenizer load.
 _TEMPLATES: dict[str, object] = {}
 
@@ -273,6 +276,11 @@ def _judge_mbpp_plus(rows, texts) -> list[bool]:
                 f"--- stderr ---\n{proc.stderr[-2000:]}")
 
         v = json.loads(verdicts.read_text())
+
+    guard = v.get("memory_guard")
+    if guard and guard not in _WARNED:
+        _WARNED.add(guard)
+        print(f"        mbpp_plus: {guard}")
 
     if v["n_scored"] != len(rows):
         print(f"        mbpp_plus: {v['n_scored']}/{len(rows)} scored -- "

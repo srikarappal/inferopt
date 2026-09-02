@@ -87,6 +87,66 @@ HERE = Path(__file__).resolve().parent
 PKGS = HERE / ".evalplus-pkgs"
 
 
+def _configure_memory_guard() -> str:
+    """Make evalplus's rlimit guard applicable on THIS shell, or turn it off loudly.
+
+    evalplus caps each execution with setrlimit on RLIMIT_AS, RLIMIT_DATA and
+    RLIMIT_STACK, all to the same value (4 GiB by default, or
+    EVALPLUS_MAX_MEMORY_BYTES). Setting a HARD limit above the current hard
+    limit is not permitted, so on a shell where any of those three is capped
+    below 4 GiB -- RLIMIT_STACK commonly is -- every execution raises
+
+        ValueError: not allowed to raise maximum limit
+
+    and every sample fails. The score is then 0.0000 with the generations
+    perfectly fine, which is indistinguishable from total quality collapse. It
+    is also environment-dependent: identical code passes in a shell with
+    unlimited hard limits and fails in one without, which is exactly the kind of
+    difference that gets blamed on the model.
+
+    So: pick the largest cap this shell can actually apply. If even a reduced
+    cap is impossible, disable the guard (-1) and say so, because a missing
+    memory cap is a much smaller problem than a benchmark that always reads
+    zero. The guard was never containment anyway -- see the module docstring --
+    it stops runaway generations, and the execution timeout still does that.
+    """
+    import resource
+
+    want = int(os.environ.get("EVALPLUS_MAX_MEMORY_BYTES", 4 * 1024 ** 3))
+    if want == -1:
+        return "disabled by caller"
+
+    hards = []
+    for name in ("RLIMIT_AS", "RLIMIT_DATA", "RLIMIT_STACK"):
+        r = getattr(resource, name, None)
+        if r is None:
+            continue
+        _, hard = resource.getrlimit(r)
+        if hard != resource.RLIM_INFINITY:
+            hards.append(hard)
+
+    if not hards or min(hards) >= want:
+        return ""                                # the default already applies
+
+    usable = min(hards)
+    # A cap this small would fail legitimate solutions rather than protect
+    # anything, so below ~256 MiB it is not worth having.
+    if usable >= 256 * 1024 ** 2:
+        os.environ["EVALPLUS_MAX_MEMORY_BYTES"] = str(usable)
+        msg = (f"memory guard reduced to {usable/1024**3:.2f} GiB, this shell's "
+               f"hard rlimit (evalplus defaults to 4 GiB)")
+        print(f"  {msg}")
+        return msg
+    else:
+        os.environ["EVALPLUS_MAX_MEMORY_BYTES"] = "-1"
+        msg = (f"memory guard DISABLED -- this shell's hard rlimit is "
+               f"{usable/1024**2:.0f} MiB, too small to be useful. Executions are "
+               f"still bounded by evalplus's timeout. `ulimit -s unlimited` "
+               f"restores the cap.")
+        print(f"  {msg}")
+        return msg
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="mbpp_score")
     ap.add_argument("--samples", required=True,
@@ -149,6 +209,8 @@ def main() -> int:
               f"        evalplus tempdir appdirs multipledispatch wget termcolor \\\n"
               f"        fire tree-sitter tree-sitter-python", file=sys.stderr)
         return 2
+
+    guard = _configure_memory_guard()
 
     raw_samples = [json.loads(l) for l in
                    Path(a.samples).read_text().splitlines() if l.strip()]
@@ -216,6 +278,7 @@ def main() -> int:
         "n_unsanitizable": n_blank,
         "verdicts": verdicts,
         "status": status,
+        "memory_guard": guard,
     }
     Path(a.out).write_text(json.dumps(out, indent=2))
     tmpdir.cleanup()
