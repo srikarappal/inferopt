@@ -70,6 +70,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -84,7 +85,80 @@ from calibration import STORE
 from fingerprint import SLO, Fingerprint
 from traverse import Trial
 
-VLLM_CMD = os.environ.get("INFEROPT_VLLM_CMD", "vllm").split()
+_VLLM_CMD: list[str] | None = None
+
+
+def vllm_cmd() -> list[str]:
+    """How to invoke vLLM, resolved rather than assumed.
+
+    This was the bare string "vllm", which works only when the console script
+    happens to sit on PATH or beside sys.executable. On a host where it does
+    not -- the usual cause being that `python run.py` picked up a different
+    interpreter from the one vLLM is installed under -- subprocess raises
+    FileNotFoundError: 'vllm', which says nothing about the actual problem.
+
+    Resolution order, most explicit first:
+
+      1. INFEROPT_VLLM_CMD, if the caller wants to name it exactly
+      2. the console script on PATH (child_env has already prepended the
+         interpreter's own bin directory)
+      3. the console script under sys.prefix, for a venv whose bin is not on PATH
+      4. python -m vllm.entrypoints.cli.main, using THIS interpreter
+
+    Four is the one that always works: the console script is a two-line shim
+    around exactly that entry point, so if `import vllm` succeeds the module
+    form succeeds too, and it cannot pick up a different environment than the
+    one already imported. `python -m vllm` does NOT work -- the package has no
+    __main__ -- which is why the specific entry point is named.
+    """
+    global _VLLM_CMD
+    if _VLLM_CMD is not None:
+        return _VLLM_CMD
+
+    override = os.environ.get("INFEROPT_VLLM_CMD")
+    if override:
+        _VLLM_CMD = override.split()
+        return _VLLM_CMD
+
+    found = shutil.which("vllm", path=child_env().get("PATH"))
+    if found:
+        _VLLM_CMD = [found]
+        return _VLLM_CMD
+
+    cand = Path(sys.prefix) / "bin" / "vllm"
+    if cand.exists():
+        _VLLM_CMD = [str(cand)]
+        return _VLLM_CMD
+
+    try:
+        import importlib.util
+        if importlib.util.find_spec("vllm.entrypoints.cli.main") is not None:
+            _VLLM_CMD = [sys.executable, "-m", "vllm.entrypoints.cli.main"]
+            return _VLLM_CMD
+    except Exception:
+        pass
+
+    raise LaunchError(
+        f"cannot find vLLM.\n"
+        f"  interpreter : {sys.executable}\n"
+        f"  sys.prefix  : {sys.prefix}\n"
+        f"  'vllm' importable: {_vllm_importable()}\n"
+        f"Looked for a 'vllm' console script on PATH and under sys.prefix/bin, "
+        f"and for the vllm.entrypoints.cli.main module.\n"
+        f"The usual cause is running this with a different interpreter than the "
+        f"one vLLM is installed under -- check that `{sys.executable} -c 'import "
+        f"vllm'` works. Override explicitly with INFEROPT_VLLM_CMD if vLLM lives "
+        f"somewhere unusual.")
+
+
+def _vllm_importable() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("vllm") is not None
+    except Exception:
+        return False
+
+
 HOST = "127.0.0.1"
 LAUNCH_TIMEOUT_S = float(os.environ.get("INFEROPT_LAUNCH_TIMEOUT_S", "1800"))
 # 45s, not 15s. The prefix cache does not fill in 15s: passes were identical
@@ -147,7 +221,7 @@ def installed_flags() -> set[str]:
     global _FLAGS
     if _FLAGS is None:
         try:
-            out = subprocess.run([*VLLM_CMD, "serve", "--help=all"], env=child_env(),
+            out = subprocess.run([*vllm_cmd(), "serve", "--help=all"], env=child_env(),
                                  capture_output=True, text=True, timeout=180).stdout
             _FLAGS = {m.group(1).replace("-", "_") for m in re.finditer(r"--([a-z0-9][a-z0-9-]*)", out)}
         except Exception:
@@ -458,7 +532,7 @@ class VllmEvaluator:
         d = self.run_dir / "launches" / tag
         d.mkdir(parents=True, exist_ok=True)
         err = d / "server.log"
-        cmd = [*VLLM_CMD, "serve", model, "--host", HOST, "--port", str(self.port), *to_cli(config)]
+        cmd = [*vllm_cmd(), "serve", model, "--host", HOST, "--port", str(self.port), *to_cli(config)]
         env = child_env(CUDA_VISIBLE_DEVICES=self.gpu,
                         VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"))
         with open(err, "wb") as fh:
