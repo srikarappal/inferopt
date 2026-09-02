@@ -117,7 +117,7 @@ def seed_config(fp) -> dict:
     killer.
     """
     need = fp.workload.p999_input_tokens + fp.workload.p99_output_tokens
-    return {
+    cfg = {
         "max_num_seqs": 256,
         "gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90,
         "max_model_len": min(fp.model.max_model_len, max(4096, ((need // 1024) + 2) * 1024)),
@@ -130,6 +130,29 @@ def seed_config(fp) -> dict:
         # its own node, against the accumulated config.
         "enforce_eager": True,
     }
+
+    # MoE ON sm12x NEEDS THE TRITON KERNELS, NOT FLASHINFER'S CUTLASS ONES.
+    #
+    # vLLM's default picks "FlashInfer CUTLASS" for an unquantized MoE. No
+    # prebuilt sm120 kernels ship, so FlashInfer JIT-compiles them at first load
+    # via gen_cutlass_fused_moe_sm120_module().build_and_load(), which shells out
+    # to a compiler. On GB10 that ran 88 minutes without finishing and was still
+    # going when the 7200s launch timeout killed it -- the traversal spent two
+    # hours and produced nothing.
+    #
+    # The root cause is architectural, not a bug: sm120/sm121 has 99 KiB of
+    # shared memory per block against sm100's 228 KiB, so CUTLASS tile configs
+    # written for datacenter Blackwell do not fit and the autotuner grinds
+    # through tactics that cannot work. NVIDIA's own guidance for DGX Spark is
+    # the Triton MoE path.
+    #
+    # Only applied where it is needed: a dense model never selects a MoE kernel,
+    # and sm100 (B200) has the shared memory CUTLASS expects.
+    if not fp.model.is_dense and fp.hw.sm_major == 12:
+        from evaluator import installed_flags
+        if "moe_backend" in installed_flags():
+            cfg["moe_backend"] = "triton"
+    return cfg
 
 
 def free_port(start: int) -> int:
