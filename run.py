@@ -229,6 +229,13 @@ def cmd_optimize(args) -> int:
     kv_one = fp.model.kv_bytes_per_token * fp.model.max_model_len / 1e9
     print(f"  headroom  one max-length sequence needs {kv_one:.1f}GB of KV\n")
 
+    # BEFORE any launch, so the download is not inside a launch timeout. The
+    # first Qwen3-30B-A3B run spent 40 of its 120 allotted minutes here, invisibly
+    # -- vLLM logs "Starting to load model" and then says nothing while it
+    # fetches, which is indistinguishable from a hang.
+    prefetch_weights(fp.model.id)
+    print()
+
     from evaluator import VllmEvaluator
     from fingerprint import Context
 
