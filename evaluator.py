@@ -161,6 +161,27 @@ def _vllm_importable() -> bool:
 
 HOST = "127.0.0.1"
 LAUNCH_TIMEOUT_S = float(os.environ.get("INFEROPT_LAUNCH_TIMEOUT_S", "1800"))
+# How long a launch may produce NO log output before it is declared hung. The
+# deadline above is extended whenever the server writes anything, so a slow but
+# talking startup is allowed to finish while a silent one fails fast.
+STALL_S = float(os.environ.get("INFEROPT_LAUNCH_STALL_S", "600"))
+# Backstop, so a server that logs in a loop forever cannot hold the run.
+LAUNCH_HARD_CAP_S = float(os.environ.get("INFEROPT_LAUNCH_HARD_CAP_S", "10800"))
+
+
+def _last_line(path: Path) -> str:
+    """The last non-empty line of a log, for a failure message.
+
+    A launch that hangs is identified by the last thing it said. Reporting only
+    "not healthy in 7200s" sent two hours of investigation in the wrong
+    direction when the answer -- gen_cutlass_fused_moe_sm120_module -- was
+    sitting on the final line the whole time.
+    """
+    try:
+        lines = [l.strip() for l in path.read_text(errors="replace").splitlines() if l.strip()]
+        return lines[-1] if lines else "(log is empty)"
+    except Exception:
+        return "(log unreadable)"
 # 45s, not 15s. The prefix cache does not fill in 15s: passes were identical
 # (47.9/47.9) before prefix caching was enabled and 42% apart after (137.9/195.2),
 # because pass 1 ran cold and pass 2 warm. Both passes must measure the same
@@ -539,8 +560,32 @@ class VllmEvaluator:
             proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
                                     env=env, start_new_session=True)
         try:
-            deadline = time.monotonic() + LAUNCH_TIMEOUT_S
-            while time.monotonic() < deadline:
+            # THE DEADLINE FOLLOWS PROGRESS, NOT WALL CLOCK.
+            #
+            # A single timeout covering Popen -> /health lumps together four
+            # unrelated things: weight download, weight load, kernel JIT, and KV
+            # profiling. Only the last is a property of the config under test.
+            # A Qwen3-30B-A3B run spent 40 min downloading and 88 min inside
+            # FlashInfer's sm120 CUTLASS MoE compile, then got SIGINT'd at 7200s
+            # having measured nothing -- and the console said only "not healthy
+            # in 7200s", which reads as a slow launch rather than a stuck one.
+            #
+            # So: while the server is still WRITING to its log it is making
+            # progress and the deadline is pushed out. When it goes silent for
+            # STALL_S it is hung, and that fails immediately with the last line
+            # it managed to write -- which is the one thing that identifies the
+            # cause. A hard cap stops a pathological loop running forever.
+            #
+            # This does not rescue a phase that is silently slow (FlashInfer's
+            # compile shells out and prints nothing for the whole 88 minutes).
+            # It converts that from a two-hour blind wait into a ten-minute
+            # failure that names the last thing the server said.
+            start = time.monotonic()
+            hard_cap = start + LAUNCH_HARD_CAP_S
+            deadline = start + LAUNCH_TIMEOUT_S
+            last_size, last_note = -1, start
+            while True:
+                now = time.monotonic()
                 if proc.poll() is not None:
                     raise LaunchError(f"exited {proc.returncode} during startup",
                                       err.read_text()[-3000:])
@@ -549,9 +594,26 @@ class VllmEvaluator:
                         break
                 except httpx.HTTPError:
                     pass
+
+                size = err.stat().st_size if err.exists() else 0
+                if size != last_size:                 # still talking -> still working
+                    last_size = size
+                    deadline = max(deadline, now + STALL_S)
+
+                if now > deadline or now > hard_cap:
+                    why = ("stopped producing output" if now > deadline
+                           else f"exceeded the hard cap of {LAUNCH_HARD_CAP_S/60:.0f} min")
+                    raise LaunchError(
+                        f"launch {why} after {(now-start)/60:.0f} min.\n"
+                        f"        last line: {_last_line(err)}",
+                        err.read_text()[-3000:])
+
+                # A long launch should not look like a frozen one.
+                if now - last_note > 120:
+                    last_note = now
+                    self.log(f"        still starting ({(now-start)/60:.0f} min) "
+                             f"-- {_last_line(err)[:110]}")
                 time.sleep(2)
-            else:
-                raise LaunchError(f"not healthy in {LAUNCH_TIMEOUT_S:.0f}s", err.read_text()[-3000:])
             yield model
         finally:
             if proc.poll() is None:

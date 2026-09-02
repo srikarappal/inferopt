@@ -277,6 +277,28 @@ def _judge_mbpp_plus(rows, texts) -> list[bool]:
     if v["n_scored"] != len(rows):
         print(f"        mbpp_plus: {v['n_scored']}/{len(rows)} scored -- "
               f"task_ids missing from the dataset were dropped")
+
+    # A clean sweep of zeros is almost never a model result, and this project has
+    # now lost time to it three separate ways: a missing tree-sitter made every
+    # sample raise; fixed temp-file names let two scorers overwrite each other;
+    # and the dataset needed a mid-benchmark download. Each time the number said
+    # only "0.0000", which is indistinguishable from total quality collapse.
+    # So when nothing passes, say what the scorer actually saw.
+    if v["n_scored"] and not any(v["verdicts"].values()):
+        blank = v.get("n_unsanitizable", 0)
+        # evalplus writes tqdm progress bars to stderr, so "stderr is non-empty"
+        # is not a signal. Only keep lines that look like a real problem.
+        noise = ("it/s", "it [", "%|", "\r")
+        bad = [l for l in proc.stderr.splitlines()
+               if l.strip() and not any(n in l for n in noise)]
+        print(f"        mbpp_plus: 0/{v['n_scored']} passed -- verify this is the "
+              f"model and not the probe")
+        print(f"          unsanitizable: {blank}/{v['n_scored']}"
+              + ("  <- NOTHING parsed as code, this is a probe failure"
+                 if blank == v["n_scored"] else "  (generations did parse)"))
+        if bad:
+            print(f"          scorer said  : {' | '.join(bad)[-300:]}")
+        print(f"          inspect      : python diagnose_mbpp.py <run-dir>")
     # Back into ROW ORDER. mbpp_score runs a process pool and returns verdicts as
     # they complete, so its dict order is arrival order, not row order. Callers
     # zip these against rows to find which problem flipped -- returning them

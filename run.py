@@ -155,6 +155,45 @@ def seed_config(fp) -> dict:
     return cfg
 
 
+def prefetch_weights(model: str, log=print) -> None:
+    """Download the checkpoint BEFORE the traversal, outside any launch timeout.
+
+    A launch timeout is meant to answer "did this config start?". It was also
+    answering "did 61 GB arrive over the network?", which is not a property of
+    the config and not something a launch budget should cover. The first
+    Qwen3-30B-A3B run spent 40 of its 120 allotted minutes downloading, inside
+    the window, before it had measured anything at all.
+
+    Doing it here also makes the wait legible: huggingface_hub prints progress,
+    where a download inside vLLM's startup is invisible -- the server logs
+    "Starting to load model" and then says nothing for forty minutes, which is
+    indistinguishable from a hang.
+
+    A local path is left alone. Failure is NOT fatal: vLLM will fetch it itself,
+    and refusing to start a traversal because a pre-fetch failed would be a
+    worse outcome than a slow first launch.
+    """
+    if Path(model).exists():
+        log(f"  weights   local path, nothing to fetch")
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        log(f"  weights   huggingface_hub not available; vLLM will fetch on launch")
+        return
+    log(f"  weights   pre-fetching {model} (outside the launch timeout) ...")
+    try:
+        import time as _t
+        t0 = _t.time()
+        p = snapshot_download(model, allow_patterns=[
+            "*.safetensors", "*.json", "*.txt", "*.model", "*.py"])
+        n = sum(f.stat().st_size for f in Path(p).rglob("*") if f.is_file())
+        log(f"  weights   ready, {n/1e9:.1f} GB in {(_t.time()-t0)/60:.1f} min -> {p}")
+    except Exception as e:
+        log(f"  weights   pre-fetch failed ({type(e).__name__}: {e});")
+        log(f"            vLLM will fetch on first launch, which may exceed its timeout")
+
+
 def free_port(start: int) -> int:
     """First free port at or above `start`. The OCR server sits on 8813 and
     vLLM's default is 8000, so a fixed port is a collision waiting to happen."""

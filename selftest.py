@@ -402,6 +402,103 @@ def main() -> int:
         m_rows, [r"the answer is \boxed{42}", "I could not solve it"])
     check("math_500 judge: right answer True, no boxed answer False", got == [True, False])
 
+    # ----------------------------------------------------------------------
+    # The launch deadline follows PROGRESS, not wall clock.
+    #
+    # A Qwen3-30B-A3B run spent 40 min downloading and 88 min inside
+    # FlashInfer's sm120 CUTLASS MoE compile, then got killed at 7200s having
+    # measured nothing -- and reported only "not healthy in 7200s", which reads
+    # as a slow launch rather than a stuck one. The last log line said
+    # gen_cutlass_fused_moe_sm120_module the whole time.
+    # ----------------------------------------------------------------------
+    print("\n=== launch deadline: extends on progress, fails fast on silence ===")
+    import tempfile as _tf
+    import types as _types
+
+    class _FakeProc:
+        returncode = None
+        pid = 999999
+        def poll(self): return None            # alive throughout
+        def wait(self, timeout=None): return 0
+
+    def _run_serve(writer, healthy_after):
+        """Drive the real _serve() against a fake server. Returns (ok, err)."""
+        d = Path(_tf.mkdtemp())
+        e = ev.VllmEvaluator.__new__(ev.VllmEvaluator)
+        e.fp, e.slo, e.log = fp, slo, lambda *a: None
+        e.gpu, e.port, e.run_dir = "0", 8000, d
+        e.base_url = "http://127.0.0.1:8000/v1"
+        e.trace_path = "data/trace.jsonl"
+        calls = {"n": 0}
+
+        def fake_popen(cmd, stdout=None, stderr=None, env=None, start_new_session=None):
+            return _FakeProc()
+
+        def fake_get(url, timeout=None):
+            calls["n"] += 1
+            log = d / "launches" / "t" / "server.log"
+            writer(log, calls["n"])
+            if healthy_after and calls["n"] >= healthy_after:
+                return _types.SimpleNamespace(status_code=200)
+            raise ev.httpx.HTTPError("nope")
+
+        # The teardown in _serve kills the process group. Our fake proc has a
+        # made-up pid, so os.getpgid raises ProcessLookupError and masks the
+        # LaunchError we are actually testing for.
+        op, og = ev.subprocess.Popen, ev.httpx.get
+        okp, ogp = ev.os.killpg, ev.os.getpgid
+        ok_, err = False, None
+        ev.subprocess.Popen, ev.httpx.get = fake_popen, fake_get
+        ev.os.killpg, ev.os.getpgid = (lambda *a: None), (lambda *a: 0)
+        try:
+            with e._serve({}, "t"):
+                ok_ = True
+        except ev.LaunchError as ex:
+            err = str(ex)
+        finally:
+            ev.subprocess.Popen, ev.httpx.get = op, og
+            ev.os.killpg, ev.os.getpgid = okp, ogp
+        return ok_, err
+
+    orig_stall, orig_to = ev.STALL_S, ev.LAUNCH_TIMEOUT_S
+    ev.STALL_S, ev.LAUNCH_TIMEOUT_S = 4.0, 4.0
+    try:
+        # 1. writes once, then goes silent -> must fail, naming the last line
+        def silent(log, n):
+            if n == 1:
+                log.write_text("INFO starting\n"
+                               "module = gen_cutlass_fused_moe_sm120_module(x).build_and_load()\n")
+        ok_, err = _run_serve(silent, healthy_after=0)
+        check("a silent launch fails rather than waiting out the clock",
+              not ok_ and err is not None and "stopped producing output" in err, f"{err}")
+        check("the failure names the last thing the server said",
+              err is not None and "gen_cutlass_fused_moe_sm120_module" in err,
+              "without it, two hours went into diagnosing the wrong thing")
+
+        # 2. keeps writing, healthy late -> deadline extends past LAUNCH_TIMEOUT_S
+        def chatty(log, n):
+            with open(log, "a") as fh:
+                fh.write(f"INFO still loading shard {n}\n")
+        t0 = time.monotonic()
+        ok_, err = _run_serve(chatty, healthy_after=6)
+        check("a launch that keeps logging is allowed past LAUNCH_TIMEOUT_S",
+              ok_, f"failed with: {err}")
+    finally:
+        ev.STALL_S, ev.LAUNCH_TIMEOUT_S = orig_stall, orig_to
+
+    print("\n=== MoE on sm12x avoids FlashInfer's CUTLASS JIT ===")
+    from run import seed_config as _seed
+    class _HW:
+        def __init__(s, sm, uni): s.sm_major, s.unified_memory = sm, uni
+    class _M:
+        def __init__(s, dense): s.is_dense, s.max_model_len = dense, 32768
+    class _FP:
+        def __init__(s, dense, sm): s.model, s.hw, s.workload = _M(dense), _HW(sm, True), fp.workload
+    for dense, sm, want in ((False, 12, "triton"), (True, 12, None), (False, 9, None)):
+        got = _seed(_FP(dense, sm)).get("moe_backend")
+        check(f"{'dense' if dense else 'MoE':5s} on sm{sm} -> moe_backend={want}",
+              got == want, f"got {got!r}")
+
     # RULER prompts must fit the window the server will actually run. When they
     # do not, EVERY prompt is rejected and the benchmark scores 0.0 for every
     # config -- which reads as "quality unchanged" rather than "probe broken".
