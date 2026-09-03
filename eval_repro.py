@@ -82,7 +82,8 @@ def memory_fraction(fp) -> float:
     per card on an H100 -- the number was right for the machine it was written on
     and wrong everywhere else.
     """
-    return 0.75 if fp.hw.unified_memory else 0.90
+    from evaluator import hardware_defaults
+    return hardware_defaults(fp)["gpu_memory_utilization"]
 
 
 def stock_config(fp) -> dict:
@@ -98,7 +99,8 @@ def stock_config(fp) -> dict:
     That is a requirement to start at all, not a tuning decision, and it is
     printed so it is never mistaken for one.
     """
-    return {"gpu_memory_utilization": memory_fraction(fp)}
+    from evaluator import hardware_defaults
+    return dict(hardware_defaults(fp))
 
 
 def load_config(path: str) -> dict:
@@ -121,8 +123,9 @@ def configs_under_test(a, fp) -> list[tuple[str, dict]]:
         # names one explicitly, so a config file is portable across hardware.
         out = []
         for i, p in enumerate(a.config):
-            c = load_config(p)
-            c.setdefault("gpu_memory_utilization", memory_fraction(fp))
+            from evaluator import hardware_defaults
+            # Hardware requirements UNDER the file, so the file always wins.
+            c = {**hardware_defaults(fp), **load_config(p)}
             out.append((Path(p).stem, c))
         return out
     return [("stock", stock_config(fp))]

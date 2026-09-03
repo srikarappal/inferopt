@@ -78,6 +78,13 @@ def install_fake_server(ev, per_token_s: float = 0.004):
     ev._one = fake_one
 
 
+def configs_under_test_backend(er, fp):
+    """moe_backend that a `--config file` run would actually serve."""
+    import argparse
+    a = argparse.Namespace(from_run=None, config=["configs/stock.json"], model=fp.model.id)
+    return er.configs_under_test(a, fp)[0][1].get("moe_backend")
+
+
 def main() -> int:
     import importlib.util
 
@@ -488,6 +495,23 @@ def main() -> int:
 
     print("\n=== MoE on sm12x avoids FlashInfer's CUTLASS JIT ===")
     from run import seed_config as _seed
+    # EVERY launch path, not just the traversal. moe_backend was set only in
+    # run.py's seed_config, so a stock eval_repro run on the same model went
+    # down FlashInfer's sm120 path and hung 30 min compiling kernels while the
+    # traversal beside it ran fine.
+    import eval_repro as _er
+    import argparse as _ap
+    for mid, want in (("Qwen/Qwen3-30B-A3B", "triton"), ("Qwen/Qwen3-14B", None)):
+        _fp, _ = _bf(_R(model=mid, trace="data/trace.jsonl"))
+        paths = {
+            "seed_config": _seed(_fp).get("moe_backend"),
+            "stock_config": _er.stock_config(_fp).get("moe_backend"),
+            "--config file": configs_under_test_backend(_er, _fp),
+        }
+        for name, got in paths.items():
+            check(f"{mid.split('/')[-1]:14s} {name:14s} -> moe_backend={want}",
+                  got == want, f"got {got!r}")
+
     class _HW:
         def __init__(s, sm, uni): s.sm_major, s.unified_memory = sm, uni
     class _M:

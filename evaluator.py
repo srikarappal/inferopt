@@ -151,6 +151,42 @@ def vllm_cmd() -> list[str]:
         f"somewhere unusual.")
 
 
+def hardware_defaults(fp) -> dict:
+    """Flags this (model, GPU) pair REQUIRES to run at all, not tuning choices.
+
+    Lives here, in one place, because it has to apply to every path that launches
+    a server. It did not: moe_backend was set only in run.py's seed_config, so
+    the traversal got it and eval_repro did not. A stock-baseline run on
+    Qwen3-30B-A3B then went down FlashInfer's sm120 CUTLASS path and hung for 30
+    minutes JIT-compiling kernels, exactly the failure the flag exists to
+    prevent -- while the traversal beside it ran fine. A hardware fact expressed
+    in one caller is a bug waiting for the second caller.
+
+      gpu_memory_utilization  0.75 on unified memory, where the fraction is of
+                              SYSTEM memory the CPU also competes for and 0.90
+                              runs a 122GB box into the OOM killer. 0.90 on a
+                              dedicated GPU, where 0.75 strands ~20GB.
+
+      moe_backend=triton      MoE on sm12x. vLLM defaults to FlashInfer CUTLASS,
+                              no prebuilt sm120 kernels ship, and the JIT build
+                              does not finish in any reasonable time: sm120/121
+                              has 99 KiB shared memory per block against sm100's
+                              228 KiB, so tile configs written for datacenter
+                              Blackwell cannot fit. Dense models never select a
+                              MoE kernel; sm100 has the memory CUTLASS expects.
+
+    Callers merge these UNDER their own settings, so an explicit value always
+    wins -- these are defaults, not overrides.
+    """
+    out: dict[str, Any] = {
+        "gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90,
+    }
+    if not fp.model.is_dense and fp.hw.sm_major == 12:
+        if "moe_backend" in installed_flags():
+            out["moe_backend"] = "triton"
+    return out
+
+
 def _vllm_importable() -> bool:
     try:
         import importlib.util
