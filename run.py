@@ -205,6 +205,21 @@ def free_port(start: int) -> int:
     raise RuntimeError(f"no free port in {start}..{start+40}")
 
 
+def _incumbent_node(res) -> str | None:
+    """Which frontier node IS the incumbent.
+
+    The traversal returns the incumbent as a CONFIG dict, while finalist_curves
+    is keyed by node id, so joining them needs a lookup rather than a name. The
+    last kept trial whose config matches is the one that was deployed.
+    """
+    for t in reversed(res.trials):
+        if t.kept and t.config == res.incumbent:
+            return t.node_id
+    # Fall back to the best kept trial; a config can pick up later edits.
+    kept = [t for t in res.trials if t.kept]
+    return max(kept, key=lambda t: t.goodput).node_id if kept else None
+
+
 def cmd_optimize(args) -> int:
     req = InferOptRequest(
         model=args.model, trace=args.trace,
@@ -435,7 +450,9 @@ def cmd_optimize(args) -> int:
                 print(f"      sweep failed ({type(e).__name__}: {e}); "
                       f"keeping the traversal measurement")
 
-    report(res, demand_tok_s=fp.workload.request_rate_qps * fp.workload.mean_output_tokens)
+    _inc = _incumbent_node(res)
+    report(res, demand_tok_s=fp.workload.request_rate_qps * fp.workload.mean_output_tokens,
+           incumbent_curve=(finalist_curves.get(_inc) or {}).get('curve'))
 
     run_dir.mkdir(parents=True, exist_ok=True)
     out = run_dir / "result.json"
@@ -443,9 +460,22 @@ def cmd_optimize(args) -> int:
         **meta,
         "fingerprint": fp.model_dump(),
         "baseline": (baseline.__dict__ if baseline else None),
-        "capacity_curve": curve,
+        # NAMED FOR WHAT IT IS. This was "capacity_curve", which reads as the
+        # run's capacity but holds the STAGE 1.3 SEED's sweep -- a config that
+        # was replaced before the run ended. On the MoE run the two disagree
+        # completely: the seed collapses from 41.8 goodput at L=2 to 7.2 at L=8,
+        # while the incumbent peaks at 65.6 AT L=8. Reading the seed's curve as
+        # the result would say the deployed config runs at 9x less than it does.
+        "seed_capacity_curve": curve,
         "operating_concurrency": operating_L,
         "finalist_curves": finalist_curves,
+        # The curve of the config actually chosen, hoisted out of
+        # finalist_curves so the thing that sets the replica count is not buried
+        # one level down under a node id the reader has to know to look up.
+        "incumbent_capacity_curve": (
+            (finalist_curves.get(_incumbent_node(res)) or {}).get("curve") or []),
+        "incumbent_peak": (
+            (finalist_curves.get(_incumbent_node(res)) or {}).get("peak") or {}),
         "demand_tok_s": fp.workload.request_rate_qps * fp.workload.mean_output_tokens,
         "incumbent": res.incumbent,
         "frontier": [t.__dict__ for t in res.frontier()],

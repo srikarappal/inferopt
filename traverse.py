@@ -215,6 +215,25 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     if jpath:
         jpath.parent.mkdir(parents=True, exist_ok=True)
 
+    def _decide(node_id: str, keep: bool, best: Trial, prev: float, band: float) -> None:
+        """Append the keep/revert verdict, which record() cannot know yet.
+
+        Written to the same journal as a `"decision"` line so a live run can be
+        read without waiting for result.json."""
+        if not jpath:
+            return
+        try:
+            with open(jpath, "a") as fh:
+                fh.write(json.dumps({
+                    "decision": node_id, "kept": keep,
+                    "goodput": best.goodput, "prev_goodput": prev,
+                    "delta": (best.goodput / prev - 1) if prev else None,
+                    "accept_band": band, "concurrency": best.concurrency,
+                }, default=str) + "\n")
+                fh.flush()
+        except Exception as e:
+            log(f"        journal: could not record decision ({e})")
+
     def record(t: Trial) -> None:
         """Append one measurement to the journal immediately.
 
@@ -406,6 +425,15 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
 
         if best:
             best.kept = keep
+            # THE JOURNAL RECORDS THE DECISION SEPARATELY, because record(t) runs
+            # right after the measurement -- before this line -- so every trial
+            # in trials.jsonl carries kept=False, its dataclass default. Reading
+            # the journal mid-run therefore says "nothing was kept" no matter
+            # what the traversal decided; the real answer only appears in
+            # result.json once the whole run finishes, which is exactly when a
+            # journal is least needed. This appends the verdict as its own line
+            # so a live run can be read honestly.
+            _decide(cur, keep, best, incumbent_goodput, band)
             ctx.measurements[cur] = NodeMeasurement(
                 kept=keep, goodput=best.goodput, ttft_p99_ms=best.ttft_p99_ms,
                 itl_p99_ms=best.itl_p99_ms, quality=best.quality,
@@ -440,7 +468,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                   minutes=(time.time() - t0) / 60, stopped_early=stopped)
 
 
-def report(res: Result, log=print, demand_tok_s: float | None = None) -> None:
+def report(res: Result, log=print, demand_tok_s: float | None = None,
+           incumbent_curve: list[dict] | None = None) -> None:
     log(f"\n{'='*74}")
     log(f"visited {len(res.visited)} nodes, skipped {len(res.skipped)}, "
         f"{res.launches} launches, {res.minutes:.1f} min")
@@ -494,3 +523,20 @@ def report(res: Result, log=print, demand_tok_s: float | None = None) -> None:
                 r1 = math.ceil(demand_tok_s / max(1e-9, best.goodput))
                 log(f"  fleet           {r0} replicas -> {r1} to serve "
                     f"{demand_tok_s:.0f} tok/s at the SLO")
+
+    # THE CURVE OF THE CONFIG ACTUALLY CHOSEN. The seed's sweep is not it: on the
+    # MoE run the seed collapsed from 41.8 goodput at L=2 to 7.2 at L=8, while
+    # the incumbent PEAKS at L=8 with 65.6. Printing the seed's curve beside the
+    # incumbent's config understates the deployed capacity roughly ninefold.
+    if incumbent_curve:
+        log(f"\n  CAPACITY OF THE CHOSEN CONFIG  (its own sweep, not the seed's)")
+        log(f"    {'L':>5s} {'goodput':>9s} {'ttft p99':>9s} {'slo':>6s}")
+        peak = max(incumbent_curve, key=lambda pt: pt.get("goodput", 0))
+        for pt in incumbent_curve:
+            mark = "   <- peak" if pt is peak else ""
+            log(f"    {pt.get('concurrency', 0):5d} {pt.get('goodput', 0):9.1f} "
+                f"{pt.get('ttft_p99_ms', 0):8.0f}m {pt.get('slo_attainment', 0):6.0%}{mark}")
+        if peak is incumbent_curve[0] or peak is incumbent_curve[-1]:
+            log(f"    NOTE: the peak sits at an EDGE of the swept range, so the true")
+            log(f"    optimum may lie outside it -- treat this as a lower bound.")
+
