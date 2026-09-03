@@ -97,6 +97,32 @@ def build(dag: dict) -> tuple[dict[str, Node], nx.DiGraph, list[str]]:
                 errs.append(
                     f"{nid}: requires {req!r}, which is not an ancestor -- "
                     f"no on_keep/on_revert path leads from {req!r} to {nid!r}")
+    # A PREDICATE MAY ONLY READ MEASUREMENTS THAT ALREADY EXIST.
+    #
+    # ctx.measurements is filled in as the walk proceeds, so gating on a node
+    # that has not run yet raises inside the predicate -- and traverse turns a
+    # predicate error into a SKIP. The node is silently disabled by DAG ordering
+    # alone, which is precisely the failure mode this validator exists to catch:
+    # it looks like "the fingerprint said it would not help".
+    for nid, n in nodes.items():
+        if not n.applicable_when:
+            continue
+        try:
+            paths = Predicate(n.applicable_when).paths()
+        except Exception:
+            continue                       # reported by the expression check
+        for path in paths:
+            parts = path.split(".")
+            if len(parts) < 2 or parts[0] != "measurements":
+                continue
+            ref = parts[1]
+            if ref in nodes and ref != nid and not nx.has_path(g, ref, nid):
+                errs.append(
+                    f"{nid}: applicable_when reads measurements.{ref}, but "
+                    f"{ref!r} is not an ancestor -- it has not run when {nid!r} "
+                    f"is reached, so the predicate raises and the node is "
+                    f"silently skipped")
+
     # WHERE A SKIP GOES, when the branches disagree.
     #
     # A skipped node never ran, but the walk follows on_keep -- the "this

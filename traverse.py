@@ -177,13 +177,40 @@ class Result:
 
 
 def _value(v: Any, ctx: Context) -> Any:
-    """Resolve a config value that may be an expression string."""
-    if isinstance(v, str) and any(c in v for c in "+-*/()") and not v.startswith("/"):
-        try:
-            return Predicate(v).evaluate(ctx)
-        except Exception:
-            return v          # a plain string that merely contains punctuation
-    return v
+    """Resolve a config value that may be an expression string.
+
+    The hard part is telling an EXPRESSION from a literal that merely contains
+    punctuation, because plenty do: "Qwen/Qwen3-14B", "fp8-dynamic",
+    "meta-llama/Llama-3.1-8B". The old rule was "contains any of +-*/() -> try
+    to evaluate, and on failure return the string unchanged", which silently
+    swallowed real mistakes: `workload.nonexistent * 2` is unmistakably meant as
+    an expression, and it was handed to vLLM as the literal string
+    "workload.nonexistent * 2".
+
+    The discriminator is whether the string REFERENCES A ROOT. A literal never
+    does; an expression always does. So:
+
+      references a root      ->  an expression; failure is an ERROR
+      names nothing at all   ->  pure arithmetic like "2 * 3"; evaluate it
+      names something else   ->  a literal: "a-b-c", "fp8-dynamic"
+    """
+    if not isinstance(v, str) or not any(c in v for c in "+-*/()") or v.startswith("/"):
+        return v
+    try:
+        p = Predicate(v)
+    except Exception:
+        return v                      # does not even parse: a literal
+    import ast as _ast
+    names = {n.id for n in _ast.walk(p.tree) if isinstance(n, _ast.Name)}
+    if not p.paths() and names:
+        return v                      # names something that is not a root: literal
+    try:
+        return p.evaluate(ctx)
+    except Exception as e:
+        raise ValueError(
+            f"config expression {v!r} references {sorted(p.paths())} but could "
+            f"not be evaluated: {e}. It was previously passed to vLLM as this "
+            f"literal string.") from None
 
 
 def _variants(node, base: dict, ctx: Context) -> list[dict]:

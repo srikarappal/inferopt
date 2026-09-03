@@ -186,6 +186,23 @@ def test_value():
     check("expression reads the fingerprint",
           _value("fingerprint.model.n_layers * 2", ctx) == 80, f"{_value('fingerprint.model.n_layers * 2', ctx)}")
 
+    # Pure arithmetic evaluates even with no fingerprint reference.
+    check("pure arithmetic evaluates", _value("1-2", ctx) == -1, f"{_value('1-2', ctx)}")
+
+    # A BROKEN EXPRESSION MUST RAISE, not become a config literal. It used to
+    # be handed to vLLM as the string "workload.nonexistent * 2", where it is
+    # either rejected as an unknown value or, worse, accepted as one.
+    import traceback
+    try:
+        got = _value("workload.nonexistent * 2", ctx)
+        check("a broken expression raises rather than leaking a string", False,
+              f"returned {got!r}")
+    except ValueError:
+        check("a broken expression raises rather than leaking a string", True)
+    except Exception as e:
+        check("a broken expression raises ValueError specifically", False,
+              f"{type(e).__name__}: {e}")
+
     # Non-strings pass through untouched, including the falsy ones.
     for v in (0, False, None, 1.5, True, [], {}):
         check(f"non-string passes through: {v!r}", _value(v, ctx) == v or

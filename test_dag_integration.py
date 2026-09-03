@@ -543,6 +543,18 @@ def test_validator_rejects_bad_dags():
           any("unknown node" in x for x in errs_for(bad_edge)),
           f"errors={errs_for(bad_edge)}")
 
+    # A predicate reading a node that has not run yet. traverse turns a
+    # predicate error into a SKIP, so the node is silently disabled by ordering
+    # alone -- indistinguishable from "the fingerprint said it would not help".
+    def forward_ref(d):
+        for n in d["nodes"]:
+            if n["id"] == "prefix_caching":
+                n["applicable_when"] = "measurements.graph_capture.kept"
+    e = errs_for(forward_ref)
+    check("a forward measurements reference is reported",
+          any("not an ancestor" in x and "measurements" in x for x in e),
+          f"errors={e}")
+
     # The unmodified DAG must be clean, or every check above is meaningless.
     _, _, clean = V.build(json.loads(Path("dag/llm.json").read_text()))
     check("the real DAG produces no errors", not clean, f"errors={clean}")
