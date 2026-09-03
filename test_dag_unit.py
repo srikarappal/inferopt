@@ -90,6 +90,28 @@ def test_predicates():
               raises(lambda: p.evaluate(_ctx())),
               "parsed AND evaluated -- the predicate language executes arbitrary code")
 
+    # THE SUPPORTED SURFACE, pinned. A DAG author needs to know what is legal,
+    # and a silent change here turns a working predicate into a skipped node.
+    from fingerprint import Context
+    surface = [
+        ("2 ** 3", 8), ("7 // 2", 3), ("7 % 3", 1), ("-5", -5),
+        ("1 < 2 < 3", True), ("'a' == 'a'", True),
+        ("max(1, 2)", 2), ("min(1, 2)", 1), ("abs(-3)", 3),
+        ("len('abc')", 3), ("round(1.6)", 2), ("int(1.9)", 1), ("float(1)", 1.0),
+        # `is` is deliberately NOT permitted; None is compared with ==, which
+        # works because the schema uses Optional rather than sentinels.
+        ("slo.throughput_target_tok_s == None", True),
+    ]
+    for expr, want in surface:
+        try:
+            got = Predicate(expr).evaluate(_ctx())
+            check(f"supported: {expr}", got == want, f"got {got!r}, want {want!r}")
+        except Exception as ex:
+            check(f"supported: {expr}", False, f"{type(ex).__name__}: {ex}")
+    check("`is` stays refused",
+          raises(lambda: Predicate("None is None")),
+          "identity comparison has no place in a config predicate")
+
     # Typos must be caught by check(), which is the entire reason it exists:
     # a mistyped path silently disables a node otherwise.
     from predicates import resolve_path_type
