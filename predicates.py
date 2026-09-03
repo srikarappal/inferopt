@@ -130,6 +130,16 @@ class Predicate:
                 raise PredicateError(
                     f"{expr!r}: {type(n).__name__} is not permitted in a predicate"
                 )
+            # NO DUNDERS. Attribute access alone cannot call anything -- Call is
+            # already restricted to an allowlist of plain names -- but
+            # `fingerprint.model.__class__.__mro__` evaluated happily, which
+            # walks straight out of the schema into Python internals. A DAG is a
+            # data file that may not have been written here; it has no business
+            # reaching object internals, and nothing legitimate needs to.
+            if isinstance(n, ast.Attribute) and n.attr.startswith("__"):
+                raise PredicateError(
+                    f"{expr!r}: attribute {n.attr!r} is not permitted -- a "
+                    f"predicate may only read schema fields")
             if isinstance(n, ast.Call):
                 if not isinstance(n.func, ast.Name) or n.func.id not in ALLOWED_FUNCS:
                     fn = getattr(n.func, "id", ast.dump(n.func))
@@ -161,6 +171,23 @@ class Predicate:
 
     def check(self, node_ids: set[str] | None = None) -> list[str]:
         errs = []
+
+        # NAMES THAT ARE NOT ROOTS, FIRST. paths() only collects attribute
+        # chains whose head is already in ROOTS, so anything else vanished
+        # before this loop and check() reported success on an expression that
+        # RAISES at evaluation time -- "unknown name 'model'", hours into a
+        # traversal. That is precisely the failure this method exists to
+        # prevent: `model.n_params_b` instead of `fingerprint.model.n_params_b`
+        # passed validate_dag and then killed the run at the node that used it.
+        for n in ast.walk(self.tree):
+            if isinstance(n, ast.Name) and n.id not in ROOTS:
+                if n.id in ALLOWED_FUNCS:
+                    continue                      # min(), max() and friends
+                errs.append(
+                    f"{self.expr!r}: unknown name {n.id!r}. A predicate may only "
+                    f"start from {', '.join(ROOTS)} -- model and hardware fields "
+                    f"live under fingerprint.model.* and fingerprint.hw.*")
+
         for p in sorted(self.paths()):
             try:
                 resolve_path_type(p, node_ids)

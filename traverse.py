@@ -86,8 +86,17 @@ class Trial:
     @property
     def min_quality(self) -> float:
         """Worst benchmark, not the mean. A config that keeps its average by
-        collapsing on one task is not an acceptable operating point."""
-        return min(self.quality.values()) if self.quality else 1.0
+        collapsing on one task is not an acceptable operating point.
+
+        UNMEASURED IS 0.0, NOT 1.0. It used to return 1.0, which handed a trial
+        with no quality data a PERFECT score on the frontier's quality axis --
+        so it dominated every properly-measured trial there and earned a
+        frontier slot for free. Lossless nodes are not affected either way:
+        they INHERIT the baseline's scores rather than leaving them empty
+        (quality_inherited), precisely so every point has a real coordinate. An
+        empty dict means nothing was measured and nothing was inherited, and
+        that must not outrank a measurement."""
+        return min(self.quality.values()) if self.quality else 0.0
 
     def axes(self) -> dict[str, float]:
         return {"goodput": self.goodput, "quality": self.min_quality,
