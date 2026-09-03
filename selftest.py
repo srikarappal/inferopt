@@ -117,6 +117,25 @@ def main() -> int:
     print("\n=== MoE and MLA across providers (config + headers only, no weights) ===")
     from request import MoEReconciliationError, detect_model as _dm
     from request import InferOptRequest as _R2
+
+    # THIS SECTION NEEDS THE NETWORK, and says so rather than failing
+    # ambiguously. It reads safetensors headers from the Hub over HTTP Range to
+    # measure stored bytes-per-parameter, because a checkpoint's
+    # quantization_config lies -- DeepSeek-V3 declares fp8 and stores BF16.
+    #
+    # When a header read fails the code falls back to torch_dtype, which halves
+    # the parameter count for an fp8 checkpoint and correctly trips the MoE
+    # reconciliation guard. So a network blip produces the SAME exception as a
+    # genuinely unreconcilable checkpoint, and a red suite that means nothing.
+    # It has already flaked twice in one day.
+    import httpx as _httpx
+    try:
+        _httpx.head("https://huggingface.co", timeout=5, follow_redirects=True)
+        _online = True
+    except Exception as _e:
+        _online = False
+        print(f"  SKIP  the Hub is unreachable ({type(_e).__name__}); these checks "
+              f"read safetensors headers over the network and cannot run offline")
     CASES = [
         # model, published total B, published active B, expected attention
         ("mistralai/Mixtral-8x7B-Instruct-v0.1", 46.7, 12.9, "gqa"),   # num_local_experts
@@ -124,7 +143,7 @@ def main() -> int:
         ("moonshotai/Kimi-K2-Instruct",        1029.0, 32.0, "mla"),   # n_routed_experts + MLA
         ("Qwen/Qwen3-14B",                       14.8, None, "gqa"),   # dense control
     ]
-    for mid, pub_t, pub_a, attn in CASES:
+    for mid, pub_t, pub_a, attn in (CASES if _online else []):
         try:
             f = _dm(_R2(model=mid, trace="data/trace.jsonl"))
         except Exception as ex:
@@ -143,9 +162,10 @@ def main() -> int:
     # A MoE checkpoint whose weights do not add up must RAISE, not approximate.
     # DeepSeek-V3's index reports 1369GB against 671B published parameters while
     # its shard headers measure 1.22 bytes/param -- those cannot both be true.
-    raised = False
+    raised = not _online          # nothing to prove when we cannot reach the Hub
     try:
-        _dm(_R2(model="deepseek-ai/DeepSeek-V3", trace="data/trace.jsonl"))
+        if _online:
+            _dm(_R2(model="deepseek-ai/DeepSeek-V3", trace="data/trace.jsonl"))
     except MoEReconciliationError:
         raised = True
     except Exception:
