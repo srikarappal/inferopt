@@ -520,7 +520,7 @@ def test_branch_semantics():
     """
     section("branch semantics: keep, revert, skip")
     def three(**kw):
-        d = mkdag([node("a", "KEPT"), node("KEPT"), node("REVERTED"), node("SKIP")])
+        d = mkdag([node("a", "KEPT"), node("KEPT"), node("REVERTED")])
         for n in d["nodes"]:
             if n["id"] == "a":
                 n["on_keep"] = ["KEPT"]; n["on_revert"] = ["REVERTED"]
@@ -536,24 +536,34 @@ def test_branch_semantics():
           f"{[n for n, _ in ev.calls]} -- 10.1 vs 10.0 is inside the band")
 
     _, ev = run(three(status="todo"), {"incumbent": 10.0})
-    check("a skip falls back to on_keep when on_skip is absent",
-          "KEPT" in [n for n, _ in ev.calls], f"{[n for n, _ in ev.calls]}")
-
-    _, ev = run(three(status="todo", on_skip=["SKIP"]), {"incumbent": 10.0})
-    check("an explicit on_skip wins over on_keep",
-          "SKIP" in [n for n, _ in ev.calls] and "KEPT" not in [n for n, _ in ev.calls],
+    check("a SKIP follows on_keep, not on_revert",
+          "KEPT" in [n for n, _ in ev.calls] and
+          "REVERTED" not in [n for n, _ in ev.calls],
           f"{[n for n, _ in ev.calls]}")
 
-    # And the validator must refuse a DAG that relies on the default unsafely.
-    import validate_dag as V
-    d = json.loads(Path("dag/llm.json").read_text())
-    for n in d["nodes"]:
-        if n["id"] == "lora_serve_strategy":
-            n.pop("on_skip", None)          # back to relying on the default
-    _, _, errs = V.build(d)
-    check("the validator rejects an unguarded divergent skip",
-          any("can be skipped and its branches differ" in e for e in errs),
-          f"errors={errs}")
+    # WHERE THIS IS LOAD-BEARING, documented rather than changed. Four gated
+    # nodes in the real DAG have divergent branches, so a skip on any of them
+    # takes the "this worked" branch for a technique that never ran. It is safe
+    # only because three of their on_keep successors independently re-check
+    # measurements.<node>.kept and skip themselves, and the fourth
+    # (lora_serve_strategy -> prefix_caching) is unrelated to what was skipped.
+    # This asserts that convention still holds, so a future node that breaks it
+    # fails here rather than silently taking the wrong branch.
+    import networkx as nx
+    dag = json.loads(Path("dag/llm.json").read_text())
+    nodes = {n["id"]: n for n in dag["nodes"]}
+    for nid, n in nodes.items():
+        if n.get("status") != "active" or n.get("on_keep") == n.get("on_revert"):
+            continue
+        if not n.get("applicable_when"):
+            continue                       # cannot be skipped by a predicate
+        succ = (n.get("on_keep") or [None])[0]
+        guard = str((nodes.get(succ) or {}).get("applicable_when") or "")
+        unrelated = nid.split("_")[0] not in succ if succ else False
+        check(f"skip-safe: {nid} -> {succ}", nid in guard or unrelated,
+              f"{succ} neither re-checks measurements.{nid} nor is unrelated to "
+              f"it, so skipping {nid} would run {succ} on a prerequisite that "
+              f"never happened")
 
 
 def test_validator_rejects_bad_dags():

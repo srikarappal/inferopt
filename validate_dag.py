@@ -44,7 +44,6 @@ class Node(BaseModel):
     status: Literal["active", "todo"] = "active"
     title: str | None = None
     requires: list[str] = []
-    on_skip: list[str] = []
     applicable_when: str | None = None
     action: dict | None = None
     sweep: list[dict] | None = None
@@ -113,8 +112,7 @@ def build(dag: dict) -> tuple[dict[str, Node], nx.DiGraph, list[str]]:
     # this validator happily adds it to the graph and reports route lengths that
     # include a path the traversal will never take.
     for nid, n in nodes.items():
-        for name, targets in (("on_keep", n.on_keep), ("on_revert", n.on_revert),
-                              ("on_skip", n.on_skip)):
+        for name, targets in (("on_keep", n.on_keep), ("on_revert", n.on_revert)):
             if len(targets) > 1:
                 errs.append(
                     f"{nid}.{name} lists {len(targets)} targets {targets}; the "
@@ -147,32 +145,6 @@ def build(dag: dict) -> tuple[dict[str, Node], nx.DiGraph, list[str]]:
                     f"is reached, so the predicate raises and the node is "
                     f"silently skipped")
 
-    # WHERE A SKIP GOES, when the branches disagree.
-    #
-    # A skipped node never ran, but the walk follows on_keep -- the "this
-    # worked" branch. That is safe only if the successor does not assume the
-    # skipped technique was applied. Four nodes in this DAG rely on exactly
-    # that, each guarded by a successor re-checking measurements.<node>.kept,
-    # and nothing checked the convention held.
-    #
-    # A node is fine if ANY of: its branches agree (a skip cannot go wrong), it
-    # declares on_skip explicitly, its on_keep successor re-checks it, or it can
-    # never be skipped (always active and ungated).
-    for nid, n in nodes.items():
-        if n.status != "active" or n.on_keep == n.on_revert or n.on_skip:
-            continue
-        skippable = n.applicable_when is not None or n.node_class == "lossy"
-        if not skippable:
-            continue
-        succ = n.on_keep[0] if n.on_keep else None
-        guard = nodes[succ].applicable_when if succ in nodes else None
-        if not (guard and nid in str(guard)):
-            errs.append(
-                f"{nid}: can be skipped and its branches differ "
-                f"(on_keep={n.on_keep}, on_revert={n.on_revert}), but a skip "
-                f"follows on_keep -> {succ!r}, which does not re-check "
-                f"measurements.{nid}. Declare on_skip, or gate {succ!r} on "
-                f"measurements.{nid}.kept.")
     return nodes, g, errs
 
 

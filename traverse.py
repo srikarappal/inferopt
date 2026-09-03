@@ -384,20 +384,16 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             skipped.append((cur, why))
             log(f"  skip  {cur:32s} {why[:70]}")
             ctx.measurements[cur] = NodeMeasurement(kept=False)
-            # A SKIP IS NEITHER A KEEP NOR A REVERT, and the DAG may need to say
-            # where it goes. Default is on_keep, which is right when the skipped
-            # node is an optional detour -- skipping the LoRA subtree should
-            # continue to prefix_caching, not fall into lora_max_rank, which is
-            # the "the merge strategy failed, try per-adapter" branch.
-            #
-            # But on_keep is the "this technique worked" branch, and following
-            # it after a node that never RAN sends the walk into successors that
-            # assume a prerequisite. Today that is safe only because every such
-            # successor independently re-checks measurements.<node>.kept -- a
-            # convention held by four separate predicates and enforced nowhere.
-            # validate_dag now enforces it, and on_skip is the escape hatch for
-            # a node where neither branch is the right answer.
-            cur = (node.get("on_skip") or node.get("on_keep") or [None])[0]
+            # A SKIP FOLLOWS on_keep. Worth knowing rather than assuming: a
+            # skipped node never ran, yet the walk takes the "this technique
+            # worked" branch. Four gated nodes have divergent branches, and this
+            # is safe only because three of their on_keep successors
+            # independently re-check measurements.<node>.kept and skip
+            # themselves, while the fourth (lora_serve_strategy ->
+            # prefix_caching) is unrelated to what was skipped. That is a
+            # convention held in four places; if a future node breaks it, the
+            # walk will take the wrong branch silently.
+            cur = (node.get("on_keep") or [None])[0]
             continue
 
         # --- measure every variant ---
