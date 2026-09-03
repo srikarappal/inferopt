@@ -424,6 +424,7 @@ def main() -> int:
              test_frontier_includes_reverted, test_quality_inheritance,
              test_determinism, test_sweep_variants_all_measured,
              test_real_dag_walks,
+             test_validator_rejects_bad_dags,
              test_tolerance_is_reporting_not_gating,
              test_checkpoint_adopts_tolerance, test_zero_width_gate,
              test_measurements_visible_downstream, test_no_infinite_loop,
@@ -450,6 +451,53 @@ def main() -> int:
 
 
 # ================================================= second round: deeper probes
+
+def test_validator_rejects_bad_dags():
+    """validate_dag must REJECT what it claims to catch.
+
+    Testing the invariant in this file is not the same as testing the
+    validator: a mutation that deleted validate_dag's requires-as-ancestor
+    check survived, because the unit test re-derived the property itself. The
+    validator is what runs in CI and before a four-hour traversal, so it needs
+    its own coverage.
+    """
+    section("validate_dag rejects malformed DAGs")
+    import validate_dag as V
+
+    def errs_for(mutate):
+        d = json.loads(Path("dag/llm.json").read_text())
+        mutate(d)
+        _, _, errs = V.build(d)
+        return errs
+
+    def set_requires(d, nid, reqs):
+        for n in d["nodes"]:
+            if n["id"] == nid:
+                n["requires"] = reqs
+
+    # A requirement that runs AFTER the node claiming it.
+    e = errs_for(lambda d: set_requires(d, "prefix_caching", ["chunked_prefill"]))
+    check("a non-ancestor requirement is reported",
+          any("not an ancestor" in x for x in e), f"errors={e}")
+
+    # A requirement naming a node that does not exist.
+    e = errs_for(lambda d: set_requires(d, "prefix_caching", ["nope"]))
+    check("an unknown requirement is reported",
+          any("unknown node" in x for x in e), f"errors={e}")
+
+    # An edge to a node that does not exist.
+    def bad_edge(d):
+        for n in d["nodes"]:
+            if n["id"] == "prefix_caching":
+                n["on_keep"] = ["does_not_exist"]
+    check("a dangling edge is reported",
+          any("unknown node" in x for x in errs_for(bad_edge)),
+          f"errors={errs_for(bad_edge)}")
+
+    # The unmodified DAG must be clean, or every check above is meaningless.
+    _, _, clean = V.build(json.loads(Path("dag/llm.json").read_text()))
+    check("the real DAG produces no errors", not clean, f"errors={clean}")
+
 
 def test_tolerance_is_reporting_not_gating():
     """PINS a subtlety that reads like a bug and is not.

@@ -78,6 +78,24 @@ def build(dag: dict) -> tuple[dict[str, Node], nx.DiGraph, list[str]]:
         for req in n.requires:
             if req not in nodes:
                 errs.append(f"{nid}: requires unknown node {req!r}")
+
+    # `requires` MUST AGREE WITH THE EDGES. The graph is built from on_keep and
+    # on_revert; requires was only checked for existence, so it was free to say
+    # the opposite of the actual order and nothing noticed. prefix_caching
+    # declared `requires: [chunked_prefill]` while running two nodes AHEAD of
+    # it, contradicting its own rationale ("Placed FIRST among the flag nodes").
+    # It is documentation people read to understand the ordering, so it has to
+    # be true.
+    #
+    # The rule is ancestry, not dominance: a node may legitimately be reachable
+    # by a revert path that skips an optional predecessor, but a stated
+    # requirement that is not an ancestor at all is simply wrong.
+    for nid, n in nodes.items():
+        for req in n.requires:
+            if req in nodes and req != nid and not nx.has_path(g, req, nid):
+                errs.append(
+                    f"{nid}: requires {req!r}, which is not an ancestor -- "
+                    f"no on_keep/on_revert path leads from {req!r} to {nid!r}")
     return nodes, g, errs
 
 

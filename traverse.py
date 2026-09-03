@@ -41,6 +41,7 @@ HISTORY
 from __future__ import annotations
 
 import json
+import math
 
 import time
 from dataclasses import dataclass, field
@@ -138,12 +139,27 @@ class Result:
         included. Deliberately not GEPA's per-instance frontier and not just the
         accepted lineage."""
         out = []
+
+        def usable(t: "Trial") -> bool:
+            """A measurement with a non-finite axis is not a measurement.
+
+            NaN breaks domination silently rather than loudly: every comparison
+            against NaN is False, so `worse_none` is False and the point is
+            never dominated -- a trial with goodput 1.0 and a NaN TTFT survives
+            against one with goodput 100.0 and lands on the frontier. The
+            evaluator produces NaN percentiles whenever a window completes zero
+            requests, and only avoids this today because that same case sets
+            goodput to 0 and slo_ok to False. That is a coupling between two
+            separate computations, not a guarantee, so the frontier checks for
+            itself."""
+            return t.slo_ok and all(math.isfinite(v) for v in t.axes().values())
+
         for a in self.trials:
-            if not a.slo_ok:
+            if not usable(a):
                 continue
             dominated = False
             for b in self.trials:
-                if b is a or not b.slo_ok:
+                if b is a or not usable(b):
                     continue
                 ax, bx = a.axes(), b.axes()
                 better_any = any(

@@ -310,6 +310,34 @@ def test_frontier():
     check("a dead launch is not a frontier point",
           [t.node_id for t in fr] == ["live"], f"{[t.node_id for t in fr]}")
 
+    # NON-FINITE AXES. Every comparison against NaN is False, so worse_none is
+    # False and a NaN point is never dominated -- it survives against anything.
+    # The evaluator emits NaN percentiles whenever a window completes zero
+    # requests, so this is a shape the code actually produces.
+    nan = float("nan")
+    strong = _t("strong", goodput=100.0)
+    nanny = _t("nan_ttft", goodput=1.0, ttft=nan)
+    fr = R([strong, nanny]).frontier()
+    check("a NaN axis does not buy a frontier slot",
+          [t.node_id for t in fr] == ["strong"],
+          f"{[t.node_id for t in fr]} -- goodput 1.0 with a NaN TTFT must not "
+          f"survive against goodput 100.0")
+    infy = _t("inf_ttft", goodput=1.0, ttft=float("inf"))
+    fr = R([strong, infy]).frontier()
+    check("an infinite axis does not buy a frontier slot either",
+          [t.node_id for t in fr] == ["strong"], f"{[t.node_id for t in fr]}")
+    # itl_p99_ms is NOT a frontier axis -- OBJECTIVES is goodput, quality,
+    # ttft_p99_ms and memory_gb -- so a NaN there is irrelevant to domination
+    # and must not silently exclude an otherwise good point.
+    fr = R([_t("nan_itl_only", goodput=50.0, itl=nan)]).frontier()
+    check("a NaN on a NON-axis field does not exclude the trial",
+          [t.node_id for t in fr] == ["nan_itl_only"], f"{[t.node_id for t in fr]}")
+    # A run where EVERY trial has a non-finite AXIS yields an empty frontier
+    # rather than an arbitrary one.
+    fr = R([nanny, _t("also_nan", goodput=nan)]).frontier()
+    check("all-non-finite yields an empty frontier, not a guess", fr == [],
+          f"{[t.node_id for t in fr]}")
+
     # Sorted by goodput descending.
     ts = [_t("lo", goodput=1), _t("hi", goodput=100), _t("mid", goodput=50)]
     fr = R(ts).frontier()
@@ -420,6 +448,33 @@ def test_dag_file():
                   "an empty sweep on an ACTIVE node measures nothing new")
 
 
+def test_requires_matches_edges():
+    section("dag: `requires` agrees with the actual edges")
+    import networkx as nx
+    d = json.loads(Path("dag/llm.json").read_text())
+    nodes = {n["id"]: n for n in d["nodes"]}
+    g = nx.DiGraph()
+    for i in nodes:
+        g.add_node(i)
+    for i, n in nodes.items():
+        for e in ("on_keep", "on_revert"):
+            for t in (n.get(e) or []):
+                if t in nodes:
+                    g.add_edge(i, t)
+    # requires is documentation people read to understand ordering. It was
+    # checked only for EXISTENCE, so it was free to state the opposite of the
+    # real order: prefix_caching declared requires=[chunked_prefill] while
+    # running two nodes ahead of it, contradicting its own rationale.
+    for i, n in nodes.items():
+        for req in (n.get("requires") or []):
+            if req not in nodes or req == i:
+                continue
+            check(f"{i} requires {req}, which is an ancestor",
+                  nx.has_path(g, req, i),
+                  f"no on_keep/on_revert path from {req} to {i} -- the stated "
+                  f"prerequisite runs AFTER the node that claims it")
+
+
 def test_reachability():
     section("dag/llm.json: reachability and termination")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -454,7 +509,8 @@ def test_reachability():
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
-               test_trial_axes, test_frontier, test_dag_file, test_reachability):
+               test_trial_axes, test_frontier, test_dag_file,
+               test_requires_matches_edges, test_reachability):
         try:
             fn()
         except Exception as e:

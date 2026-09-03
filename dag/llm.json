@@ -237,7 +237,7 @@
       "class": "lossless",
       "status": "active",
       "requires": [
-        "chunked_prefill"
+        "lora_serve_strategy"
       ],
       "applicable_when": "workload.prefix_overlap_per_adapter > 0.05",
       "rationale": "Placed FIRST among the flag nodes, ahead of the batching and context nodes. On a workload with real prefix sharing this is what makes the SLO reachable at all: measured 2368ms -> 630ms TTFT and 15% -> 97% attainment on Qwen3-14B/GB10. Until attainment is high, goodput is quantised by whole requests -- at 15% attainment one request flipping moves goodput ~11%, against a 5% accept band -- so every node judged before it is decided on noise. The SLO-enabling technique has to come before the nodes measured against the SLO.",
