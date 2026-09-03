@@ -252,7 +252,17 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     minutes of GPU time should survive a bug in the code that reads it.
     """
     nodes = {n["id"]: n for n in dag["nodes"]}
-    root = next(n["id"] for n in dag["nodes"] if n.get("class") == "root")
+    if len(nodes) != len(dag["nodes"]):
+        dupes = [i for i in nodes if sum(1 for n in dag["nodes"] if n["id"] == i) > 1]
+        raise ValueError(
+            f"duplicate node id(s) {dupes}: building the lookup silently keeps "
+            f"the LAST definition, so the DAG that runs is not the one written")
+    try:
+        root = next(n["id"] for n in dag["nodes"] if n.get("class") == "root")
+    except StopIteration:
+        raise ValueError(
+            'no node has class "root": the traversal has nowhere to start. '
+            'Bare StopIteration here says nothing about what is wrong.') from None
     guard = dag["traversal"]["budget_guard"]
     scenario = "multi_lora" if ctx.fingerprint.lora.multi_lora_active else "default"
     max_launches = guard["max_launches"][scenario] if isinstance(guard["max_launches"], dict) else guard["max_launches"]
@@ -333,6 +343,12 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     cur, last_kept = root, True
 
     while cur:
+        if cur not in nodes:
+            raise ValueError(
+                f"edge points at {cur!r}, which is not a node in this DAG "
+                f"(reached from {visited[-1] if visited else 'the start'}). "
+                f"validate_dag catches this; a bare KeyError does not say where "
+                f"it came from.")
         node = nodes[cur]
         visited.append(cur)
         elapsed = (time.time() - t0) / 60

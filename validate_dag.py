@@ -67,6 +67,17 @@ def build(dag: dict) -> tuple[dict[str, Node], nx.DiGraph, list[str]]:
             for d in e.errors():
                 errs.append(f"{raw.get('id', '?')}: {'.'.join(map(str, d['loc']))} — {d['msg']}")
 
+    # DUPLICATE IDS. build() keys nodes by id, so a repeat silently discards
+    # the earlier definition -- the DAG that runs is not the one written, and
+    # every downstream check validates the survivor.
+    seen: dict[str, int] = {}
+    for raw in dag["nodes"]:
+        i = raw.get("id")
+        seen[i] = seen.get(i, 0) + 1
+    for i, c in seen.items():
+        if c > 1:
+            errs.append(f"{i}: defined {c} times; only the last survives")
+
     g = nx.DiGraph()
     for nid, n in nodes.items():
         g.add_node(nid, node=n)
@@ -97,6 +108,19 @@ def build(dag: dict) -> tuple[dict[str, Node], nx.DiGraph, list[str]]:
                 errs.append(
                     f"{nid}: requires {req!r}, which is not an ancestor -- "
                     f"no on_keep/on_revert path leads from {req!r} to {nid!r}")
+    # ONE TARGET PER EDGE. traverse follows `(node.get("on_keep") or [None])[0]`
+    # -- the FIRST entry only. A second target is silently unreachable, while
+    # this validator happily adds it to the graph and reports route lengths that
+    # include a path the traversal will never take.
+    for nid, n in nodes.items():
+        for name, targets in (("on_keep", n.on_keep), ("on_revert", n.on_revert),
+                              ("on_skip", n.on_skip)):
+            if len(targets) > 1:
+                errs.append(
+                    f"{nid}.{name} lists {len(targets)} targets {targets}; the "
+                    f"traversal follows only the first, so {targets[1:]} is "
+                    f"unreachable")
+
     # A PREDICATE MAY ONLY READ MEASUREMENTS THAT ALREADY EXIST.
     #
     # ctx.measurements is filled in as the walk proceeds, so gating on a node

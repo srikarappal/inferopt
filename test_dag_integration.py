@@ -424,6 +424,7 @@ def main() -> int:
              test_frontier_includes_reverted, test_quality_inheritance,
              test_determinism, test_sweep_variants_all_measured,
              test_real_dag_walks,
+             test_malformed_dag_errors_clearly,
              test_branch_semantics,
              test_validator_rejects_bad_dags,
              test_tolerance_is_reporting_not_gating,
@@ -452,6 +453,60 @@ def main() -> int:
 
 
 # ================================================= second round: deeper probes
+
+def test_malformed_dag_errors_clearly():
+    """A malformed DAG must say what is wrong, not raise a bare builtin.
+
+    Each of these used to surface as StopIteration with no message, a KeyError
+    naming only the missing key, or no error at all -- none of which tells you
+    which node to look at.
+    """
+    section("malformed DAGs fail with a usable message")
+    from traverse import traverse
+
+    def go(dag):
+        try:
+            traverse(dag, ctx(), ScriptedEvaluator({}), log=lambda *a: None)
+            return None
+        except Exception as e:
+            return f"{type(e).__name__}: {e}"
+
+    # no root
+    e = go({"traversal": {"budget_guard": {"max_launches": 9, "max_minutes": 9}},
+            "nodes": [{"id": "a", "class": "lossless", "status": "active"}]})
+    check("a DAG with no root names the problem",
+          e and "root" in e and not e.startswith("StopIteration"), f"{e}")
+
+    # duplicate ids -- the lookup silently keeps the last, so the DAG that runs
+    # is not the DAG that was written
+    d = mkdag([node("dup", "end")])
+    d["nodes"].append(node("dup", "end"))
+    e = go(d)
+    check("duplicate node ids are refused", e and "duplicate" in e.lower(), f"{e}")
+
+    # an edge to a node that does not exist
+    e = go(mkdag([node("a", "ghost")]))
+    check("a dangling edge names both ends",
+          e and "ghost" in e and not e.startswith("KeyError"), f"{e}")
+
+    # the validator catches the same three, plus multi-target edges
+    import validate_dag as V
+    d = json.loads(Path("dag/llm.json").read_text())
+    for n in d["nodes"]:
+        if n["id"] == "prefix_caching":
+            n["on_keep"] = ["max_model_len_rightsize", "chunked_prefill"]
+    _, _, errs = V.build(d)
+    check("the validator refuses a multi-target edge",
+          any("only the first" in x for x in errs),
+          f"errors={errs} -- traverse follows [0], so the rest is unreachable "
+          f"while the validator counts it in route lengths")
+
+    d = json.loads(Path("dag/llm.json").read_text())
+    d["nodes"].append(dict(d["nodes"][3]))
+    _, _, errs = V.build(d)
+    check("the validator refuses duplicate ids",
+          any("defined" in x and "times" in x for x in errs), f"errors={errs}")
+
 
 def test_branch_semantics():
     """Where the walk goes on keep, revert and SKIP.
