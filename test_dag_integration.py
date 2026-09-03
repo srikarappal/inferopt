@@ -424,6 +424,7 @@ def main() -> int:
              test_frontier_includes_reverted, test_quality_inheritance,
              test_determinism, test_sweep_variants_all_measured,
              test_real_dag_walks,
+             test_branch_semantics,
              test_validator_rejects_bad_dags,
              test_tolerance_is_reporting_not_gating,
              test_checkpoint_adopts_tolerance, test_zero_width_gate,
@@ -451,6 +452,54 @@ def main() -> int:
 
 
 # ================================================= second round: deeper probes
+
+def test_branch_semantics():
+    """Where the walk goes on keep, revert and SKIP.
+
+    A skip is neither a keep nor a revert. It follows on_keep by default, which
+    is right when the skipped node is an optional detour and wrong when the
+    successor assumes the technique was applied. In the real DAG four nodes
+    depend on that default being safe, each rescued by a successor that
+    re-checks measurements.<node>.kept -- a convention held in four places and,
+    until validate_dag learned to check it, enforced in none.
+    """
+    section("branch semantics: keep, revert, skip")
+    def three(**kw):
+        d = mkdag([node("a", "KEPT"), node("KEPT"), node("REVERTED"), node("SKIP")])
+        for n in d["nodes"]:
+            if n["id"] == "a":
+                n["on_keep"] = ["KEPT"]; n["on_revert"] = ["REVERTED"]
+                n.update(kw)
+        return d
+
+    _, ev = run(three(), {"incumbent": 10.0, "a": 100.0})
+    check("a keep follows on_keep", "KEPT" in [n for n, _ in ev.calls],
+          f"{[n for n, _ in ev.calls]}")
+
+    _, ev = run(three(), {"incumbent": 10.0, "a": 10.1})
+    check("a revert follows on_revert", "REVERTED" in [n for n, _ in ev.calls],
+          f"{[n for n, _ in ev.calls]} -- 10.1 vs 10.0 is inside the band")
+
+    _, ev = run(three(status="todo"), {"incumbent": 10.0})
+    check("a skip falls back to on_keep when on_skip is absent",
+          "KEPT" in [n for n, _ in ev.calls], f"{[n for n, _ in ev.calls]}")
+
+    _, ev = run(three(status="todo", on_skip=["SKIP"]), {"incumbent": 10.0})
+    check("an explicit on_skip wins over on_keep",
+          "SKIP" in [n for n, _ in ev.calls] and "KEPT" not in [n for n, _ in ev.calls],
+          f"{[n for n, _ in ev.calls]}")
+
+    # And the validator must refuse a DAG that relies on the default unsafely.
+    import validate_dag as V
+    d = json.loads(Path("dag/llm.json").read_text())
+    for n in d["nodes"]:
+        if n["id"] == "lora_serve_strategy":
+            n.pop("on_skip", None)          # back to relying on the default
+    _, _, errs = V.build(d)
+    check("the validator rejects an unguarded divergent skip",
+          any("can be skipped and its branches differ" in e for e in errs),
+          f"errors={errs}")
+
 
 def test_validator_rejects_bad_dags():
     """validate_dag must REJECT what it claims to catch.

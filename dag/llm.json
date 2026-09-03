@@ -128,10 +128,14 @@
       "on_keep": [
         "prefix_caching"
       ],
+      "on_skip": [
+        "prefix_caching"
+      ],
       "on_revert": [
         "lora_max_rank"
       ],
-      "scenario": "multi_lora"
+      "scenario": "multi_lora",
+      "skip_note": "on_keep and on_revert are both LoRA answers: keep means the merge strategy worked, revert means try per-adapter. A SKIP means there is no LoRA at all, which is neither -- the whole subtree is irrelevant and the walk continues at prefix_caching. Stated explicitly because a skip otherwise follows on_keep by default, and relying on that default happening to be right is how the branch semantics drift."
     },
     {
       "id": "lora_max_rank",
