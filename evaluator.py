@@ -187,6 +187,14 @@ def hardware_defaults(fp) -> dict:
     return out
 
 
+def _vllm_version() -> str:
+    try:
+        import vllm
+        return getattr(vllm, "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+
 def _vllm_importable() -> bool:
     try:
         import importlib.util
@@ -581,10 +589,38 @@ class VllmEvaluator:
                 config["quantization"] = kind      # fp8: a load-time flag
 
         model = config.get("model") or self.fp.model.id
-        unknown = [k for k in config if k != "model" and k not in installed_flags()] \
-            if installed_flags() else []
+        # THE FLAG CHECK MUST NOT DISABLE ITSELF. It used to fall back to "[]"
+        # whenever installed_flags() came back empty, which is precisely the case
+        # where it is most needed: an old vLLM whose `serve --help=all` is not
+        # recognised returns nothing, validation silently switches off, and every
+        # config is passed blind to a binary that may not accept it. The launch
+        # then dies with "exited 1 during startup" and no indication that a flag
+        # was the reason.
+        # Only demand the flag list when there is something to check against it.
+        # A config with no keys beyond `model` cannot contain an unknown flag, so
+        # refusing to launch it because `--help=all` was unreadable would block a
+        # bare `vllm serve <model>` for no reason.
+        to_check = [k for k in config if k != "model"]
+        flags = installed_flags() if to_check else None
+        if to_check and not flags and os.environ.get("INFEROPT_SKIP_FLAG_CHECK"):
+            flags = None                        # explicit opt-out, launch blind
+        elif to_check and not flags:
+            raise LaunchError(
+                f"could not read this vLLM's flag list, so no config can be "
+                f"validated before launching.\n"
+                f"`{' '.join(vllm_cmd())} serve --help=all` produced nothing "
+                f"parseable -- older vLLM builds do not accept --help=all.\n"
+                f"Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let vLLM "
+                f"reject bad flags itself, at the cost of a failed launch per "
+                f"bad key instead of an instant error.")
+        unknown = [k for k in config if k != "model" and k not in flags] if flags else []
         if unknown:
-            raise LaunchError(f"config keys this vLLM does not accept: {unknown}")
+            raise LaunchError(
+                f"config keys this vLLM ({_vllm_version()}) does not accept: "
+                f"{unknown}. Flags move between releases -- 0.26 removed "
+                f"--disable-log-requests, --swap-space and --cuda-graph-sizes, "
+                f"and older builds take speculative decoding as flat flags "
+                f"rather than --speculative-config JSON.")
 
         d = self.run_dir / "launches" / tag
         d.mkdir(parents=True, exist_ok=True)
