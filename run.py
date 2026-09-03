@@ -46,7 +46,7 @@ from traverse import report, traverse
 
 # Benchmarks run once on the seed so the frontier has a quality axis. Lossless
 # nodes inherit these; lossy nodes re-measure.
-BASELINE_BENCHMARKS = ["math_500", "ruler_multineedle"]
+BASELINE_BENCHMARKS = ["math_500"]
 
 
 def cmd_trace(args) -> int:

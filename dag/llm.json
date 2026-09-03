@@ -86,17 +86,6 @@
       "scoring": "final boxed answer",
       "why": "long reasoning chains, genuine headroom at 9B scale",
       "n_full": 500
-    },
-    {
-      "id": "ruler_multineedle",
-      "metric": "accuracy",
-      "scoring": "exact string match of all needles",
-      "contexts": [
-        16384,
-        32768
-      ],
-      "why": "probes exactly what KV-cache quantization damages; vanilla NIAH saturates at 1.00 and cannot",
-      "n_full": 200
     }
   ],
   "nodes": [
@@ -560,8 +549,7 @@
         "quality"
       ],
       "quality_benchmarks": [
-        "math_500",
-        "ruler_multineedle"
+        "math_500"
       ],
       "reuse_server_if": "previous_node.kept",
       "on_measure": "If the quality delta exceeds what per_token_flip_rate predicts, something in the lossless branch was not lossless. Stop and report rather than entering the lossy branch on a corrupted incumbent.",
@@ -578,7 +566,7 @@
         "lossless_complete"
       ],
       "applicable_when": "fingerprint.hw.supports_fp8",
-      "rationale": "Entered first in the lossy branch because it has the best gain-to-damage ratio: roughly halves KV memory, touches no weights, and the damage is concentrated in long-context recall where RULER can see it.",
+      "rationale": "Entered first in the lossy branch because it has the best gain-to-damage ratio: roughly halves KV memory, touches no weights, and the damage is concentrated in long-context recall. NOTE: no active benchmark probes that axis since ruler_multineedle was removed, so this node's quality gate is weaker than it looks -- MATH-500 will not see long-context degradation.",
       "action": {
         "set": {
           "kv_cache_dtype": "fp8_e4m3"
@@ -590,7 +578,6 @@
         "quality"
       ],
       "quality_benchmarks": [
-        "ruler_multineedle",
         "math_500"
       ],
       "cost_launches": 1,
@@ -705,8 +692,7 @@
         "quality"
       ],
       "quality_benchmarks": [
-        "math_500",
-        "ruler_multineedle"
+        "math_500"
       ],
       "quality_note": "MANDATORY. Quality on the eval set is the only thing that says whether a quantization did a good job -- goodput alone would keep a checkpoint that serves twice as fast and cannot do arithmetic. Measured against the tolerance established at lossless_complete, so a drop inside the eval's own resolution limit is not mistaken for damage.",
       "cost_launches": 4,

@@ -11,8 +11,8 @@
 #      google-generativeai for its own generation backends, and this project has
 #      twice been broken by a dependency installed for a side feature (modelopt
 #      pulled setuptools 81 against vLLM's <81).
-#   2. materializes data/, which is gitignored because RULER's corpus and the
-#      run outputs are large and machine-specific. MBPP+'s test file is only
+#   2. materializes data/, which is gitignored because the run outputs and
+#      generated corpora are large and machine-specific. MBPP+'s test file is only
 #      2.6MB but travels the same way, so a clone has prompts and no tests.
 #   3. checks the vLLM/torch environment is actually present.
 #   4. reports what this GPU can and cannot run, so an unsupported ladder row is

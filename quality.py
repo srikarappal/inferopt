@@ -34,6 +34,10 @@ HISTORY -- gates that could not be passed
 
   The dataset was also simply missing: fetch_data.py had never been run for
   ruler_multineedle, and nothing noticed until the file was looked for.
+  ruler_multineedle has since been REMOVED -- it saturated at 1.00 on one model
+  and read an incoherent 0.05 on another, moving across a lossless node where
+  quality cannot change. The filter it motivated is kept: it guards any
+  benchmark whose prompts might not fit.
 
   MATH-500 answers are LaTeX, not numbers. '\\left( 3, \\frac{\\pi}{2} \\right)'
   does not survive numeric extraction, hence _norm_latex and string matching.
@@ -202,7 +206,8 @@ def _math_500_prompt(r) -> str:
     return r["problem"] + "\n\nPut your final answer in \\boxed{}."
 
 
-def _ruler_prompt(r) -> str:
+def _raw_prompt(r) -> str:
+    """Row's prompt text, unchanged. For benchmarks that ship their own."""
     return r["prompt"]
 
 
@@ -213,16 +218,6 @@ def _judge_math_500(rows, texts) -> list[bool]:
         m = _BOXED.findall(t)
         # no boxed answer produced == wrong, not skipped
         out.append(bool(m) and _norm_latex(m[-1]) == _norm_latex(r["answer"]))
-    return out
-
-
-def _judge_ruler(rows, texts) -> list[bool]:
-    """accuracy -- every needle must appear. Multi-needle on purpose: the
-    single-needle variant saturates at 1.00 and cannot show a regression."""
-    out = []
-    for r, t in zip(rows, texts):
-        needles = r["answers"] if isinstance(r.get("answers"), list) else [r["answer"]]
-        out.append(all(str(n).strip().lower() in t.lower() for n in needles))
     return out
 
 
@@ -365,7 +360,7 @@ class Benchmark:
     chat: bool = False
     """Whether to send the prompt through the model's chat template.
 
-    False for math_500 and ruler on purpose. Every accuracy number this project
+    False for math_500 on purpose. Every accuracy number this project
     has recorded was measured raw, and turning the template on for them would
     make new rows incomparable to old ones for a reason unrelated to the config
     being tested. mbpp_plus is new, so it starts on the correct setting.
@@ -374,7 +369,6 @@ class Benchmark:
 
 BENCHMARKS: dict[str, Benchmark] = {
     "math_500": Benchmark(_judge_math_500, _math_500_prompt, "exact_match", 500, 1024),
-    "ruler_multineedle": Benchmark(_judge_ruler, _ruler_prompt, "accuracy", 200, 64),
     # max_tokens 512: measured p95 output is 73 tokens and the longest seen was
     # 142, so this is ~3.5x the worst observed. It is a runaway cap, not a
     # target. It matters most if a model with no chat template falls back to raw
@@ -382,7 +376,7 @@ BENCHMARKS: dict[str, Benchmark] = {
     # the cap.
     "mbpp_plus": Benchmark(_judge_mbpp_plus, _mbpp_plus_prompt, "pass@1", 378, 512,
                            chat=True),
-    "humaneval_plus": Benchmark(_judge_humaneval_plus, _ruler_prompt, "pass@1", 164, 512),
+    "humaneval_plus": Benchmark(_judge_humaneval_plus, _raw_prompt, "pass@1", 164, 512),
 }
 
 
@@ -391,7 +385,7 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                   model: str | None = None) -> float:
     """Score one benchmark, refusing to score prompts the server cannot take.
 
-    RULER generates long documents. Served under a right-sized max_model_len,
+    A benchmark with long prompts, served under a right-sized max_model_len,
     every prompt can exceed the context and be rejected, and the benchmark then
     returns 0.0 -- for EVERY config, so the gate reads "quality unchanged"
     instead of "probe broken". That is the same shape as the accuracy gate that
@@ -427,7 +421,8 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                 f"would score 0.0 for every config -- indistinguishable from "
                 f"'no quality change'.\n"
                 f"Regenerate at a context that fits:\n"
-                f"    python fetch_data.py --ruler-contexts {budget//2},{int(budget*0.9)}")
+                f"Either serve a longer context, or use a benchmark whose prompts "
+                f"fit {budget} tokens.")
         if len(fits) < len(rows):
             print(f"        {name}: {len(rows)-len(fits)}/{len(rows)} prompts exceed "
                   f"the {budget}-token budget, scoring on {len(fits)}")

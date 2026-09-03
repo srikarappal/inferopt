@@ -69,9 +69,9 @@ class DryRunEvaluator:
 
         if "quality" in probes:
             for b in benchmarks or ["humaneval_plus"]:
-                v = {"humaneval_plus": 0.58, "math_500": 0.44, "ruler_multineedle": 0.92}[b]
+                v = {"humaneval_plus": 0.58, "math_500": 0.44}[b]
                 if config.get("kv_cache_dtype") == "fp8_e4m3":
-                    v -= {"ruler_multineedle": 0.021}.get(b, 0.004)
+                    v -= 0.004
                 if "fp8" in str(config.get("model", "")).lower():
                     v -= 0.010
                 if "awq" in str(config.get("model", "")).lower():
@@ -113,7 +113,7 @@ def build_context() -> Context:
                    "enable_prefix_caching": False, "enable_chunked_prefill": False,
                    "enforce_eager": False},
         # stage 1.3 measured these before the DAG started
-        quality_baseline={"humaneval_plus": 0.58, "math_500": 0.44, "ruler_multineedle": 0.92},
+        quality_baseline={"humaneval_plus": 0.58, "math_500": 0.44},
         incumbent_metrics=NodeMeasurement(goodput=480.0, ttft_p99_ms=420.0, itl_p99_ms=50.0),
     )
 

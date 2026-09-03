@@ -186,7 +186,7 @@ def main() -> int:
     ap.add_argument("--model", required=True,
                     help="HF id or local path, including a quantized checkpoint")
     ap.add_argument("--benchmark", default="math_500",
-                    help="math_500 | mbpp_plus | ruler_multineedle (see quality.py). "
+                    help="math_500 | mbpp_plus (see quality.py). "
                          "mbpp_plus EXECUTES generated code in a subprocess -- see "
                          "mbpp_score.py for the isolation boundary.")
     ap.add_argument("--n", type=int, default=100, help="problems to score")
