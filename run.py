@@ -206,6 +206,7 @@ def _incumbent_node(res) -> str | None:
 def cmd_optimize(args) -> int:
     req = InferOptRequest(
         model=args.model, trace=args.trace,
+        qps=args.qps,
         ttft_p99_ms=args.ttft_p99, itl_p99_ms=args.itl_p99,
         allow_loss=args.allow_loss, lossless_tolerance=args.lossless_tolerance,
         adapters=args.adapter or [],
@@ -218,8 +219,14 @@ def cmd_optimize(args) -> int:
     print(f"  hardware  {fp.hw.gpu_name} x{fp.hw.gpu_count}  cc{fp.hw.compute_capability}  "
           f"{fp.hw.memory_gb:.0f}GB{' unified' if fp.hw.unified_memory else ''}  "
           f"{fp.hw.memory_bandwidth_gb_s:.0f} GB/s")
+    # Where qps CAME FROM, not just its value: it is the denominator of every
+    # replica count in the report, and a stated rate and a measured one are
+    # different claims. calibration.py labels accept_band the same way and for
+    # the same reason -- a number resting on a default must never look measured.
+    qsrc = "stated" if args.qps else "from trace arrival_ts"
     print(f"  workload  {fp.workload.n_requests} reqs, in p99 {fp.workload.p99_input_tokens}, "
-          f"out mean {fp.workload.mean_output_tokens:.0f}, {fp.workload.request_rate_qps:.1f} qps, "
+          f"out mean {fp.workload.mean_output_tokens:.0f}, "
+          f"{fp.workload.request_rate_qps:.1f} qps [{qsrc}], "
           f"prefix {fp.workload.prefix_overlap:.0%}")
     print(f"  slo       ttft_p99 {slo.ttft_p99_ms}ms  itl_p99 {slo.itl_p99_ms}ms  "
           f"allow_loss {slo.quality_budget}")
@@ -500,6 +507,14 @@ def main() -> int:
     o.add_argument("--trace", required=True)
     o.add_argument("--ttft-p99", type=float, default=None)
     o.add_argument("--itl-p99", type=float, default=None)
+    o.add_argument("--qps", type=float, default=None,
+                   help="arrival rate in requests/second. Overrides the rate "
+                        "implied by the trace's arrival_ts, which is the "
+                        "fallback. Use this when you know your target rate and "
+                        "your trace has no real timestamps -- fabricating "
+                        "arrival_ts to express a rate you already know is "
+                        "circular, and omitting it silently zeroed every "
+                        "replica count.")
     o.add_argument("--allow-loss", type=float, default=None,
                    help="quality budget for the LOSSY branch, e.g. 0.1")
     o.add_argument("--lossless-tolerance", type=float, default=0.03,

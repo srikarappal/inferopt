@@ -857,6 +857,67 @@ def test_moe_backend_and_int_flags():
 
 
 # ==========================================================================
+def test_qps_source():
+    """qps is the denominator of every replica count, so where it comes from
+    matters as much as its value."""
+    section("qps: stated, derived, or refused")
+    import tempfile
+    from fingerprint import WorkloadFingerprint
+
+    rows = [{"prompt": "x", "input_tokens": 100, "output_tokens": 50,
+             "arrival_ts": i * 0.5, "prefix_id": None, "temperature": 0.0}
+            for i in range(20)]
+
+    with tempfile.TemporaryDirectory() as td:
+        withts = Path(td) / "with.jsonl"
+        withts.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        nots = Path(td) / "without.jsonl"
+        nots.write_text("".join(
+            json.dumps({k: v for k, v in r.items() if k != "arrival_ts"}) + "\n"
+            for r in rows))
+
+        w = WorkloadFingerprint.from_trace(str(withts))
+        # 20 requests, first at 0.0 and last at 9.5, so the span is 9.5s.
+        check("qps is derived from the trace when timestamps are present",
+              abs(w.request_rate_qps - 20 / 9.5) < 1e-6, f"{w.request_rate_qps}")
+
+        w = WorkloadFingerprint.from_trace(str(withts), request_rate_qps=40.0)
+        check("a stated rate overrides the trace's timestamps",
+              w.request_rate_qps == 40.0, f"{w.request_rate_qps}")
+
+        # THE REGRESSION GUARD. This used to return qps=0.0 in silence, which
+        # made demand 0 tok/s and every replica count meaningless, on the one
+        # field a caller is least likely to have.
+        check("a trace with no arrival_ts and no stated rate RAISES",
+              raises(lambda: WorkloadFingerprint.from_trace(str(nots))),
+              "silently returning qps=0 is what this replaces")
+        try:
+            WorkloadFingerprint.from_trace(str(nots))
+        except ValueError as e:
+            check("...and the error names the way out", "--qps" in str(e),
+                  "an error that does not say what to do is only half a fix")
+
+        w = WorkloadFingerprint.from_trace(str(nots), request_rate_qps=16.0)
+        check("a stated rate makes a timestamp-free trace usable",
+              w.request_rate_qps == 16.0, f"{w.request_rate_qps}")
+        check("the other statistics still come from the trace itself",
+              w.n_requests == 20 and w.mean_output_tokens == 50.0,
+              f"{w.n_requests} reqs, out {w.mean_output_tokens}")
+
+    section("qps: the request surface")
+    from request import InferOptRequest
+    tr = "data/trace_shared.jsonl"      # InferOptRequest validates the path
+    if Path(tr).exists():
+        check("qps must be positive",
+              raises(lambda: InferOptRequest(model="m", trace=tr, qps=0)),
+              "a zero rate is the bug this flag exists to prevent")
+        check("a negative qps is refused",
+              raises(lambda: InferOptRequest(model="m", trace=tr, qps=-1)))
+        check("qps is optional",
+              InferOptRequest(model="m", trace=tr).qps is None)
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -999,7 +1060,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_dag_file,
+               test_qps_source, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

@@ -101,6 +101,13 @@ class InferOptRequest(BaseModel):
 
     ttft_p99_ms: float | None = Field(None, description="latency SLO; requests slower than this earn no goodput")
     itl_p99_ms: float | None = Field(None, description="inter-token latency SLO")
+    qps: float | None = Field(None, gt=0.0, description=
+        "Arrival rate in requests/second. Overrides whatever the trace's "
+        "arrival_ts implies. Most callers KNOW their target rate and have no "
+        "timestamped log, and deriving it from timestamps forces them to "
+        "fabricate a field to express a number they already had -- which then "
+        "silently reads 0 if they omit it. Timestamps remain the fallback, for "
+        "callers who really did capture production traffic.")
     throughput_target_tok_s: float | None = Field(None, description="minimum acceptable throughput, if any")
 
     lossless_tolerance: float = Field(0.03, ge=0.0, le=1.0,
@@ -640,7 +647,8 @@ def build_fingerprint(req: InferOptRequest) -> tuple[Fingerprint, SLO]:
 
     fp = Fingerprint(
         model=model, hw=hw,
-        workload=WorkloadFingerprint.from_trace(req.trace),
+        workload=WorkloadFingerprint.from_trace(
+            req.trace, **({"request_rate_qps": req.qps} if req.qps else {})),
         lora=detect_lora(req),
     )
     slo = SLO(ttft_p99_ms=req.ttft_p99_ms, itl_p99_ms=req.itl_p99_ms,

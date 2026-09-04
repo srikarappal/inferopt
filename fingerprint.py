@@ -349,9 +349,23 @@ class WorkloadFingerprint(BaseModel):
 
         ins = [r["input_tokens"] for r in rows]
         outs = [r["output_tokens"] for r in rows]
+        # arrival_ts is the ONLY source of qps, and qps is the denominator of
+        # every replica count. It is also the field a caller is least likely to
+        # have: input_tokens and output_tokens are read with r[...] and would
+        # raise, while this one used .get() and quietly produced qps=0.0, a
+        # demand of 0 tok/s, and replica counts computed from nothing. Silence
+        # was the wrong default for the one field most likely to be missing.
         ts = sorted(r["arrival_ts"] for r in rows if r.get("arrival_ts") is not None)
         span = (ts[-1] - ts[0]) if len(ts) > 1 else 0.0
         qps = len(rows) / span if span > 0 else 0.0
+        if qps <= 0 and "request_rate_qps" not in overrides:
+            raise ValueError(
+                f"{path}: no usable arrival_ts, so the arrival rate cannot be "
+                f"derived ({len(ts)} of {len(rows)} rows carry one). qps is the "
+                f"denominator of every replica count and every demand figure.\n"
+                f"  Either add arrival_ts (seconds, relative or absolute epoch) "
+                f"to the trace,\n"
+                f"  or state the rate directly:  --qps 16")
 
         # Burstiness from the busiest one-second bucket against the mean.
         burst = 1.0
