@@ -77,6 +77,12 @@ class Trial:
     an outcome of arrival rate and service time rather than an input."""
     curve: list[dict] = field(default_factory=list)
     """Extra (concurrency, goodput) points, for nodes whose curves cross."""
+    provenance: dict[str, Any] = field(default_factory=dict)
+    """What produced this number: model, GPU, vLLM version, trace hash, SLO.
+
+    Carried per-trial and not only per-run because comparing optimizers means
+    pooling trials from many runs into one table, and a row that cannot say
+    what produced it cannot be pooled. See provenance.trial_stamp."""
     quality_inherited: bool = False
     """True when quality was carried forward from the baseline rather than
     measured. Lossless nodes cannot move quality, and the equivalence probe is a
@@ -240,7 +246,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              journal: str | Path | None = None,
              baseline: Trial | None = None,
              concurrency: int | None = None,
-             fixed_concurrency: int | None = None) -> Result:
+             fixed_concurrency: int | None = None,
+             provenance: dict | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
 
     `journal` is a path to APPEND every Trial to as it completes; the caller
@@ -302,6 +309,11 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         Flushed per line: a crash, a kill, or an OOM must not cost the trials
         already paid for. Journal failures are reported but never raised -- a
         broken journal must not take down a run that is otherwise fine."""
+        # Stamped here rather than at construction: the evaluator builds Trials
+        # and has no reason to know about run identity. Stamping before the
+        # write means the journal and the returned trials agree.
+        if provenance and not t.provenance:
+            t.provenance = dict(provenance)
         if not jpath:
             return
         try:

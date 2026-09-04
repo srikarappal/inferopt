@@ -105,3 +105,54 @@ def banner(meta: dict[str, Any], path: Path) -> str:
     dirty = "  DIRTY TREE" if env.get("inferopt_dirty") else ""
     return (f"  provenance -> {path}  (commit {commit}{dirty}, "
             f"vllm {env.get('vllm')}, torch {env.get('torch')})")
+
+
+def trial_stamp(fp, trace: str | Path | None = None, slo=None) -> dict[str, Any]:
+    """The compact identity a single MEASUREMENT must carry to be poolable.
+
+    run_meta.json already records everything about a run. That is the wrong
+    granularity for one job: comparing optimizers means pooling trials from many
+    runs into one table, and a row that does not say what produced it cannot be
+    pooled -- it can only be trusted or discarded wholesale. 80 trials were
+    accumulated across nine runs before anyone noticed that not one of them
+    recorded its model, its trace or its vLLM version.
+
+    SLO IS PART OF THE IDENTITY, not context. Goodput counts only the requests
+    that met the SLO, so the same config measured against a 500 ms TTFT target
+    and a 200 ms one produces two different numbers that are not comparable and
+    do not average. Pooling those silently is the failure this is here to stop.
+
+    `key` is a hash of everything above, so a reader can group by one value
+    instead of comparing seven fields and getting it subtly wrong.
+    """
+    import hashlib
+    import json as _json
+
+    rec: dict[str, Any] = {}
+    if fp is not None:
+        rec["model"] = fp.model.id
+        rec["gpu"] = fp.hw.gpu_name
+        rec["gpu_count"] = fp.hw.gpu_count
+    env = environment()
+    rec["vllm"] = env["vllm"]
+    rec["commit"] = (env["inferopt_commit"] or "")[:12] or None
+    rec["dirty"] = env["inferopt_dirty"]
+
+    if trace:
+        p = Path(trace)
+        try:
+            raw = p.read_bytes()
+            rec["trace"] = p.name
+            rec["trace_sha"] = hashlib.sha256(raw).hexdigest()[:12]
+            rec["trace_rows"] = raw.count(b"\n")
+        except Exception:
+            # A trace we cannot read is recorded as unknown rather than omitted:
+            # an absent field reads as "not applicable", which is a lie here.
+            rec["trace"] = str(trace)
+            rec["trace_sha"] = None
+    if slo is not None:
+        rec["slo"] = {"ttft_p99_ms": getattr(slo, "ttft_p99_ms", None),
+                      "itl_p99_ms": getattr(slo, "itl_p99_ms", None)}
+    rec["key"] = hashlib.sha256(
+        _json.dumps(rec, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    return rec

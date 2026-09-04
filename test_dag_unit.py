@@ -550,6 +550,135 @@ def test_pb_design():
 
 
 # ==========================================================================
+def test_replay():
+    """The optimizer-scoring harness. Its job is to be trusted about which
+    strategy wins, so its own arithmetic has to be beyond doubt."""
+    section("replay: the table")
+    import random as _r
+    from replay import (Table, regret, sequential_dag, pb_then_factorial,
+                        pb_anchored, random_search, yolo, screen_fidelity,
+                        STRATEGIES, _spearman)
+
+    EFF = {"a": 10.0, "b": 5.0, "c": -3.0, "d": 0.0}
+    t = Table.synthetic(EFF, base=20.0, noise=0.0, repeats=2, seed=1)
+    check("synthetic table has 2^n cells", len(t.cells) == 16, f"{len(t.cells)}")
+    check("all-off cell is the base", abs(t.truth("0000") - 20.0) < 1e-9)
+    check("truth adds the stated effects",
+          abs(t.truth("1100") - 35.0) < 1e-9, f"{t.truth('1100')}")
+    check("a negative factor lowers truth",
+          abs(t.truth("0010") - 17.0) < 1e-9, f"{t.truth('0010')}")
+    m, g = t.virtual_best()
+    # d has effect 0.0, so 1100 and 1101 are genuinely tied. Either is correct;
+    # asserting one of them would be testing dict order, not the function.
+    check("virtual best is a max-truth cell",
+          m in ("1100", "1101") and abs(g - 35.0) < 1e-9, f"got {m} at {g}")
+    check("true_effects recovers an additive model exactly",
+          all(abs(t.true_effects()[k] - v) < 1e-9 for k, v in EFF.items()),
+          f"{t.true_effects()}")
+    check("an empty table is refused", raises(lambda: Table(["a"], {})),
+          "scoring against nothing must not silently return 0 regret")
+
+    ti = Table.synthetic({"a": 1.0, "b": 1.0}, base=10.0, noise=0.0,
+                         interactions={("a", "b"): 8.0}, seed=1)
+    check("interactions are applied only when both factors are on",
+          abs(ti.truth("11") - 20.0) < 1e-9 and abs(ti.truth("10") - 11.0) < 1e-9,
+          f"11={ti.truth('11')} 10={ti.truth('10')}")
+
+    # A MEASURED table has no analytic truth -- its truth is the mean of the
+    # repeats, which is why repeats are not optional. Every synthetic table
+    # short-circuits that path, so it needs a table built from cells directly.
+    meas = Table(["x", "y"], {"00": [10.0, 12.0, 14.0], "01": [20.0, 20.0, 20.0],
+                              "10": [9.0, 9.0, 9.0], "11": [30.0, 10.0, 20.0]})
+    check("a measured cell's truth is the MEAN of its repeats",
+          abs(meas.truth("00") - 12.0) < 1e-9, f"got {meas.truth('00')}")
+    check("a wide spread does not raise a cell's truth",
+          abs(meas.truth("11") - 20.0) < 1e-9,
+          f"got {meas.truth('11')}; taking the max would reward a lucky launch")
+    check("virtual best on a measured table uses those means",
+          meas.virtual_best()[0] in ("01", "11"), f"{meas.virtual_best()}")
+
+    section("replay: regret is scored on truth, not on what was observed")
+    check("a trace holding only the best cell has zero regret",
+          abs(regret(t, [("1101", 99.0)])) < 1e-9)
+    check("an empty trace is total regret, not zero",
+          regret(t, []) == 1.0, "a strategy that measured nothing must not win")
+    # THE property. A strategy that gets a lucky draw on a bad cell must be
+    # charged for the bad cell it would ship, not credited with the lucky number.
+    lucky = regret(t, [("0000", 999.0), ("1101", 1.0)])
+    check("a lucky reading on a bad cell is still scored as the bad cell",
+          abs(lucky - (35.0 - 20.0) / 35.0) < 1e-9,
+          f"got {lucky}; scoring on observed values would reward noise")
+    check("regret rises as the shipped cell gets worse",
+          regret(t, [("0010", 1.0)]) > regret(t, [("1000", 1.0)]) > 0,
+          "1100 is itself optimal, so it cannot be the worse of the pair")
+
+    section("replay: strategies are budget-honest")
+    for name, fn in STRATEGIES.items():
+        for b in (1, 3, 7, 12, 20):
+            tr = fn(t, b, _r.Random(0))
+            check(f"{name}: respects a budget of {b}", len(tr) <= b,
+                  f"spent {len(tr)}")
+            check(f"{name}: never invents a cell (budget {b})",
+                  all(m in t.cells for m, _ in tr), "measured a nonexistent config")
+        check(f"{name}: returns nothing on a zero budget",
+              fn(t, 0, _r.Random(0)) == [], "a free lunch is a bug")
+
+    # A half-fraction table has holes. A strategy must skip them, not crash and
+    # not fabricate -- this is what a real partially-measured table looks like.
+    holed = Table(t.factors, {k: v for i, (k, v) in enumerate(t.cells.items())
+                              if i % 2 == 0})
+    for name, fn in STRATEGIES.items():
+        tr = fn(holed, 12, _r.Random(0))
+        check(f"{name}: survives an incompletely measured table",
+              all(m in holed.cells for m, _ in tr), "read a hole as a number")
+
+    section("replay: the sequential walk behaves as traverse.py does")
+    walk = sequential_dag(t, 99, _r.Random(0))
+    check("the walk costs one launch per factor, plus the baseline",
+          len(walk) == len(t.factors) + 1, f"spent {len(walk)}")
+    check("the walk starts from all-off", walk[0][0] == "0000", f"{walk[0][0]}")
+    check("extra budget does not help the walk",
+          len(sequential_dag(t, 500, _r.Random(0))) == len(walk),
+          "the walk cannot spend more than one pass -- that is the point")
+    # It must actually turn on a factor worth far more than the band.
+    check("the walk keeps a large win", walk[-1][0].count("1") >= 1,
+          f"ended at {walk[-1][0]} having seen a +10 factor")
+
+    # The band is the walk's whole decision rule. On a table where every factor
+    # pays less than it, the walk must end where it started -- otherwise it is
+    # accepting noise, which is the failure the band exists to prevent.
+    # The incumbent is not in the trace, but it is visible in it: while the
+    # incumbent stays all-off, every candidate carries exactly one 1. The moment
+    # a factor is kept, later candidates carry two. So the maximum popcount over
+    # the trace says whether anything was ever accepted.
+    tiny = Table.synthetic({"a": 0.2, "b": 0.3, "c": 0.1}, base=100.0,
+                           noise=0.0, repeats=1, seed=5)
+    w = sequential_dag(tiny, 99, _r.Random(0), band=0.05)
+    check("the walk accepts no gain smaller than the band",
+          max(m.count("1") for m, _ in w) <= 1,
+          f"trace {[m for m, _ in w]} -- a 0.3% gain was kept against a 5% band")
+    big = Table.synthetic({"a": 40.0, "b": 30.0}, base=100.0,
+                          noise=0.0, repeats=1, seed=5)
+    wb = sequential_dag(big, 99, _r.Random(0), band=0.05)
+    check("a gain far above the band IS kept",
+          max(m.count("1") for m, _ in wb) == 2,
+          f"trace {[m for m, _ in wb]} -- the band must not reject a 40% win")
+
+    section("replay: screening fidelity")
+    clean = Table.synthetic({"a": 20.0, "b": 10.0, "c": 5.0, "d": -8.0,
+                             "e": 0.5, "f": -0.2}, base=30.0, noise=0.0,
+                            repeats=1, seed=3)
+    fid = screen_fidelity(clean, seeds=10)
+    check("a noiseless additive space is screened perfectly",
+          fid["rank_correlation"] > 0.999 and fid["top3_recall"] > 0.999,
+          f"{fid} -- resolution III is exact when there are no interactions")
+    check("spearman is 1.0 for identical orderings",
+          abs(_spearman([1, 2, 3], [10, 20, 30]) - 1.0) < 1e-9)
+    check("spearman is -1.0 for reversed orderings",
+          abs(_spearman([1, 2, 3], [30, 20, 10]) + 1.0) < 1e-9)
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -691,7 +820,7 @@ def test_reachability():
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
-               test_trial_axes, test_frontier, test_pb_design, test_dag_file,
+               test_trial_axes, test_frontier, test_pb_design, test_replay, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

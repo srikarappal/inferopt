@@ -266,12 +266,14 @@ def cmd_optimize(args) -> int:
     journal.write_text("")          # truncate once, here; traverse only appends
 
     port = free_port(args.port)
-    from provenance import banner, provenance
+    from provenance import banner, provenance, trial_stamp
+    stamp = trial_stamp(fp, args.trace, slo)
     meta = provenance(ap_ref[0], args, fp, extra={
         "port": port,
         "seed_config": cfg,
         "dag": args.dag,
         "slo": slo.model_dump(),
+        "trial_stamp": stamp,
     })
     (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
     print(banner(meta, run_dir / "run_meta.json"))
@@ -334,6 +336,7 @@ def cmd_optimize(args) -> int:
         # So it is now written THREE times -- console block, journal line 1,
         # result.json["baseline"] -- because losing it makes the entire run
         # uninterpretable, and it costs nothing to keep.
+        t.provenance = dict(stamp)
         journal.write_text(json.dumps(t.__dict__, default=str) + "\n")
         d = t.diagnostics or {}
         miss = lambda v, lim: ("" if not lim else
@@ -410,7 +413,8 @@ def cmd_optimize(args) -> int:
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
                    journal=journal, baseline=baseline,
                    concurrency=operating_L,
-                   fixed_concurrency=args.fixed_concurrency)
+                   fixed_concurrency=args.fixed_concurrency,
+                   provenance=stamp)
 
     # Full sweep on the finalists. The traversal ranks configs at one operating
     # point, which is enough to CHOOSE between them -- most goodput curves sit
