@@ -407,6 +407,149 @@ def test_frontier():
 
 
 # ==========================================================================
+def test_pb_design():
+    """Plackett-Burman screening: the design, and that it recovers known effects.
+
+    The method rests entirely on ORTHOGONALITY -- each factor ON in half the
+    runs, and every PAIR of factors balanced across those halves. If that
+    breaks, the difference of means stops isolating one factor and silently
+    starts measuring a blend of several, with no symptom at all: the table
+    still prints, the numbers still look like effects, and they are wrong.
+    """
+    section("plackett-burman: design properties")
+    from pb_screen import pb_design, effects
+
+    for nf, want_n in ((5, 12), (8, 12), (11, 12), (12, 20), (15, 20)):
+        design, n = pb_design(nf)
+        check(f"{nf} factors -> N={want_n}", n == want_n, f"got {n}")
+        check(f"N={n}: one row per run", len(design) == n, f"got {len(design)}")
+        check(f"N={n}: every row covers every factor",
+              all(len(r) == nf for r in design), "ragged design matrix")
+        cols = [[design[r][c] for r in range(n)] for c in range(nf)]
+        check(f"N={n}: every factor ON in exactly half the runs",
+              all(sum(c) == n // 2 for c in cols),
+              f"ON counts {sorted({sum(c) for c in cols})}, want {n//2}")
+        # THE property. Without pairwise balance the main effects are
+        # confounded with EACH OTHER, not merely with interactions, and the
+        # whole screen is void.
+        bad = [(i, j) for i in range(nf) for j in range(i + 1, nf)
+               if sum(1 for r in range(n)
+                      if design[r][i] and design[r][j]) != n // 4]
+        check(f"N={n}: every PAIR of factors is balanced", not bad,
+              f"{len(bad)} unbalanced pairs, e.g. {bad[:3]}")
+        check(f"N={n}: exactly one all-off row",
+              sum(1 for r in design if not any(r)) == 1,
+              "the all-off row anchors the design to the stock config")
+        check(f"N={n}: no row turns everything on",
+              not any(all(r) for r in design),
+              "an all-on row is the YOLO experiment, not a screen")
+        check(f"N={n}: no two rows identical",
+              len({tuple(r) for r in design}) == n, "a repeated row wastes a launch")
+
+    check("more factors than the largest design raises",
+          raises(lambda: pb_design(64)),
+          "must refuse rather than silently screen a truncated factor set")
+
+    section("plackett-burman: recovers known effects")
+    import random
+    TRUTH = {"a": 35.0, "b": 20.0, "c": -12.0, "d": -8.0, "e": 2.0, "f": 0.0}
+    names = list(TRUTH)
+    fs = [{"id": k} for k in names]
+    design, _ = pb_design(len(names))
+    clean = [40.0 + sum(TRUTH[names[c]] for c in range(len(names)) if row[c])
+             for row in design]
+
+    # Noise-free, an orthogonal design must recover every effect EXACTLY.
+    got = {x["id"]: x["effect"] for x in effects(design, fs, clean)}
+    worst = max(abs(got[k] - TRUTH[k]) for k in TRUTH)
+    check("noise-free recovery is exact", worst < 1e-9,
+          f"largest error {worst:.6g} -- design is not orthogonal")
+    check("a truly dead factor reads as zero", abs(got["f"]) < 1e-9,
+          f"got {got['f']}")
+    check("effects are returned largest-magnitude first",
+          [x["id"] for x in effects(design, fs, clean)]
+          == sorted(TRUTH, key=lambda k: -abs(TRUTH[k])),
+          "the ranking IS the output of a screen")
+
+    # At the across-launch spread we actually measured (~5%), the RANKING must
+    # survive, which is all a screen is asked for.
+    rng = random.Random(0)
+    noisy = [g * (1 + rng.gauss(0, 0.05)) for g in clean]
+    order = [x["id"] for x in effects(design, fs, noisy)]
+    check("under 5% noise the two largest effects still rank first",
+          set(order[:2]) == {"a", "b"}, f"got {order}")
+    small = [x for x in effects(design, fs, noisy) if x["id"] in ("e", "f")]
+    check("under noise, small effects land inside their own error bars",
+          all(abs(x["effect"]) < 2 * x["se"] for x in small),
+          "a screen that calls a 2-unit effect resolved at 5% noise is lying")
+
+    # A launch that died must not be scored as zero goodput -- that would
+    # fabricate an enormous negative effect for every factor ON in that row.
+    holed = list(clean); holed[3] = None
+    e = effects(design, fs, holed)
+    check("a failed row is dropped, not counted as zero",
+          all(x["n_on"] + x["n_off"] == len(design) - 1 for x in e),
+          f"row counts {[(x['n_on'], x['n_off']) for x in e][:3]}")
+    check("effects stay roughly right with one row missing",
+          max(abs(x["effect"] - TRUTH[x["id"]]) for x in e) < 12.0,
+          "one lost row should perturb, not destroy, the screen")
+
+    allgone = effects(design, fs, [None] * len(design))
+    check("every row failing does not crash the screen", len(allgone) == len(fs))
+    check("every row failing yields no effect at all",
+          all(x["effect"] is None for x in allgone),
+          "no data must read as unknown, never as zero")
+
+    # The error bar is not decoration: it is what separates "RESOLVED" from
+    # "inside the noise", which is the entire output of a screen. Two mutants
+    # survived the checks above -- dropping the sqrt (reporting a variance as
+    # if it were a standard error) and computing the spread from only one of
+    # the two groups. Both make the screen over-confident, and neither shows
+    # up as anything but a slightly different number.
+    section("plackett-burman: the error bar itself")
+    base = [40.0 + (17.0 if row[0] else 0.0) + (3.0 if row[1] else 0.0)
+            for row in design]
+    jitter = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 1.5, -1.5, 0.25, -0.25, 3.0, -3.0]
+    obs = [b + j for b, j in zip(base, jitter)]
+    e0 = {x["id"]: x for x in effects(design, fs, obs)}["a"]
+
+    # A standard error carries the same units as the effect. Scale every
+    # goodput by k and both must scale by k -- a variance would scale by k*k.
+    e2 = {x["id"]: x for x in effects(design, fs, [v * 3 for v in obs])}["a"]
+    check("se scales linearly with the data, like the effect does",
+          abs(e2["se"] - 3 * e0["se"]) < 1e-9,
+          f"se {e0['se']:.4f} -> {e2['se']:.4f}; x9 means a variance is being "
+          f"reported as a standard error")
+    check("effect scales linearly too", abs(e2["effect"] - 3 * e0["effect"]) < 1e-9)
+
+    # Both groups contribute. Widen ONLY the off rows: the error on the
+    # difference must grow, or the off group is being ignored.
+    wide = [v + (8.0 if (i % 2 and not design[i][0]) else 0.0)
+            for i, v in enumerate(obs)]
+    ew = {x["id"]: x for x in effects(design, fs, wide)}["a"]
+    check("noise in the OFF group alone still widens the error bar",
+          ew["se"] > e0["se"] + 1e-9,
+          f"se {e0['se']:.4f} -> {ew['se']:.4f}; the off group is not counted")
+
+    won = [v + (8.0 if (i % 2 and design[i][0]) else 0.0)
+           for i, v in enumerate(obs)]
+    en = {x["id"]: x for x in effects(design, fs, won)}["a"]
+    check("noise in the ON group alone still widens the error bar",
+          en["se"] > e0["se"] + 1e-9,
+          f"se {e0['se']:.4f} -> {en['se']:.4f}; the ON group is not counted")
+
+    # And more runs at the same spread must shrink it.
+    d20, _ = pb_design(15)
+    f20 = [{"id": f"x{i}"} for i in range(15)]
+    mk = lambda dd: [40.0 + (17.0 if r[0] else 0.0) + (1.0 if i % 2 else -1.0)
+                     for i, r in enumerate(dd)]
+    s12 = {x["id"]: x for x in effects(design, fs, mk(design))}["a"]["se"]
+    s20 = {x["id"]: x for x in effects(d20, f20, mk(d20))}["x0"]["se"]
+    check("more runs at the same spread give a tighter error bar", s20 < s12,
+          f"N=12 se {s12:.4f} vs N=20 se {s20:.4f} -- averaging is not helping")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -548,7 +691,7 @@ def test_reachability():
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
-               test_trial_axes, test_frontier, test_dag_file,
+               test_trial_axes, test_frontier, test_pb_design, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
