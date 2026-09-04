@@ -75,8 +75,12 @@ def trav_rows(rel: str) -> tuple[list[dict], dict]:
     for t in src:
         gp = t.get("goodput") or 0
         q = t.get("quality") or {}
+        c = t.get("config") or {}
+        qz, qb = c.get("quantize"), c.get("quantize_bits")
+        variant = (f"{qz}@{qb}" if qz and qb else qz) or ""
         rows.append({
-            "label": t["node_id"], "kept": t.get("kept", False),
+            "label": t["node_id"], "variant": variant, "kept": t.get("kept", False),
+            "slo_ok": t.get("slo_ok", True),
             "acc": q.get("math_500"), "inherited": t.get("quality_inherited", False),
             "goodput": gp, "ttft": t.get("ttft_p99_ms") or 0,
             "itl": t.get("itl_p99_ms") or 0, "mem": t.get("memory_gb") or 0,
@@ -181,7 +185,51 @@ def main() -> int:
         "MATH-500 accuracy is unchanged across every lossless step on both "
         "models, and across most lossy steps. The one real loss found — NVFP4 at "
         "−0.0253 — was only resolvable at n=500.",
+        "The MoE's lossy search took it from 35.8 to 524.3 tok/s, 14.6x, on "
+        "NVFP4 weights over an FP8 KV cache, at 17 GB instead of 61.1 GB. This "
+        "is the largest gain recorded in any experiment here, and it carries "
+        "three caveats that are set out with the result rather than in a "
+        "footnote — an unconfirmed accuracy reading, a TTFT p99 that misses the "
+        "SLO, and one variant that never loaded.",
+        "THE SEARCH IS PATH-DEPENDENT, and this is now demonstrated rather than "
+        "suspected. Two lossless traversals of the same model, hardware, trace "
+        "and SLO reached different answers: runs/moe-lossless-2 KEPT prefix "
+        "caching and finished at 66.6 tok/s, while runs/moe-lossy-2 REVERTED it "
+        "at −22.9% and finished its lossless stage at 50.9. A greedy walk that "
+        "decides each node against a single measurement inherits that "
+        "measurement's noise for the rest of the run.",
     ])
+
+    # ------------------------------------------------------------- coverage
+    doc.add_heading("What has and has not been run", 1)
+    para(doc,
+         "A dash means the experiment was not performed, not that it produced "
+         "nothing. The two models have NOT had the same treatment, and reading "
+         "any comparison below without this table will overstate what is known.")
+    table(doc, ["experiment", "instrument", "Qwen3-14B", "Qwen3-30B-A3B"], [
+        ["lossless search", "traversal, swept",
+         "runs/ninth — 10 launches", "runs/moe-lossless-2 — 12 launches\n"
+         "runs/moe-lossy-2 — repeated, and DISAGREED"],
+        ["lossy search (weights)", "traversal, swept",
+         "-  never run: every 14B traversal used --lossless-only, which parks "
+         "the whole lossy branch",
+         "runs/moe-lossy-2 — 21 launches, all four variants"],
+        ["lossy ladder, MATH-500", "ladder, pinned L=30",
+         "7 rungs: stock, lossless, fp8, autoquant@6.0, autoquant@5.15, nvfp4, "
+         "w4a16", "-  not run"],
+        ["lossy ladder, MBPP+", "ladder, pinned L=30", "7 rungs", "-  not run"],
+        ["n=500 confirmation", "ladder, pinned L=30",
+         "stock and nvfp4 only", "-  not run"],
+        ["stock reference", "ladder, pinned",
+         "runs/quantize/q_stock", "runs/moe-stock — ONE point at L=8, not a sweep"],
+    ], widths=[1.15, 1.0, 2.0, 2.2])
+    para(doc,
+         "The asymmetry matters in one direction especially: the 14B's lossy "
+         "numbers come from the LADDER, which pins the operating point, while "
+         "the MoE's come from the TRAVERSAL, which sweeps it. A 14B lossy row "
+         "and a MoE lossy row are therefore not comparable, and the MoE numbers "
+         "are the more favourable instrument. Closing that gap needs one 14B "
+         "traversal run without --lossless-only.", size=9.5, italic=True)
 
     # ------------------------------------------------------------- setup
     doc.add_heading("What was measured", 1)
@@ -249,7 +297,9 @@ def main() -> int:
         base = rows[0]["goodput"]
         table(doc, ["node", "kept", "goodput\ntok/s", "vs seed", "TTFT p99",
                     "ITL p99", "mem GB", "L", "replicas", "MATH-500"],
-              [[r["label"], "KEEP" if r["kept"] else "revert", f(r["goodput"]),
+              [[r["label"],
+                "seed" if r["label"].startswith("stage_1_3") else
+                ("KEEP" if r["kept"] else "revert"), f(r["goodput"]),
                 f(r["goodput"] / base - 1 if base else None, "{:+.1%}"),
                 f(r["ttft"], "{:.0f}ms"), f(r["itl"], "{:.0f}ms"), f(r["mem"]),
                 r["L"], r["replicas"],
@@ -375,6 +425,87 @@ def main() -> int:
              "the whole curve — which is why the operating point follows the "
              "incumbent through the search.", size=9.5)
 
+    # ------------------------------------------------------- MoE lossy
+    doc.add_page_break()
+    doc.add_heading("Experiment 5 — Qwen3-30B-A3B (MoE), lossy search", 1)
+    lrows, lmeta = trav_rows("runs/moe-lossy-2")
+    if lrows:
+        para(doc, f"run.py optimize, swept, {lmeta.get('launches','?')} launches, "
+                  f"{lmeta.get('minutes',0):.0f} minutes. The first traversal on "
+                  f"either model to run the lossy branch.", size=9.5, italic=True)
+        lbase = lrows[0]["goodput"]
+        table(doc, ["node", "variant", "kept", "goodput\ntok/s", "vs seed",
+                    "TTFT p99", "ITL p99", "L", "replicas", "MATH-500"],
+              [[r["label"], r.get("variant") or "-",
+                "seed" if r["label"].startswith("stage_1_3") else
+                ("KEEP" if r["kept"] else
+                 ("FAILED" if not r["goodput"] else "revert")),
+                f(r["goodput"]) if r["goodput"] else "-",
+                f(r["goodput"] / lbase - 1 if lbase and r["goodput"] else None, "{:+.1%}"),
+                f(r["ttft"], "{:.0f}ms") if r["goodput"] else "-",
+                f(r["itl"], "{:.0f}ms") if r["goodput"] else "-",
+                r["L"] or "-", r["replicas"] or "-",
+                ((f(r["acc"], "{:.4f}") + ("~" if r["inherited"] else ""))
+                 if r["goodput"] else "-")]
+               for r in lrows],
+              widths=[1.3, .62, .48, .58, .55, .55, .5, .28, .55, .6])
+
+        para(doc, "")
+        para(doc, "The four weight variants, ranked", bold=True)
+        wq = [r for r in lrows if r["label"] == "weight_autoquantize"]
+        table(doc, ["variant", "goodput tok/s", "vs KV-quantized incumbent",
+                    "L", "TTFT p99", "MATH-500", "artifact"],
+              [[r.get("variant") or "-",
+                f(r["goodput"]) if r["goodput"] else "FAILED TO LOAD",
+                f(r["goodput"] / 59.4 - 1 if r["goodput"] else None, "{:+.1%}"),
+                r["L"] or "-", f(r["ttft"], "{:.0f}ms") if r["goodput"] else "-",
+                f(r["acc"], "{:.4f}"),
+                {"nvfp4": "17 GB", "w4a16": "17 GB", "autoquant@5.0": "19 GB",
+                 "autoquant@6.0": "22 GB"}.get(r.get("variant"), "-")]
+               for r in wq],
+              widths=[.95, .95, 1.35, .3, .7, .7, .6])
+        para(doc,
+             "NVFP4 wins by a wide margin and is also the smallest artifact. The "
+             "ordering is monotone in aggression — 4-bit beats 5-bit beats 6-bit "
+             "— which is what a memory-bandwidth-bound decode predicts, since "
+             "every bit removed from the weights is bandwidth returned.", size=9.5)
+
+        para(doc, "")
+        para(doc, "Three cautions on the headline number", bold=True)
+        bullets(doc, [
+            "MATH-500 reads 0.7600 for NVFP4 against 0.7000 for the seed. "
+            "Accuracy IMPROVING under 4-bit quantization is not a credible "
+            "result; on the 14B the same variant LOST 0.0253, and that loss was "
+            "only resolvable at n=500. This figure is at the traversal's default "
+            "sample size and should be treated as unconfirmed until re-run at "
+            "n=500.",
+            "TTFT p99 is 568.9 ms against a 500 ms target. The configuration is "
+            "kept because goodput counts only conforming requests and SLO "
+            "attainment is 95%, but the p99 itself MISSES. Anyone reading "
+            "\"524 tok/s\" as unconditional capacity would be wrong.",
+            "autoquant@6.0 never loaded. Its checkpoint declares "
+            "MIXED_PRECISION, which the backend reconciliation treats as "
+            "NVFP4-family and switches to marlin; vLLM then rejects marlin "
+            "because at a 6.0-bit budget the MoE layers were left unquantized. "
+            "autoquant@5.0, also MIXED_PRECISION, quantizes them and loads "
+            "fine — so the checkpoint's declared algorithm does not determine "
+            "what the MoE layers actually are, and the reconciliation is reading "
+            "the wrong field.",
+        ])
+
+        para(doc, "")
+        para(doc, "Two nodes that have never produced a measurement", bold=True)
+        para(doc,
+             "retune_batching_after_kv and retune_batching_after_weight failed "
+             "all four times they were attempted, in this run and in every run "
+             "before it. The cause is not the model: dag/llm.json computes "
+             "max_num_seqs as incumbent.max_num_seqs * 1.5 and * 2.0, which "
+             "yields 384.0 and 512.0, and vLLM's --max-num-seqs takes an int. "
+             "The launches die during argument parsing, before any weights are "
+             "read. Four launches per lossy run have been spent on this, and "
+             "the two nodes have contributed nothing to any result on record.",
+             size=9.5)
+
     # ------------------------------------------------------------- frontier
     doc.add_heading("Pareto frontiers", 1)
     para(doc,
@@ -383,7 +514,9 @@ def main() -> int:
          "someone may want — \"less goodput, better latency\" is a trade, not a "
          "failure. Axes: goodput (max), quality (max), TTFT p99 (min), memory (min).")
     for name, rel, node in (("Qwen3-14B (lossless search)", "runs/ninth", None),
-                            ("Qwen3-30B-A3B (lossless search)", "runs/moe-lossless-2", None)):
+                            ("Qwen3-30B-A3B (lossless search)", "runs/moe-lossless-2", None),
+                            ("Qwen3-30B-A3B (lossless + lossy search)",
+                             "runs/moe-lossy-2", None)):
         f_ = ROOT / rel / "result.json"
         if not f_.exists():
             continue
@@ -471,6 +604,17 @@ def main() -> int:
         "All results are single-GPU on GB10 with UNIFIED memory, where "
         "gpu_memory_utilization is a fraction of system RAM the CPU also "
         "competes for. NVFP4 requires Blackwell and will not load on H100.",
+        "Two lossless traversals of the MoE disagree. Seed goodput was measured "
+        "at 29.7 in one run and 35.8 in the other — a 20% gap between supposedly "
+        "identical starting points — and the walks then diverged on prefix "
+        "caching. Neither run is wrong; the walk simply resolves keep/revert at "
+        "a 5% band against across-launch spread that is itself around 5%. Any "
+        "single traversal result should be read as one sample, not as the "
+        "configuration's answer.",
+        "The 14B and MoE lossy numbers were produced by DIFFERENT INSTRUMENTS "
+        "and must not be tabulated against each other. See the coverage table: "
+        "the 14B rows are ladder rows pinned at L=30, the MoE rows are traversal "
+        "rows measured at their own swept peak.",
         "Quality was measured at concurrency 32. Batch composition changes the "
         "floating-point reduction order in attention and GEMM accumulation, "
         "which is the leading cause of verdict flips between identical runs; the "
