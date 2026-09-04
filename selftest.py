@@ -513,6 +513,61 @@ def main() -> int:
     finally:
         ev.STALL_S, ev.LAUNCH_TIMEOUT_S = orig_stall, orig_to
 
+    # ==================================================================
+    # A DEFAULT MUST BE VALID FOR THE ARTIFACT IT LANDS ON.
+    #
+    # The check below this one asserts moe_backend=triton IS SET for a MoE on
+    # sm12x. That is a tautology -- it sets triton, then confirms triton was
+    # set -- and it passed while an 18-hour run built a 23 GB artifact that
+    # could not load:
+    #
+    #   ValueError: moe_backend='triton' is not supported for NvFP4 MoE.
+    #
+    # This one tests a PROPERTY instead, against vLLM's own list rather than a
+    # copy of it: whatever config we would serve for a quantized artifact must
+    # use a backend vLLM accepts for that artifact's quant_algo.
+    # ==================================================================
+    print("\n=== the served config is valid for the artifact it loads ===")
+    from evaluator import (_artifact_quant_algo, _nvfp4_moe_backends,
+                           reconcile_moe_backend)
+    valid = _nvfp4_moe_backends()
+    check("vLLM's NvFP4 MoE backend list is readable", bool(valid),
+          "cannot verify our config against it; the list moved or the import "
+          "path changed")
+    check("triton is NOT among them -- the assumption that broke an 18h run",
+          "triton" not in valid, f"got {sorted(valid)}")
+
+    # THE PATH THAT ACTUALLY RUNS. Checking hardware_defaults alone is a
+    # tautology: it sets triton, so asserting triton is set proves nothing. What
+    # matters is the config _serve finally hands to vLLM, so that is what is
+    # exercised here.
+    quantized = [p for p in sorted(Path("artifacts").glob("*--*"))
+                 if _artifact_quant_algo(str(p))]
+    check("there is at least one quantized artifact to test against",
+          bool(quantized), "cannot verify the reconciliation without one")
+    for art in quantized:
+        algo = _artifact_quant_algo(str(art))
+        cfg = reconcile_moe_backend(
+            {"moe_backend": "triton", "model": str(art)}, log=lambda *a: None)
+        needs_fix = "NVFP4" in algo.upper() or algo == "MIXED_PRECISION"
+        if needs_fix:
+            check(f"{art.name}: triton corrected for {algo}",
+                  cfg["moe_backend"] in valid,
+                  f"still {cfg['moe_backend']!r}; vLLM accepts {sorted(valid)} "
+                  f"and would raise at engine init AFTER the artifact was built")
+        else:
+            check(f"{art.name}: {algo} left alone",
+                  cfg["moe_backend"] == "triton", f"got {cfg['moe_backend']!r}")
+
+    # An UNQUANTIZED MoE must keep triton -- that is the whole reason the
+    # default exists, and "fixing" it everywhere would reintroduce the 88-minute
+    # FlashInfer CUTLASS JIT hang.
+    cfg = reconcile_moe_backend({"moe_backend": "triton",
+                                 "model": "Qwen/Qwen3-30B-A3B"},
+                                log=lambda *a: None)
+    check("an unquantized MoE keeps triton", cfg["moe_backend"] == "triton",
+          f"got {cfg['moe_backend']!r} -- this is what avoids the sm120 JIT hang")
+
     print("\n=== MoE on sm12x avoids FlashInfer's CUTLASS JIT ===")
     from run import seed_config as _seed
     # EVERY launch path, not just the traversal. moe_backend was set only in

@@ -151,6 +151,72 @@ def vllm_cmd() -> list[str]:
         f"somewhere unusual.")
 
 
+def _artifact_quant_algo(path: str) -> str | None:
+    """quant_algo an artifact declares, or None if it is not one of ours.
+
+    hf_quant_config.json is written last by the producer, so its presence also
+    means the export finished."""
+    try:
+        f = Path(path) / "hf_quant_config.json"
+        if not f.exists():
+            return None
+        return (json.loads(f.read_text()).get("quantization") or {}).get("quant_algo")
+    except Exception:
+        return None
+
+
+def _nvfp4_moe_backends() -> set[str]:
+    """The backends vLLM ITSELF accepts for an NvFP4 MoE, read from its source.
+
+    Read rather than copied: the list moves between releases, and a copy would
+    silently go stale in exactly the way that produces a 3am ValueError."""
+    try:
+        import inspect, re
+        from vllm.model_executor.layers.fused_moe.oracle import nvfp4 as _n
+        return set(re.findall(r'"(\w+)":', inspect.getsource(_n.map_nvfp4_backend)))
+    except Exception:
+        return set()
+
+
+def reconcile_moe_backend(config: dict, *, log=print) -> dict:
+    """Correct a moe_backend that is invalid for the artifact being served.
+
+    A pure function on the config, called by _serve, so it can be tested without
+    a GPU -- the reason this exists as a function and not four lines inline.
+
+    hardware_defaults sets moe_backend=triton for a MoE on sm12x, because
+    FlashInfer's sm120 CUTLASS path JIT-compiles for hours on an UNQUANTIZED
+    MoE. vLLM then refuses triton for a QUANTIZED NvFP4 MoE:
+
+        ValueError: moe_backend='triton' is not supported for NvFP4 MoE.
+        Expected one of ['cutlass', 'flashinfer_trtllm', ... 'marlin', ...]
+
+    The two requirements genuinely conflict, and hardware_defaults cannot
+    resolve it: it derives from the fingerprint and cannot know a quantized
+    artifact will be loaded. This is the first point that knows both.
+
+    Cost of not doing this: an 18-hour run built a 23 GB artifact, failed to
+    load it, and had three more conversions queued that would each fail the
+    same way. marlin is preferred because it is the path vLLM itself falls back
+    to for W4A16_NVFP4, and unlike cutlass it does not JIT for sm120.
+    """
+    mb, model = config.get("moe_backend"), config.get("model")
+    if not mb or not model:
+        return config
+    algo = _artifact_quant_algo(model)
+    if not algo:
+        return config
+    if "NVFP4" not in algo.upper() and algo != "MIXED_PRECISION":
+        return config
+    ok = _nvfp4_moe_backends()
+    if not ok or mb in ok:
+        return config
+    config["moe_backend"] = "marlin" if "marlin" in ok else sorted(ok)[0]
+    log(f"        moe_backend {mb!r} is invalid for a {algo} MoE; "
+        f"using {config['moe_backend']!r}")
+    return config
+
+
 def hardware_defaults(fp) -> dict:
     """Flags this (model, GPU) pair REQUIRES to run at all, not tuning choices.
 
@@ -587,6 +653,8 @@ class VllmEvaluator:
                 config["model"] = path
             else:
                 config["quantization"] = kind      # fp8: a load-time flag
+
+        reconcile_moe_backend(config, log=self.log)
 
         model = config.get("model") or self.fp.model.id
         # THE FLAG CHECK MUST NOT DISABLE ITSELF. It used to fall back to "[]"
