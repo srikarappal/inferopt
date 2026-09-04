@@ -604,10 +604,10 @@
       },
       "sweep": [
         {
-          "max_num_seqs": "incumbent.max_num_seqs * 1.5"
+          "max_num_seqs": "int(incumbent.max_num_seqs * 1.5)"
         },
         {
-          "max_num_seqs": "incumbent.max_num_seqs * 2.0"
+          "max_num_seqs": "int(incumbent.max_num_seqs * 2.0)"
         }
       ],
       "probes": [
@@ -726,10 +726,10 @@
       },
       "sweep": [
         {
-          "max_num_seqs": "incumbent.max_num_seqs * 1.5"
+          "max_num_seqs": "int(incumbent.max_num_seqs * 1.5)"
         },
         {
-          "max_num_seqs": "incumbent.max_num_seqs * 2.0"
+          "max_num_seqs": "int(incumbent.max_num_seqs * 2.0)"
         }
       ],
       "probes": [

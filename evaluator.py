@@ -165,17 +165,75 @@ def _artifact_quant_algo(path: str) -> str | None:
         return None
 
 
-def _nvfp4_moe_backends() -> set[str]:
-    """The backends vLLM ITSELF accepts for an NvFP4 MoE, read from its source.
+def moe_expert_state(path: str) -> str:
+    """Whether the MoE EXPERT layers in an artifact are quantized: full/none/mixed.
 
-    Read rather than copied: the list moves between releases, and a copy would
-    silently go stale in exactly the way that produces a 3am ValueError."""
+    The declared quant_algo does not answer this, and assuming it does is what
+    broke autoquant@6.0. That checkpoint declares MIXED_PRECISION, exactly like
+    autoquant@5.0, and the two behave differently: at a 5.0-bit budget all 48
+    expert layers are quantized, at 6.0 only 45 are, because the search had bits
+    to spare and left three MoE layers in bf16. vLLM then rejects marlin with
+    "not supported for unquantized MoE" -- while still rejecting triton for the
+    other 45. A partly-quantized MoE is a THIRD state, and reading one top-level
+    string cannot distinguish it.
+
+    The evidence used is quantized_layers, which MIXED_PRECISION checkpoints
+    carry: a layer present in that map but with no `.experts` entry has had its
+    attention quantized and its experts left alone. Single-format checkpoints
+    (NVFP4, W4A16_NVFP4) carry no such map, and for them the declared algorithm
+    IS the whole truth.
+    """
     try:
-        import inspect, re
-        from vllm.model_executor.layers.fused_moe.oracle import nvfp4 as _n
-        return set(re.findall(r'"(\w+)":', inspect.getsource(_n.map_nvfp4_backend)))
+        f = Path(path) / "hf_quant_config.json"
+        if not f.exists():
+            return "unknown"
+        q = (json.loads(f.read_text()).get("quantization") or {})
+        algo = (q.get("quant_algo") or "").upper()
+        ql = q.get("quantized_layers") or {}
+        if not ql:
+            return "full" if "NVFP4" in algo else "none"
+        import re as _re
+        seen, with_experts = set(), set()
+        for k in ql:
+            m = _re.match(r"model\.layers\.(\d+)\.", k)
+            if not m:
+                continue
+            seen.add(m.group(1))
+            if ".experts" in k:
+                with_experts.add(m.group(1))
+        if not seen:
+            return "unknown"
+        if not with_experts:
+            return "none"
+        return "full" if with_experts == seen else "mixed"
+    except Exception:
+        return "unknown"
+
+
+def _moe_backends(kind: str) -> set[str]:
+    """Backends vLLM ITSELF accepts, read from its source rather than copied.
+
+    A copy goes stale between releases in exactly the way that produces a 3am
+    ValueError. `kind` is "nvfp4" or "unquantized"."""
+    try:
+        import importlib
+        import inspect
+        import re
+        # importlib, not attribute access on the package: oracle/__init__ does
+        # not import every submodule, so `oracle.nvfp4` raised AttributeError
+        # and this returned an empty set -- which the caller reads as "no
+        # opinion" and skips the correction entirely. A silent empty set here
+        # reinstates the exact bug this function exists to prevent.
+        mod = importlib.import_module(
+            f"vllm.model_executor.layers.fused_moe.oracle.{kind}")
+        fn = getattr(mod, f"map_{kind}_backend")
+        return set(re.findall(r'"(\w+)":', inspect.getsource(fn)))
     except Exception:
         return set()
+
+
+def _nvfp4_moe_backends() -> set[str]:
+    return _moe_backends("nvfp4")
 
 
 def reconcile_moe_backend(config: dict, *, log=print) -> dict:
@@ -189,16 +247,28 @@ def reconcile_moe_backend(config: dict, *, log=print) -> dict:
     MoE. vLLM then refuses triton for a QUANTIZED NvFP4 MoE:
 
         ValueError: moe_backend='triton' is not supported for NvFP4 MoE.
-        Expected one of ['cutlass', 'flashinfer_trtllm', ... 'marlin', ...]
 
-    The two requirements genuinely conflict, and hardware_defaults cannot
-    resolve it: it derives from the fingerprint and cannot know a quantized
-    artifact will be loaded. This is the first point that knows both.
+    hardware_defaults cannot resolve that: it derives from the fingerprint and
+    cannot know a quantized artifact will be loaded. This is the first point
+    that knows both. Cost of not doing it: an 18-hour run built a 23 GB artifact
+    it could not load, with three more conversions queued to fail the same way.
 
-    Cost of not doing this: an 18-hour run built a 23 GB artifact, failed to
-    load it, and had three more conversions queued that would each fail the
-    same way. marlin is preferred because it is the path vLLM itself falls back
-    to for W4A16_NVFP4, and unlike cutlass it does not JIT for sm120.
+    THERE ARE THREE STATES, NOT TWO. The first version of this function assumed
+    two -- quantized or not -- and switched anything NVFP4-family to marlin.
+    That fixed nvfp4 and w4a16 and BROKE autoquant@6.0, whose experts are only
+    partly quantized: marlin refuses the 3 unquantized expert layers and triton
+    refuses the other 45. The accepted sets for the two cases overlap in exactly
+    two backends, and a mixed checkpoint must use one of them:
+
+        quantized NVFP4   cutlass, flashinfer_*, marlin, humming, emulation
+        unquantized       aiter, flashinfer_cutlass, flashinfer_trtllm, triton
+        BOTH              flashinfer_cutlass, flashinfer_trtllm
+
+    flashinfer_trtllm is preferred over flashinfer_cutlass for the mixed case
+    for the same reason triton was chosen originally: the sm120 CUTLASS path
+    JIT-compiles for hours. marlin stays the choice for a fully quantized
+    checkpoint -- it is what vLLM itself falls back to for W4A16_NVFP4, and it
+    does not JIT on sm120.
     """
     mb, model = config.get("moe_backend"), config.get("model")
     if not mb or not model:
@@ -208,12 +278,33 @@ def reconcile_moe_backend(config: dict, *, log=print) -> dict:
         return config
     if "NVFP4" not in algo.upper() and algo != "MIXED_PRECISION":
         return config
-    ok = _nvfp4_moe_backends()
-    if not ok or mb in ok:
+
+    state = moe_expert_state(model)
+    if state in ("none", "unknown"):
+        # Experts are bf16, so the backend chosen for an unquantized MoE is
+        # already right. Switching here is what broke autoquant@6.0.
         return config
-    config["moe_backend"] = "marlin" if "marlin" in ok else sorted(ok)[0]
-    log(f"        moe_backend {mb!r} is invalid for a {algo} MoE; "
-        f"using {config['moe_backend']!r}")
+
+    if state == "mixed":
+        ok = _moe_backends("nvfp4") & _moe_backends("unquantized")
+        pref = ("flashinfer_trtllm", "flashinfer_cutlass")
+    else:
+        ok = _moe_backends("nvfp4")
+        pref = ("marlin",)
+    if not ok:
+        # Could not read vLLM's own accepted list. Say so: staying silent here
+        # looks identical to "the backend is fine", and the launch then dies
+        # minutes later with a ValueError that this function was written to
+        # prevent.
+        log(f"        WARNING: cannot read vLLM's accepted MoE backends; "
+            f"leaving moe_backend={mb!r} unchecked against a {algo} artifact")
+        return config
+    if mb in ok:
+        return config
+    choice = next((c for c in pref if c in ok), None) or sorted(ok)[0]
+    config["moe_backend"] = choice
+    log(f"        moe_backend {mb!r} is invalid for a {algo} MoE whose experts "
+        f"are {state}-quantized; using {choice!r}")
     return config
 
 
@@ -360,6 +451,29 @@ def installed_flags() -> set[str]:
     return _FLAGS
 
 
+# vLLM flags that take an int. A float here is not a rounding preference, it is
+# a launch failure: argparse rejects "512.0" for an int-typed argument and the
+# server exits during argument parsing, before it reads a single weight.
+#
+# This is not hypothetical. dag/llm.json computed max_num_seqs as
+# `incumbent.max_num_seqs * 1.5`, which is 384.0, and BOTH retune_batching
+# nodes died on every run they were ever applicable to -- four launches per
+# lossy run, contributing nothing, for as long as the nodes have existed. The
+# failure was invisible because a dead launch is recorded as goodput 0.0 and
+# reads like a configuration that simply did not help.
+#
+# The expressions are fixed at the source. This exists so the next one cannot
+# cost a launch: a count that arrives as a float is rounded, because a
+# fractional number of sequences has no meaning to round WRONG.
+_INT_FLAGS = frozenset({
+    "max_num_seqs", "max_num_batched_tokens", "max_model_len", "block_size",
+    "max_loras", "max_cpu_loras", "max_lora_rank", "num_speculative_tokens",
+    "prompt_lookup_max", "prompt_lookup_min", "tensor_parallel_size",
+    "pipeline_parallel_size", "max_num_partial_prefills", "swap_space",
+    "max_seq_len_to_capture", "seed",
+})
+
+
 def to_cli(cfg: dict) -> list[str]:
     args: list[str] = []
     for k, v in cfg.items():
@@ -370,6 +484,8 @@ def to_cli(cfg: dict) -> list[str]:
             args.append(flag if v else "--no-" + k.replace("_", "-"))
         elif isinstance(v, dict):
             args += [flag, json.dumps(v)]
+        elif isinstance(v, float) and k in _INT_FLAGS:
+            args += [flag, str(round(v))]
         else:
             args += [flag, str(v)]
     return args

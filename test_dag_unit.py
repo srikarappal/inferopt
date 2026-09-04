@@ -128,6 +128,13 @@ def test_predicates():
         check(f"check() accepts {gp!r}", not errs, f"reported {errs}")
 
 
+def _mk(td, name):
+    """An empty artifact directory under a temp dir."""
+    d = Path(td) / name
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
 def _ctx(**over):
     """A Context with a real fingerprint, cheap and offline."""
     from fingerprint import (Context, Fingerprint, HardwareFingerprint,
@@ -679,6 +686,177 @@ def test_replay():
 
 
 # ==========================================================================
+def test_moe_backend_and_int_flags():
+    """Two bugs that each cost real launches, and the guards against their class.
+
+    Both were invisible in the same way: a launch that dies during startup is
+    journalled as goodput 0.0, which is indistinguishable from a configuration
+    that simply did not help.
+    """
+    section("moe backend: the expert layers, not the declared algorithm")
+    import tempfile
+    from evaluator import (moe_expert_state, reconcile_moe_backend,
+                           _moe_backends, to_cli)
+
+    # vLLM's own lists. An empty set here is not a neutral result -- the caller
+    # reads it as "no opinion" and skips the correction, which is precisely the
+    # failure mode that let moe_backend=triton reach a quantized MoE.
+    q, u = _moe_backends("nvfp4"), _moe_backends("unquantized")
+    check("vLLM's NVFP4 backend list is readable", bool(q),
+          "empty means the reconciliation silently does nothing")
+    check("vLLM's unquantized backend list is readable", bool(u))
+    check("marlin is accepted for a quantized NVFP4 MoE", "marlin" in q, f"{sorted(q)}")
+    check("triton is accepted for an unquantized MoE", "triton" in u, f"{sorted(u)}")
+    check("the two lists overlap, so a MIXED checkpoint has a legal backend",
+          bool(q & u), "no backend serves both -- a mixed artifact is unservable")
+
+    def fixture(d, quantization):
+        (Path(d) / "hf_quant_config.json").write_text(
+            json.dumps({"quantization": quantization}))
+        return d
+
+    with tempfile.TemporaryDirectory() as td:
+        # Single-format: no quantized_layers map, the declared algo is the truth.
+        a = _mk(td, "nvfp4"); fixture(a, {"quant_algo": "NVFP4"})
+        check("a single-format NVFP4 artifact reads as fully quantized",
+              moe_expert_state(a) == "full", moe_expert_state(a))
+        b = _mk(td, "w4a16"); fixture(b, {"quant_algo": "W4A16_NVFP4"})
+        check("W4A16_NVFP4 also reads as fully quantized",
+              moe_expert_state(b) == "full", moe_expert_state(b))
+        c = _mk(td, "plain"); fixture(c, {"quant_algo": "FP8"})
+        check("a non-NVFP4 single-format artifact reads as unquantized experts",
+              moe_expert_state(c) == "none", moe_expert_state(c))
+
+        # MIXED_PRECISION: the map decides, and this is where the bug lived.
+        full = _mk(td, "mixed_full")
+        fixture(full, {"quant_algo": "MIXED_PRECISION", "quantized_layers": {
+            f"model.layers.{i}.self_attn.o_proj": {"quant_algo": "NVFP4"}
+            for i in range(4)} | {
+            f"model.layers.{i}.mlp.experts": {"quant_algo": "NVFP4"}
+            for i in range(4)}})
+        check("MIXED_PRECISION with every expert layer quantized reads full",
+              moe_expert_state(full) == "full", moe_expert_state(full))
+
+        mixed = _mk(td, "mixed_partial")
+        fixture(mixed, {"quant_algo": "MIXED_PRECISION", "quantized_layers": {
+            f"model.layers.{i}.self_attn.o_proj": {"quant_algo": "NVFP4"}
+            for i in range(4)} | {
+            f"model.layers.{i}.mlp.experts": {"quant_algo": "NVFP4"}
+            for i in range(3)}})           # layer 3's experts left in bf16
+        check("MIXED_PRECISION with ONE expert layer left out reads mixed",
+              moe_expert_state(mixed) == "mixed", moe_expert_state(mixed))
+
+        none = _mk(td, "attn_only")
+        fixture(none, {"quant_algo": "MIXED_PRECISION", "quantized_layers": {
+            f"model.layers.{i}.self_attn.o_proj": {"quant_algo": "NVFP4"}
+            for i in range(4)}})
+        check("MIXED_PRECISION touching no experts reads as unquantized experts",
+              moe_expert_state(none) == "none", moe_expert_state(none))
+
+        gone = _mk(td, "nothing")
+        check("an artifact with no quant config is unknown, not assumed",
+              moe_expert_state(gone) == "unknown", moe_expert_state(gone))
+
+        # The decision itself.
+        pick = lambda path: reconcile_moe_backend(
+            {"model": path, "moe_backend": "triton"}, log=lambda *_: None)["moe_backend"]
+        check("a fully quantized MoE moves off triton",
+              pick(full) != "triton" and pick(full) in q, pick(full))
+        check("a fully quantized MoE prefers marlin", pick(full) == "marlin", pick(full))
+        # THE REGRESSION. The first version switched this to marlin, and vLLM
+        # rejected it with "not supported for unquantized MoE".
+        check("a MIXED artifact gets a backend accepted by BOTH sides",
+              pick(mixed) in (q & u), f"{pick(mixed)} is not in {sorted(q & u)}")
+        check("a MIXED artifact is not sent to marlin", pick(mixed) != "marlin",
+              "marlin refuses the unquantized expert layers")
+        check("a MIXED artifact is not left on triton", pick(mixed) != "triton",
+              "triton refuses the quantized expert layers")
+        check("experts left unquantized keep the unquantized backend",
+              pick(none) == "triton", pick(none))
+        check("an unknown artifact is not touched", pick(gone) == "triton", pick(gone))
+        # With the preferred names removed, the fallback must STILL choose from
+        # the overlap. Picking from the NVFP4 list alone would return cutlass,
+        # which vLLM refuses for the unquantized expert layers -- the same class
+        # of failure as the original bug, one branch further down.
+        import evaluator as _ev
+        real = _ev._moe_backends
+        try:
+            _ev._moe_backends = lambda kind: (
+                {"cutlass", "marlin", "flashinfer_b12x", "humming"}
+                if kind == "nvfp4" else {"triton", "aiter", "humming"})
+            got = reconcile_moe_backend({"model": mixed, "moe_backend": "triton"},
+                                        log=lambda *_: None)["moe_backend"]
+            check("with no preferred backend available, mixed still picks from "
+                  "the overlap", got == "humming",
+                  f"got {got}; the overlap was {{'humming'}}")
+        finally:
+            _ev._moe_backends = real
+
+        check("a backend already valid is left alone",
+              reconcile_moe_backend({"model": full, "moe_backend": "marlin"},
+                                    log=lambda *_: None)["moe_backend"] == "marlin")
+        check("a config with no model is returned unchanged",
+              reconcile_moe_backend({"moe_backend": "triton"},
+                                    log=lambda *_: None)["moe_backend"] == "triton")
+
+    section("integer flags: a float is a launch failure, not a rounding style")
+    def flags(cfg):
+        """Parse to_cli output. Boolean flags are LONE tokens, so naive
+        zip(args[::2], args[1::2]) pairing silently misaligns everything after
+        the first bool -- which is how this test first failed against correct
+        code."""
+        a, out, i = to_cli(cfg), {}, 0
+        while i < len(a):
+            if i + 1 < len(a) and not a[i + 1].startswith("--"):
+                out[a[i]] = a[i + 1]; i += 2
+            else:
+                out[a[i]] = True; i += 1
+        return out
+
+    pair = flags({"max_num_seqs": 384.0, "max_num_batched_tokens": 512.0,
+                  "max_model_len": 7168, "gpu_memory_utilization": 0.75,
+                  "enforce_eager": False, "kv_cache_dtype": "fp8_e4m3"})
+    args = to_cli({"enforce_eager": False})
+    check("an integral float for an int flag is emitted without a decimal point",
+          pair.get("--max-num-seqs") == "384", pair.get("--max-num-seqs"))
+    check("...for every int flag, not just the one that broke",
+          pair.get("--max-num-batched-tokens") == "512",
+          pair.get("--max-num-batched-tokens"))
+    check("a non-integral float for an int flag is ROUNDED, not truncated",
+          flags({"max_num_seqs": 151.5})["--max-num-seqs"] == "152",
+          "truncation systematically under-shoots a swept count; "
+          "argparse rejects '151.5' and the server dies before loading weights")
+    check("a genuinely fractional flag keeps its decimal point",
+          pair.get("--gpu-memory-utilization") == "0.75",
+          pair.get("--gpu-memory-utilization"))
+    check("ints are untouched", pair.get("--max-model-len") == "7168")
+    check("booleans still use the --no- form", "--no-enforce-eager" in args)
+    check("strings are untouched", pair.get("--kv-cache-dtype") == "fp8_e4m3")
+
+    section("the DAG's own arithmetic yields integers")
+    d = json.loads(Path("dag/llm.json").read_text())
+    from predicates import Predicate
+    ctx = _ctx(incumbent={"max_num_seqs": 256})
+    bad = []
+    for n in d["nodes"]:
+        for sweep in (n.get("sweep") or []):
+            for k, v in sweep.items():
+                if k not in ("max_num_seqs", "max_num_batched_tokens",
+                             "max_model_len", "block_size"):
+                    continue
+                if not isinstance(v, str):
+                    continue
+                try:
+                    out = Predicate(v).evaluate(ctx)
+                except Exception:
+                    continue
+                if isinstance(out, float):
+                    bad.append((n["id"], k, v, out))
+    check("no sweep computes a float for an integer-valued knob", not bad,
+          f"{bad} -- vLLM's argparse rejects these and the launch dies")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -820,7 +998,8 @@ def test_reachability():
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
-               test_trial_axes, test_frontier, test_pb_design, test_replay, test_dag_file,
+               test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
+               test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

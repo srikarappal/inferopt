@@ -528,9 +528,14 @@ def main() -> int:
     # use a backend vLLM accepts for that artifact's quant_algo.
     # ==================================================================
     print("\n=== the served config is valid for the artifact it loads ===")
-    from evaluator import (_artifact_quant_algo, _nvfp4_moe_backends,
+    from evaluator import (_artifact_quant_algo, _moe_backends,
+                           _nvfp4_moe_backends, moe_expert_state,
                            reconcile_moe_backend)
     valid = _nvfp4_moe_backends()
+    unq = _moe_backends("unquantized")
+    check("vLLM's unquantized MoE backend list is readable", bool(unq))
+    check("the two lists overlap, so a partly-quantized MoE has a legal backend",
+          bool(valid & unq), "no backend serves both")
     check("vLLM's NvFP4 MoE backend list is readable", bool(valid),
           "cannot verify our config against it; the list moved or the import "
           "path changed")
@@ -545,19 +550,36 @@ def main() -> int:
                  if _artifact_quant_algo(str(p))]
     check("there is at least one quantized artifact to test against",
           bool(quantized), "cannot verify the reconciliation without one")
+    # THE DECLARED ALGORITHM DOES NOT DECIDE THIS. Two artifacts can both say
+    # MIXED_PRECISION and need different backends: autoquant@5.0 quantized all
+    # 48 expert layers, autoquant@6.0 had bits to spare and left 3 in bf16. The
+    # first wants marlin, the second is refused by marlin AND by triton. What
+    # the expert layers actually are is the only thing that answers it, so that
+    # is what this keys on.
     for art in quantized:
         algo = _artifact_quant_algo(str(art))
+        state = moe_expert_state(str(art))
         cfg = reconcile_moe_backend(
             {"moe_backend": "triton", "model": str(art)}, log=lambda *a: None)
-        needs_fix = "NVFP4" in algo.upper() or algo == "MIXED_PRECISION"
-        if needs_fix:
-            check(f"{art.name}: triton corrected for {algo}",
-                  cfg["moe_backend"] in valid,
-                  f"still {cfg['moe_backend']!r}; vLLM accepts {sorted(valid)} "
-                  f"and would raise at engine init AFTER the artifact was built")
+        got = cfg["moe_backend"]
+        if state == "full":
+            check(f"{art.name}: {algo}, experts fully quantized -> valid backend",
+                  got in valid,
+                  f"still {got!r}; vLLM accepts {sorted(valid)} and would raise "
+                  f"at engine init AFTER the artifact was built")
+        elif state == "mixed":
+            check(f"{art.name}: {algo}, experts PARTLY quantized -> backend "
+                  f"accepted by both sides",
+                  got in (valid & unq),
+                  f"got {got!r}; only {sorted(valid & unq)} serve a checkpoint "
+                  f"with both quantized and unquantized expert layers")
         else:
-            check(f"{art.name}: {algo} left alone",
-                  cfg["moe_backend"] == "triton", f"got {cfg['moe_backend']!r}")
+            # No quantized expert layers: either a dense model, where the MoE
+            # backend is not consulted at all, or a MoE whose experts were left
+            # alone, where triton is already the right answer. Correcting these
+            # is what broke autoquant@6.0.
+            check(f"{art.name}: {algo}, no quantized experts -> triton kept",
+                  got == "triton", f"got {got!r}")
 
     # An UNQUANTIZED MoE must keep triton -- that is the whole reason the
     # default exists, and "fixing" it everywhere would reintroduce the 88-minute
