@@ -421,7 +421,9 @@ def cmd_optimize(args) -> int:
                    journal=journal, baseline=baseline,
                    concurrency=operating_L,
                    fixed_concurrency=args.fixed_concurrency,
-                   provenance=stamp)
+                   provenance=stamp,
+                   force_benchmarks=(BASELINE_BENCHMARKS
+                                     if args.quality_every_node else None))
 
     # Full sweep on the finalists. The traversal ranks configs at one operating
     # point, which is enough to CHOOSE between them -- most goodput curves sit
@@ -507,6 +509,12 @@ def main() -> int:
     o.add_argument("--trace", required=True)
     o.add_argument("--ttft-p99", type=float, default=None)
     o.add_argument("--itl-p99", type=float, default=None)
+    o.add_argument("--quality-every-node", action="store_true",
+                   help="score the accuracy benchmark on EVERY config, not just "
+                        "the baseline and the lossy nodes. Slower, and needed "
+                        "for a method comparison: an inherited score is an "
+                        "assumption, and the comparison's claim is about the "
+                        "configs each method actually shipped.")
     o.add_argument("--qps", type=float, default=None,
                    help="arrival rate in requests/second. Overrides the rate "
                         "implied by the trace's arrival_ts, which is the "

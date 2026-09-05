@@ -247,7 +247,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              baseline: Trial | None = None,
              concurrency: int | None = None,
              fixed_concurrency: int | None = None,
-             provenance: dict | None = None) -> Result:
+             provenance: dict | None = None,
+             force_benchmarks: list[str] | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
 
     `journal` is a path to APPEND every Trial to as it completes; the caller
@@ -411,7 +412,14 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # --- measure every variant ---
         variants = _variants(node, incumbent_cfg, ctx)
         probes = node.get("probes", [])
-        benches = node.get("quality_benchmarks", [])
+        # Normally the node decides, and lossless nodes decide "none" -- they
+        # cannot move quality, the equivalence probe is a stronger check, and
+        # re-scoring costs minutes per node. force_benchmarks overrides that for
+        # a METHOD COMPARISON, where every config needs a measured accuracy
+        # coordinate rather than one inherited by assumption. It also turns
+        # "lossless cannot move quality" from a premise into a result.
+        benches = force_benchmarks if force_benchmarks is not None else \
+            node.get("quality_benchmarks", [])
         measured: list[Trial] = []
         for var in variants:
             # Crossing-prone nodes get extra concurrency levels. Everything

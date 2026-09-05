@@ -918,6 +918,99 @@ def test_qps_source():
 
 
 # ==========================================================================
+def test_methods_comparable():
+    """Three search methods must emit records that can be put in one table."""
+    section("methods: yolo's cells")
+    import tempfile
+    from pb_screen import pb_design
+
+    # yolo measures exactly two DISTINCT configs however many launches it makes.
+    # That is its defining property: cheapest possible, and unable to attribute
+    # a result to any single factor.
+    factors = [{"id": f"f{i}", "on": {f"flag{i}": True}} for i in range(6)]
+    base = {"model": "m", "gpu_memory_utilization": 0.9}
+    all_on = dict(base)
+    for f in factors:
+        all_on.update(f["on"])
+    check("all-on turns on every factor",
+          all(all_on.get(f"flag{i}") for i in range(6)), f"{all_on}")
+    check("all-off is exactly the seed", base == {"model": "m",
+                                                  "gpu_memory_utilization": 0.9})
+    check("yolo considers 2 configs regardless of factor count",
+          len({json.dumps(base, sort_keys=True),
+               json.dumps(all_on, sort_keys=True)}) == 2)
+
+    section("methods: PB stage 2 enumerates a full factorial")
+    # k survivors must give 2^k DISTINCT configs, each differing only in the
+    # varied factors -- the pinned background has to be identical across them
+    # or the factorial measures a moving target.
+    top = ["f0", "f2", "f4"]
+    pinned = {"f1": True, "f3": False, "f5": True}
+    by_id = {f["id"]: f for f in factors}
+    cfgs = []
+    for i in range(2 ** len(top)):
+        bits = [(i >> j) & 1 for j in range(len(top))]
+        c = dict(base)
+        for fid, on in pinned.items():
+            if on:
+                c.update(by_id[fid]["on"])
+        for fid, on in zip(top, bits):
+            if on:
+                c.update(by_id[fid]["on"])
+        cfgs.append(c)
+    check("2^k configs for k survivors", len(cfgs) == 8, f"{len(cfgs)}")
+    check("all 2^k are distinct",
+          len({json.dumps(c, sort_keys=True) for c in cfgs}) == 8)
+    check("the pinned background is identical in every cell",
+          all(c.get("flag1") and c.get("flag5") and "flag3" not in c for c in cfgs),
+          "a moving background confounds the factorial it exists to resolve")
+    check("one cell has none of the varied factors on",
+          any(not any(c.get(f"flag{f[1]}") for f in top) for c in cfgs),
+          "without it there is no anchor for the varied set")
+    check("one cell has all of them on",
+          any(all(c.get(f"flag{f[1]}") for f in top) for c in cfgs))
+
+    section("methods: compare.py reads every shape")
+    from compare import load, num, acc
+    check("num formats and falls back", num(1.234) == "1.2" and num(None) == "-")
+    check("num survives a bad type", num("x") == "-", "must not raise mid-table")
+    check("acc reads a benchmark out of a trial",
+          acc({"quality": {"math_500": 0.5}}, "math_500") == 0.5)
+    check("acc on a trial with no quality is None",
+          acc({}, "math_500") is None, "absence must not read as zero")
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "empty"; d.mkdir()
+        check("a directory with no result.json loads as None", load(d) is None)
+
+        # A traversal result.json -- the shape run.py writes -- must be mapped,
+        # not skipped, or every historical run drops out of the comparison.
+        d2 = Path(td) / "trav"; d2.mkdir()
+        (d2 / "result.json").write_text(json.dumps({
+            "baseline": {"node_id": "seed", "goodput": 10.0, "quality": {"math_500": 0.5}},
+            "trials": [{"node_id": "a", "goodput": 20.0, "kept": True,
+                        "quality": {"math_500": 0.6}},
+                       {"node_id": "b", "goodput": 0.0, "kept": False}],
+            "incumbent": {"config": {"x": 1}},
+            "incumbent_peak": {"goodput": 25.0, "concurrency": 8},
+            "launches": 3, "minutes": 30.0}))
+        r = load(d2)
+        check("a traversal is labelled seqDAG", r["method"] == "seqDAG", r["method"])
+        check("its shipped goodput comes from the peak sweep",
+              r["chosen"]["goodput"] == 25.0, f"{r['chosen']}")
+        check("its shipped ACCURACY comes from the last kept trial",
+              r["chosen"]["quality"]["math_500"] == 0.6,
+              "incumbent_peak carries no quality, so it must be sourced")
+        check("the seed is included as a trial",
+              any("seed" in str(t.get("node_id")) for t in r["trials"]),
+              "the baseline is the anchor every percentage is against")
+        check("failed launches are counted, not dropped",
+              r["failed_launches"] == 1, f"{r['failed_launches']}")
+        check("best_seen is the best MEASURED trial",
+              r["best_seen"]["goodput"] == 20.0, f"{r['best_seen']}")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -1060,7 +1153,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_dag_file,
+               test_qps_source, test_methods_comparable, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

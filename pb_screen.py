@@ -152,18 +152,25 @@ def main() -> int:
                          "within-launch, and the accept band is built on the "
                          "former, so repeated windows in one launch measure the "
                          "wrong noise.")
+    ap.add_argument("--survivors", type=int, default=3,
+                    help="factors carried into stage 2's full factorial. 2^k "
+                         "launches, so 3 costs 8 and 4 costs 16.")
+    ap.add_argument("--no-stage2", action="store_true",
+                    help="screen only. The screen RANKS factors; it does not "
+                         "choose a config, so without stage 2 this method has "
+                         "no answer to compare against the others.")
+    ap.add_argument("--qps", type=float, default=None,
+                    help="arrival rate; overrides the trace's arrival_ts")
+    ap.add_argument("--no-quality", action="store_true")
+    ap.add_argument("--benchmark", default="math_500")
     ap.add_argument("--gpu", default="0")
     ap.add_argument("--port", type=int, default=8300)
     a = ap.parse_args()
 
-    from evaluator import VllmEvaluator
-    from fingerprint import Context
-    from request import InferOptRequest, build_fingerprint
-    from run import free_port, seed_config
+    from methods import MethodRunner, setup
+    from run import seed_config
 
-    fp, slo = build_fingerprint(InferOptRequest(
-        model=a.model, trace=a.trace, ttft_p99_ms=a.ttft_p99, itl_p99_ms=a.itl_p99))
-    ctx = Context(fingerprint=fp, slo=slo)
+    fp, slo, ctx = setup(a.model, a.trace, a.ttft_p99, a.itl_p99, a.qps)
     dag = json.loads(Path(a.dag).read_text())
 
     base = seed_config(fp)              # all factors OFF, same seed the walk uses
@@ -193,10 +200,14 @@ def main() -> int:
     (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
     print(banner(meta, run_dir / "run_meta.json") + "\n")
 
-    ev = VllmEvaluator(fp, slo, a.trace, run_dir, gpu=a.gpu, port=free_port(a.port))
+    runner = MethodRunner("pb", fp, slo, a.trace, run_dir,
+                          gpu=a.gpu, port=a.port,
+                          benchmarks=[] if a.no_quality else [a.benchmark],
+                          quality_every=not a.no_quality, log=lambda *_: None)
     journal = run_dir / "rows.jsonl"
     journal.write_text("")
     results, t0 = [], time.time()
+    row_trials: list[list] = []
 
     for r, row in enumerate(design):
         cfg = dict(base)
@@ -206,17 +217,20 @@ def main() -> int:
         on = [factors[c]["id"] for c in range(len(factors)) if row[c]] or ["(none)"]
         print(f"  row {r+1:2d}/{len(design)}  +{(time.time()-t0)/60:5.1f}m  ON: "
               f"{', '.join(on)}")
-        got = []
+        got, ts = [], []
         for rep in range(a.repeats):
-            try:
-                t = ev.measure(cfg, probes=["goodput"], benchmarks=[],
-                               node_id=f"pb-row{r+1}-rep{rep+1}")
+            t = runner.measure(cfg, f"pb-row{r+1}-rep{rep+1}")
+            ts.append(t)
+            if t.goodput:
                 got.append(t.goodput)
                 print(f"            launch {rep+1}: {t.goodput:7.1f} tok/s  "
-                      f"ttft {t.ttft_p99_ms:5.0f}ms  L={t.concurrency}")
-            except Exception as e:
-                print(f"            launch {rep+1} FAILED: {type(e).__name__}: "
-                      f"{str(e)[:90]}")
+                      f"ttft {t.ttft_p99_ms:5.0f}ms  L={t.concurrency}"
+                      + (f"  math_500 {t.quality.get(a.benchmark):.4f}"
+                         if t.quality.get(a.benchmark) is not None else ""))
+            else:
+                err = (t.diagnostics or {}).get("launch_error", "no goodput")
+                print(f"            launch {rep+1} FAILED: {str(err)[:80]}")
+        row_trials.append(ts)
         val = statistics.fmean(got) if got else None
         results.append(val)
         with open(journal, "a") as fh:
@@ -245,22 +259,103 @@ def main() -> int:
 
     survivors = [x["id"] for x in eff if x.get("effect") is not None
                  and x["se"] and abs(x["effect"]) > 2 * x["se"]]
-    print(f"\n  STAGE 2: full factorial over the resolved factors, sweeping VALUES")
-    if survivors:
-        k = len(survivors[:4])
-        print(f"    factors {survivors[:4]}")
-        print(f"    {2**k} configs for the on/off factorial (interactions come out "
-              f"clean), plus a value sweep on any that carry a setting.")
-    else:
-        print(f"    nothing resolved above the noise. Either the techniques do not")
-        print(f"    help on this workload, or --repeats needs raising: one launch")
-        print(f"    per row leaves ~{noise:.1f} tok/s of spread on each mean.")
+    ranked = [x["id"] for x in eff if x.get("effect") is not None]
 
     (run_dir / "effects.json").write_text(json.dumps(
         {"factors": eff, "results": results, "survivors": survivors,
          "design": [[bool(x) for x in row] for row in design]},
         indent=2, default=str))
-    print(f"\n  wrote {run_dir}/effects.json and {journal}")
+
+    # ------------------------------------------------------------- stage 2
+    #
+    # A screen RANKS; it does not choose. Stopping here leaves this method with
+    # no config to compare against the walk's incumbent or yolo's winner, which
+    # is why stage 2 is not optional polish -- it is what turns a ranking into
+    # an answer.
+    #
+    # The factorial runs over the top-k factors with the rest PINNED. Pinning
+    # them off instead would change the background between stage 1 and stage 2
+    # and confound the very interactions this stage exists to resolve.
+    if a.no_stage2:
+        print(f"\n  STAGE 2 SKIPPED (--no-stage2). This run RANKS factors and "
+              f"ships nothing.")
+        runner.finish(chosen=None, extra={
+            "stage": 1, "factors": eff, "survivors": survivors,
+            "design": [[bool(x) for x in row] for row in design]})
+        return 0
+
+    top = (survivors or ranked)[:max(1, a.survivors)]
+    if not survivors:
+        print(f"\n  Nothing resolved above the noise, so stage 2 falls back to the "
+              f"{len(top)}\n  largest effects by magnitude. They may be noise; the "
+              f"factorial measures them\n  directly and does not inherit the "
+              f"screen's uncertainty.")
+
+    # Non-survivors are pinned to the level the screen preferred. That estimate
+    # is confounded -- a factor with a true effect near zero can have its sign
+    # flipped by an aliased interaction -- so the pinning is recorded and the
+    # all-off cell is measured alongside, giving stage 2 an anchor that does not
+    # depend on the screen being right.
+    pinned = {}
+    for x in eff:
+        if x["id"] in top or x.get("effect") is None:
+            continue
+        pinned[x["id"]] = x["effect"] > 0
+    by_id = {f["id"]: f for f in factors}
+
+    print(f"\n{'='*74}")
+    print(f"  STAGE 2: full factorial over {len(top)} factor(s) = {2**len(top)} configs")
+    print(f"    varying  {', '.join(top)}")
+    print(f"    pinned   " + (", ".join(
+        f"{k}={'on' if v else 'off'}" for k, v in pinned.items()) or "(none)"))
+    print(f"    Interactions among the varied factors come out clean here; the")
+    print(f"    screen could not separate them from main effects.\n")
+
+    s2 = []
+    for i in range(2 ** len(top)):
+        bits = [(i >> j) & 1 for j in range(len(top))]
+        cfg = dict(base)
+        for fid, on in pinned.items():
+            if on:
+                cfg.update(by_id[fid]["on"])
+        for fid, on in zip(top, bits):
+            if on:
+                cfg.update(by_id[fid]["on"])
+        on_names = [fid for fid, b in zip(top, bits) if b] or ["(none of the varied)"]
+        label = "s2-" + ("+".join(fid for fid, b in zip(top, bits) if b) or "pinned_only")
+        print(f"  {i+1:2d}/{2**len(top)}  {', '.join(on_names)}")
+        t = runner.measure(cfg, label)
+        if t.goodput:
+            print(f"        {t.goodput:8.1f} tok/s  L={t.concurrency}  "
+                  f"ttft {t.ttft_p99_ms:5.0f}ms"
+                  + (f"  math_500 {t.quality.get(a.benchmark):.4f}"
+                     if t.quality.get(a.benchmark) is not None else ""))
+        else:
+            print(f"        FAILED: "
+                  f"{str((t.diagnostics or {}).get('launch_error','no goodput'))[:70]}")
+        s2.append(t)
+
+    ok = [t for t in s2 if t.goodput]
+    chosen = max(ok, key=lambda t: t.goodput) if ok else None
+    print(f"\n{'='*74}")
+    if chosen:
+        seedgp = results[-1] if results else None
+        print(f"  PB ships {chosen.node_id}: {chosen.goodput:.1f} tok/s at "
+              f"L={chosen.concurrency}")
+        if seedgp:
+            print(f"  against an all-off row of {seedgp:.1f} tok/s "
+                  f"({chosen.goodput/seedgp - 1:+.1%})")
+    else:
+        print(f"  every stage 2 config failed to launch; PB ships nothing")
+
+    runner.finish(chosen=chosen, extra={
+        "stage": 2,
+        "factors": eff,
+        "survivors": survivors,
+        "varied": top,
+        "pinned": pinned,
+        "design": [[bool(x) for x in row] for row in design]})
+    print(f"  wrote {run_dir}/effects.json, {journal} and {run_dir}/result.json")
     print(f"  total {(time.time()-t0)/60:.0f} min\n")
     return 0
 
