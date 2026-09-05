@@ -59,8 +59,9 @@ def load(d: str | Path) -> dict | None:
         kept = [t for t in trials if t.get("kept")]
         q_ship = (kept[-1].get("quality") if kept else None) or \
                  ((base or {}).get("quality") or {})
+        ship_id = kept[-1].get("node_id") if kept else "stage_1_3 (seed)"
         if peak.get("goodput"):
-            chosen = {"node_id": "incumbent", "goodput": peak["goodput"],
+            chosen = {"node_id": ship_id, "goodput": peak["goodput"],
                       "concurrency": peak.get("concurrency"),
                       "ttft_p99_ms": peak.get("ttft_p99_ms"),
                       "itl_p99_ms": peak.get("itl_p99_ms"),
@@ -98,11 +99,162 @@ def acc(t, bench):
     return q.get(bench)
 
 
+# Axes for the joint frontier. Same directions the traversal uses, so a point
+# that is non-dominated here would be non-dominated inside a single run too.
+AXES = {"goodput": "max", "quality": "max", "ttft_p99_ms": "min"}
+
+
+def pareto(points: list[dict], axes: dict) -> list[int]:
+    """Indices of the non-dominated points over `axes`.
+
+    Computed across ALL methods pooled, which is the comparison worth having:
+    "who had the single highest goodput" rewards one lucky launch, while "whose
+    points survive against everyone else's" asks whether a method found trades
+    the others missed. A method can own several frontier points without ever
+    holding the top one.
+
+    A point missing any axis is dropped rather than defaulted. Filling a missing
+    accuracy with 0 would dominate nothing and be dominated by everything;
+    filling it with the baseline's score would assert a measurement nobody made.
+    """
+    ok = [i for i, p in enumerate(points)
+          if all(p.get(k) is not None and math.isfinite(p[k]) for k in axes)]
+    out = []
+    for i in ok:
+        a = points[i]
+        beaten = False
+        for j in ok:
+            if i == j:
+                continue
+            b = points[j]
+            better = any((b[k] > a[k]) if d == "max" else (b[k] < a[k])
+                         for k, d in axes.items())
+            no_worse = all((b[k] >= a[k]) if d == "max" else (b[k] <= a[k])
+                           for k, d in axes.items())
+            if no_worse and better:
+                beaten = True
+                break
+        if not beaten:
+            out.append(i)
+    return out
+
+
+def _label(t: dict) -> str:
+    """node_id, plus the quantization variant when the node has several."""
+    c = t.get("config") or {}
+    q, qb = c.get("quantize"), c.get("quantize_bits")
+    v = (f"{q}@{qb}" if q and qb else q) or ""
+    return f"{t.get('node_id')}:{v}" if v else str(t.get("node_id"))
+
+
+def collect(runs, bench, baseline=None) -> list[dict]:
+    """Every measured point from every method, flattened for plotting."""
+    pts = []
+    for r in runs:
+        ship = (r.get("chosen") or {}).get("node_id")
+        live = [t for t in (r.get("trials") or []) if t.get("goodput")]
+        # A node_id is not unique: weight_autoquantize covers four quantization
+        # variants, and matching on the name alone starred all four. The shipped
+        # config is the BEST variant of the node that was kept, so resolve it to
+        # exactly one trial here rather than letting the plot guess.
+        cand = [t for t in live if t.get("node_id") == ship]
+        ship_t = max(cand, key=lambda t: t["goodput"]) if cand else None
+        for t in live:
+            pts.append({
+                "method": r["method"],
+                "label": _label(t),
+                "goodput": t.get("goodput"),
+                "quality": (t.get("quality") or {}).get(bench),
+                "ttft_p99_ms": t.get("ttft_p99_ms"),
+                "itl_p99_ms": t.get("itl_p99_ms"),
+                "concurrency": t.get("concurrency"),
+                "inherited": bool(t.get("quality_inherited")),
+                "shipped": t is ship_t,
+            })
+    if baseline:
+        pts.append({**baseline, "method": "baseline", "inherited": False,
+                    "shipped": False})
+    return pts
+
+
+def plot_frontier(pts: list[dict], path: str, bench: str, title: str) -> None:
+    """Two panels: the accuracy trade, and the latency trade.
+
+    Two because they answer different questions and one plot cannot. Goodput
+    against accuracy is the headline -- what did the speed cost? Goodput against
+    TTFT is where the SLO actually bites, and a config can look free on the
+    first panel while sitting against the latency wall on the second.
+    """
+    import matplotlib
+    matplotlib.use("Agg")          # headless; this runs on the GPU box
+    import matplotlib.pyplot as plt
+
+    methods = sorted({p["method"] for p in pts})
+    colour = dict(zip(methods, plt.cm.tab10.colors))
+    fig, axs = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    panels = [("quality", f"{bench} accuracy", "max", axs[0]),
+              ("ttft_p99_ms", "TTFT p99 (ms)", "min", axs[1])]
+    for key, ylab, direction, ax in panels:
+        axes = {"goodput": "max", key: direction}
+        front = set(pareto(pts, axes))
+        for m in methods:
+            idx = [i for i, p in enumerate(pts) if p["method"] == m
+                   and p.get(key) is not None]
+            if not idx:
+                continue
+            # Three draws, because the three states mean different things and
+            # must not borrow each other's marker: measured, inherited (an
+            # assumption, so hollow), and shipped (the method's actual answer).
+            first = True
+            for shipped, inherited, mk, size in (
+                    (False, False, "o", 44), (False, True, "o", 44),
+                    (True, None, "*", 260)):
+                sel = [i for i in idx
+                       if pts[i]["shipped"] == shipped
+                       and (inherited is None or pts[i]["inherited"] == inherited)]
+                if not sel:
+                    continue
+                ax.scatter([pts[i]["goodput"] for i in sel],
+                           [pts[i][key] for i in sel], s=size, marker=mk,
+                           facecolors="none" if inherited else colour[m],
+                           edgecolors=colour[m], linewidths=1.4,
+                           label=(m if first else None), zorder=4 if shipped else 3)
+                first = False
+        fp = sorted(front, key=lambda i: pts[i]["goodput"])
+        if len(fp) > 1:
+            ax.plot([pts[i]["goodput"] for i in fp], [pts[i][key] for i in fp],
+                    color="0.35", lw=1.2, ls="--", zorder=2,
+                    label="joint Pareto front")
+        for i in set(front) | {i for i, q in enumerate(pts) if q["shipped"]}:
+            if pts[i].get(key) is None:
+                continue
+            if pts[i]["shipped"] or len(front) < 8:
+                ax.annotate(pts[i]["label"][:30], (pts[i]["goodput"], pts[i][key]),
+                            fontsize=7, xytext=(4, 4), textcoords="offset points",
+                            color="0.25")
+        ax.set_xlabel("goodput (tok/s)  ->  better")
+        ax.set_ylabel(ylab + ("  ->  better" if direction == "max" else "  <-  better"))
+        ax.grid(alpha=0.25, lw=0.6)
+        ax.set_title(f"goodput vs {ylab}", fontsize=10)
+    axs[0].legend(fontsize=8, loc="best")
+    fig.suptitle(title, fontsize=11)
+    fig.text(0.5, 0.005, "star = the config that method ships   |   hollow = accuracy "
+             "INHERITED, not measured   |   dashed = frontier over all methods pooled",
+             ha="center", fontsize=7.5, color="0.35")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+    fig.savefig(path, dpi=150)
+    print(f"\n  wrote {path}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="compare", description=__doc__.split("\n\n")[0])
     ap.add_argument("runs", nargs="+", help="method run dirs")
     ap.add_argument("--baseline", help="an eval_repro run dir, reported separately")
     ap.add_argument("--benchmark", default="math_500")
+    ap.add_argument("--plot", nargs="?", const="auto", default=None,
+                    help="write a Pareto frontier plot. Bare --plot derives the "
+                         "path from the first run dir.")
     ap.add_argument("--demand", type=float, default=None,
                     help="tok/s of demand for replica counts; default reads it "
                          "from the runs' own fingerprints")
@@ -209,7 +361,52 @@ def main() -> int:
                   f"{num(d.get('slo_attainment'), '{:.0%}'):>5s} "
                   f"{(f'{q:.4f}{inh}' if q is not None else '-'):>7s}")
     print(f"\n    ~ = accuracy INHERITED from the baseline, not measured on that")
-    print(f"        config. Run the walk with --quality-every-node to remove these.\n")
+    print(f"        config. Run the walk with --quality-every-node to remove these.")
+
+    # --- who owns the joint frontier
+    bpt = None
+    if a.baseline:
+        f = Path(a.baseline) / "eval.json"
+        if f.exists():
+            e = json.loads(f.read_text())
+            res = next(iter(e["results"].values()))
+            sv = res.get("serving") or {}
+            bpt = {"label": "stock (pinned)", "goodput": sv.get("goodput"),
+                   "quality": res.get("mean"), "ttft_p99_ms": sv.get("ttft_p99_ms"),
+                   "itl_p99_ms": sv.get("itl_p99_ms"),
+                   "concurrency": sv.get("concurrency")}
+
+    pts = collect(runs, a.benchmark, bpt)
+    front = pareto(pts, AXES)
+    if front:
+        print(f"\n  JOINT PARETO FRONTIER  "
+              f"(goodput max, {a.benchmark} max, TTFT p99 min)")
+        own = {}
+        for i in front:
+            own[pts[i]["method"]] = own.get(pts[i]["method"], 0) + 1
+        for m, c in sorted(own.items(), key=lambda x: -x[1]):
+            print(f"    {m:14s} {c:2d} of {len(front)} non-dominated points")
+        print(f"    Owning points is not the same as shipping the best one: a")
+        print(f"    method can find trades the others missed and still ship a")
+        print(f"    worse config than a rival's.")
+        skipped = len(pts) - len([i for i, q in enumerate(pts)
+                                  if all(q.get(k) is not None for k in AXES)])
+        if skipped:
+            print(f"    {skipped} measured point(s) omitted for want of an axis -- "
+                  f"usually an unmeasured accuracy.")
+
+    if a.plot:
+        path = a.plot
+        if path == "auto":
+            path = f"runs/{Path(a.runs[0]).name.rsplit('-', 1)[0]}-frontier.png"
+        try:
+            model = ((runs[0].get("provenance") or {}).get("model")) or "?"
+            plot_frontier(pts, path, a.benchmark,
+                          f"{model} -- search methods compared "
+                          f"({len(pts)} measured configs)")
+        except Exception as e:
+            print(f"\n  plot failed: {type(e).__name__}: {e}")
+    print()
     return 0
 
 

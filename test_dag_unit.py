@@ -1008,6 +1008,54 @@ def test_methods_comparable():
               r["failed_launches"] == 1, f"{r['failed_launches']}")
         check("best_seen is the best MEASURED trial",
               r["best_seen"]["goodput"] == 20.0, f"{r['best_seen']}")
+        check("the shipped config is named after the node that produced it",
+              r["chosen"]["node_id"] == "a",
+              "'incumbent' matches no trial, so nothing is ever marked shipped")
+
+    section("compare: the joint Pareto frontier")
+    from compare import pareto, collect, AXES
+
+    # Domination, on points where the answer is not in doubt.
+    pts = [{"goodput": 100.0, "quality": 0.9, "ttft_p99_ms": 100.0},   # best at all
+           {"goodput": 50.0,  "quality": 0.5, "ttft_p99_ms": 200.0},   # dominated
+           {"goodput": 10.0,  "quality": 0.95, "ttft_p99_ms": 400.0},  # best accuracy
+           {"goodput": 90.0,  "quality": 0.5, "ttft_p99_ms": 50.0}]    # best ttft
+    f = set(pareto(pts, AXES))
+    check("a point beaten on every axis is dominated", 1 not in f, f"{f}")
+    check("the all-round best survives", 0 in f)
+    check("a point best on ONE axis survives", 2 in f and 3 in f,
+          "a frontier that keeps only the goodput winner is not a frontier")
+
+    # A point missing an axis must be dropped, not defaulted -- filling an
+    # unmeasured accuracy with 0 dominates nothing and is dominated by all.
+    holed = pts + [{"goodput": 999.0, "quality": None, "ttft_p99_ms": 1.0}]
+    check("a point missing an axis is excluded, not defaulted",
+          4 not in set(pareto(holed, AXES)),
+          "an unmeasured accuracy must not enter the frontier as 0 or as free")
+    check("excluding it does not disturb the rest",
+          set(pareto(holed, AXES)) == f)
+    check("an empty input yields an empty frontier", pareto([], AXES) == [])
+    check("a single point is its own frontier",
+          pareto([pts[1]], AXES) == [0])
+
+    # A node_id covering several variants must star exactly one point.
+    runs2 = [{"method": "m", "chosen": {"node_id": "q"},
+              "trials": [{"node_id": "q", "goodput": 10.0,
+                          "config": {"quantize": "nvfp4"}},
+                         {"node_id": "q", "goodput": 30.0,
+                          "config": {"quantize": "w4a16"}},
+                         {"node_id": "q", "goodput": 20.0, "config": {}}]}]
+    got = collect(runs2, "math_500")
+    check("exactly one point is marked shipped",
+          sum(1 for p in got if p["shipped"]) == 1,
+          f"{sum(1 for p in got if p['shipped'])} -- one node_id covers four "
+          f"quantization variants and starring all of them is wrong")
+    check("the shipped point is the best variant of that node",
+          next(p["goodput"] for p in got if p["shipped"]) == 30.0)
+    check("variant labels distinguish rows sharing a node_id",
+          len({p["label"] for p in got}) == 3, f"{[p['label'] for p in got]}")
+    check("a dead launch is not a point in the space",
+          all(p["goodput"] for p in got))
 
 
 # ==========================================================================

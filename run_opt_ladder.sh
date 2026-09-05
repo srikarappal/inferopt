@@ -122,7 +122,8 @@ if [ -z "$DIRS" ]; then
 fi
 ARGS=""
 [ -f "$BASE/eval.json" ] && ARGS="--baseline $BASE"
-$PY compare.py $DIRS $ARGS 2>&1 | tee "runs/${TAG}-comparison.txt"
+$PY compare.py $DIRS $ARGS --plot "runs/${TAG}-frontier.png" 2>&1 \
+    | tee "runs/${TAG}-comparison.txt"
 echo
-echo "  wrote runs/${TAG}-comparison.txt"
+echo "  wrote runs/${TAG}-comparison.txt and runs/${TAG}-frontier.png"
 echo
