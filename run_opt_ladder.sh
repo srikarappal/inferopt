@@ -95,10 +95,20 @@ step "yolo   (4 launches)" "$YOLO" \
 # inheriting the baseline's score across lossless nodes. Slower, and required
 # here: the comparison's claim is about the configs each method shipped, and an
 # inherited score is an assumption, not a measurement.
+# --skip-predict IS REQUIRED FOR A FAIR COMPARISON, and its absence silently
+# invalidated the first 1.7B run. run.py calls aiconfigurator at stage 1.2 and
+# seeds the walk from its prediction, while yolo_run.py and pb_screen.py both
+# call seed_config() directly. On Qwen3-1.7B that handed the walk
+# max_num_seqs=512 against the other two methods' 256 -- a head start, in the
+# method that then won. compare.py could not catch it: model, trace, SLO and
+# vLLM version all matched, so the provenance stamps agreed.
+#
+# The aiconfigurator config belongs in the comparison as its own BASELINE row,
+# measured like stock is, not as one competitor's starting point.
 step "seqDAG (~7 launches)" "$SEQ" \
     $PY run.py optimize --model "$MODEL" --trace "$TRACE" \
         --ttft-p99 "$TTFT" --itl-p99 "$ITL" --qps "$QPS" \
-        --lossless-only --quality-every-node --run-dir "$SEQ"
+        --lossless-only --skip-predict --quality-every-node --run-dir "$SEQ"
 
 # 12 screening rows plus 2^3 for the factorial. --repeats 1 leaves the full
 # across-launch spread on each row mean, so the survivors are chosen by Lenth's
