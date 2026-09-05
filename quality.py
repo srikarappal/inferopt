@@ -382,7 +382,8 @@ BENCHMARKS: dict[str, Benchmark] = {
 
 def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                   max_input_tokens: int | None = None,
-                  model: str | None = None) -> float:
+                  model: str | None = None,
+                  record: "Path | str | None" = None) -> float:
     """Score one benchmark, refusing to score prompts the server cannot take.
 
     A benchmark with long prompts, served under a right-sized max_model_len,
@@ -432,8 +433,33 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
     # It was in both places -- Benchmark.max_tokens sized the context filter while
     # the scorer passed its own constant to gen() -- so changing one silently left
     # the filter reserving room for a generation length nothing would produce.
-    outs = gen([prompt(r) for r in rows], b.max_tokens)
+    prompts = [prompt(r) for r in rows]
+    outs = gen(prompts, b.max_tokens)
     verdicts = b.judge(rows, [o.text for o in outs])
+
+    # WHAT THE MODEL ACTUALLY SAID. A score is a single number standing in for
+    # hundreds of generations, and when it moves there is no way to ask why.
+    # RULER was abandoned for exactly this: it read 0.05 on the MoE and then
+    # MOVED across a lossless node, and the cause could not be checked because
+    # nothing recorded the output -- the corpus was fine, so the fault was
+    # downstream, most likely format, and that stayed a guess.
+    #
+    # Written per config, so two configs' generations can be diffed directly
+    # rather than inferred from two aggregate scores.
+    if record:
+        from pathlib import Path as _P
+        f = _P(record)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with open(f, "w") as fh:
+            for r, pr, o, v in zip(rows, prompts, outs, verdicts):
+                fh.write(json.dumps({
+                    "task_id": r.get("task_id") or r.get("problem", "")[:60],
+                    "prompt": pr,
+                    "output": o.text,
+                    "verdict": bool(v),
+                    "expected": r.get("answer") or r.get("entry_point"),
+                    "n_output_tokens": getattr(o, "n_out", None),
+                }, default=str) + "\n")
     return round(sum(verdicts) / len(verdicts), 4)
 
 

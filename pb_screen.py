@@ -138,6 +138,104 @@ def effects(design, factors, results) -> list[dict]:
     return sorted(out, key=lambda x: -abs(x.get("effect") or 0))
 
 
+def aliases(design, factors, top: int = 4) -> dict:
+    """What each main effect is CONFOUNDED with, quantified.
+
+    "Resolution III: main effects are aliased with two-way interactions" is the
+    caveat printed on every screen, and on its own it is useless -- it does not
+    say which interactions, so it cannot be acted on. This says which.
+
+    Plackett-Burman designs alias PARTIALLY, unlike regular fractional
+    factorials. In a 2^(k-p) design a main effect is either fully aliased with
+    an interaction or not at all; in a PB design the columns correlate by
+    fractions, and every two-way interaction contributes a little to every main
+    effect. So this reports correlations rather than a clean alias chain, and a
+    factor with several 0.33 correlations is a different situation from one with
+    a single 1.0.
+
+    Read it as: this effect may really be that interaction, so stage 2 should
+    vary both.
+    """
+    n, k = len(design), len(factors)
+    col = [[1 if design[r][c] else -1 for r in range(n)] for c in range(k)]
+
+    def corr(a, b):
+        num = sum(x * y for x, y in zip(a, b))
+        return num / n           # columns are +/-1 and balanced, so this is r
+
+    out = {}
+    for i in range(k):
+        hits = []
+        for j in range(k):
+            for m in range(j + 1, k):
+                if i in (j, m):
+                    continue
+                inter = [col[j][r] * col[m][r] for r in range(n)]
+                c = corr(col[i], inter)
+                if abs(c) > 1e-9:
+                    hits.append({"with": f"{factors[j]['id']}*{factors[m]['id']}",
+                                 "r": round(c, 3)})
+        hits.sort(key=lambda h: -abs(h["r"]))
+        out[factors[i]["id"]] = hits[:top]
+    return out
+
+
+# t(0.975, df) for the small dfs Lenth's method produces. Interpolated between.
+_T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+         7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 15: 2.131, 20: 2.086}
+
+
+def _t975(df: float) -> float:
+    ks = sorted(_T975)
+    if df <= ks[0]:
+        return _T975[ks[0]]
+    if df >= ks[-1]:
+        return _T975[ks[-1]]
+    lo = max(k for k in ks if k <= df)
+    hi = min(k for k in ks if k >= df)
+    if lo == hi:
+        return _T975[lo]
+    f = (df - lo) / (hi - lo)
+    return _T975[lo] + f * (_T975[hi] - _T975[lo])
+
+
+def lenth(effect_values: list[float]) -> dict:
+    """Lenth's pseudo standard error -- the right test for an UNREPLICATED design.
+
+    With --repeats 1 there is no replication, so the `se` computed from the two
+    groups is not noise: it is mostly the OTHER factors moving, which a balanced
+    design has already cancelled out of the estimate. That is why it reads ~1
+    tok/s when across-launch spread is 5%, and why comparing an effect to 2*se
+    calls things resolved that are not.
+
+    Lenth's method instead assumes most effects are inert and estimates the
+    noise from the effects themselves: take the median of the small ones, and
+    anything far above it is real. It is the standard test for a saturated
+    factorial for exactly this reason.
+    """
+    m = len(effect_values)
+    if m < 3:
+        return {"pse": None, "me": None, "reason": "need at least 3 effects"}
+    a = sorted(abs(e) for e in effect_values)
+    s0 = 1.5 * statistics.median(a)
+    kept = [x for x in a if x < 2.5 * s0] or a
+    pse = 1.5 * statistics.median(kept)
+    df = m / 3.0
+    return {"pse": pse, "me": _t975(df) * pse, "df": df,
+            "n_effects": m, "trimmed": len(a) - len(kept)}
+
+
+def response_effects(design, factors, per_row: dict) -> dict:
+    """Effects on EVERY measured response, not just goodput.
+
+    The design is already paid for. Running it against ttft, itl, SLO
+    attainment, accuracy and the operating point costs nothing more and catches
+    what a goodput-only screen cannot: a factor that leaves goodput alone while
+    adding 300ms of TTFT reads as harmless, and is not.
+    """
+    return {name: effects(design, factors, vals) for name, vals in per_row.items()}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="pb_screen", description=__doc__.split("\n\n")[0])
     ap.add_argument("--model", required=True)
@@ -230,6 +328,17 @@ def main() -> int:
             else:
                 err = (t.diagnostics or {}).get("launch_error", "no goodput")
                 print(f"            launch {rep+1} FAILED: {str(err)[:80]}")
+        # The +/-1 vector, on the trial itself. It lived only in the global
+        # design matrix and had to be reconstructed from config flags, which
+        # breaks the moment two factors write the same flag. A run should be
+        # self-describing.
+        for t in ts:
+            t.diagnostics = dict(t.diagnostics or {})
+            t.diagnostics["pb_row"] = r + 1
+            t.diagnostics["pb_factors_on"] = {
+                factors[c]["id"]: bool(row[c]) for c in range(len(factors))}
+            t.diagnostics["pb_coded"] = [1 if row[c] else -1
+                                         for c in range(len(factors))]
         row_trials.append(ts)
         val = statistics.fmean(got) if got else None
         results.append(val)
@@ -239,7 +348,32 @@ def main() -> int:
             fh.flush()
 
     # ---------------------------------------------------------------- report
-    eff = effects(design, factors, results)
+    #
+    # Every response the launches already produced. The design is paid for; a
+    # goodput-only screen throws the rest away and cannot see a factor that
+    # holds goodput while wrecking TTFT.
+    def _mean(ts, get):
+        vals = [get(t) for t in ts if t.goodput]
+        vals = [v for v in vals if v is not None and v == v and abs(v) != float("inf")]
+        return statistics.fmean(vals) if vals else None
+
+    per_row = {
+        "goodput": results,
+        "ttft_p99_ms": [_mean(ts, lambda t: t.ttft_p99_ms) for ts in row_trials],
+        "itl_p99_ms": [_mean(ts, lambda t: t.itl_p99_ms) for ts in row_trials],
+        "slo_attainment": [_mean(ts, lambda t: (t.diagnostics or {}).get("slo_attainment"))
+                           for ts in row_trials],
+        "concurrency": [_mean(ts, lambda t: t.concurrency) for ts in row_trials],
+        "memory_gb": [_mean(ts, lambda t: t.memory_gb) for ts in row_trials],
+    }
+    if not a.no_quality:
+        per_row[a.benchmark] = [_mean(ts, lambda t: (t.quality or {}).get(a.benchmark))
+                                for ts in row_trials]
+
+    all_eff = response_effects(design, factors, per_row)
+    alias = aliases(design, factors)
+    eff = all_eff["goodput"]
+    len_gp = lenth([x["effect"] for x in eff if x.get("effect") is not None])
     usable = [x for x in results if x is not None]
     noise = (statistics.stdev(usable) if len(usable) > 1 else 0.0)
     print(f"\n{'='*74}")
@@ -253,17 +387,66 @@ def main() -> int:
         sig = abs(x["effect"]) > 2 * x["se"] if x["se"] else abs(x["effect"]) > 0
         print(f"  {x['id']:26s} {x['effect']:+9.1f} {x['relative']:+7.0%} "
               f"{x['se']:8.1f}  {'RESOLVED' if sig else 'inside noise'}")
-    print(f"\n  Effects are confounded with two-way interactions -- this is a")
-    print(f"  resolution III design. A large effect says 'spend stage 2 here',")
-    print(f"  not 'this factor causes it'.")
+    # Lenth's test, alongside the group-spread one. They disagree when there is
+    # no replication, and the disagreement is the point: 2*se compares an effect
+    # to the OTHER factors' variation, which the design already cancelled out.
+    if len_gp.get("pse"):
+        print(f"\n  LENTH'S TEST  (the right one for {a.repeats} launch(es) per row)")
+        print(f"    PSE {len_gp['pse']:.2f} tok/s, margin of error "
+              f"{len_gp['me']:.2f} at 95% (df {len_gp['df']:.1f})")
+        for x in eff:
+            if x.get("effect") is None:
+                continue
+            act = abs(x["effect"]) > len_gp["me"]
+            print(f"    {x['id']:26s} {x['effect']:+9.1f}  "
+                  f"{abs(x['effect'])/len_gp['pse']:5.1f}x PSE  "
+                  f"{'ACTIVE' if act else '--'}")
+        print(f"    Lenth estimates noise from the effects themselves, assuming")
+        print(f"    most are inert. With no replication that is sounder than 2*se,")
+        print(f"    which compares an effect to variation the design cancelled.")
 
-    survivors = [x["id"] for x in eff if x.get("effect") is not None
-                 and x["se"] and abs(x["effect"]) > 2 * x["se"]]
+    print(f"\n  EFFECTS ON EVERY RESPONSE  (same launches, no extra cost)")
+    names = [n for n in per_row if n != "goodput"]
+    print(f"    {'factor':26s} " + "".join(f"{n[:12]:>13s}" for n in names))
+    print("    " + "-" * (26 + 13 * len(names)))
+    for x in eff:
+        cells = ""
+        for n in names:
+            v = next((y.get("effect") for y in all_eff[n] if y["id"] == x["id"]), None)
+            cells += f"{('%+.2f' % v if v is not None else '-'):>13s}"
+        print(f"    {x['id']:26s} {cells}")
+    print(f"    A factor flat on goodput but heavy on ttft_p99_ms is not neutral.")
+
+    print(f"\n  ALIAS STRUCTURE  (what each effect may really be)")
+    for x in eff[:5]:
+        hits = alias.get(x["id"]) or []
+        if not hits:
+            continue
+        top = ", ".join(f"{h['with']} (r={h['r']:+.2f})" for h in hits[:3])
+        print(f"    {x['id']:26s} {top}")
+    print(f"    Plackett-Burman aliases PARTIALLY -- these are correlations, not")
+    print(f"    a clean alias chain. Stage 2 should vary a factor together with")
+    print(f"    whatever it correlates most strongly against.")
+
+    # Lenth's margin decides when there is no replication; the group-spread
+    # test is only meaningful once each row has been launched more than once.
+    if a.repeats < 2 and len_gp.get("me"):
+        survivors = [x["id"] for x in eff if x.get("effect") is not None
+                     and abs(x["effect"]) > len_gp["me"]]
+    else:
+        survivors = [x["id"] for x in eff if x.get("effect") is not None
+                     and x["se"] and abs(x["effect"]) > 2 * x["se"]]
     ranked = [x["id"] for x in eff if x.get("effect") is not None]
 
     (run_dir / "effects.json").write_text(json.dumps(
         {"factors": eff, "results": results, "survivors": survivors,
-         "design": [[bool(x) for x in row] for row in design]},
+         "design": [[bool(x) for x in row] for row in design],
+         "coded": [[1 if x else -1 for x in row] for row in design],
+         "factor_ids": [f["id"] for f in factors],
+         "responses": per_row,
+         "effects_by_response": all_eff,
+         "aliases": alias,
+         "lenth": len_gp},
         indent=2, default=str))
 
     # ------------------------------------------------------------- stage 2

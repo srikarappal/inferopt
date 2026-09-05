@@ -406,6 +406,7 @@ def main() -> int:
     # ----------------------------------------------------------------------
     print("\n=== benchmarks: one judge per benchmark, shared by both callers ===")
     import inspect as _inspect
+    import re as _re
 
     from quality import BENCHMARKS
 
@@ -415,8 +416,23 @@ def main() -> int:
     check("score_once no longer sniffs the row shape",
           '"answers" in r' not in src,
           "picking the metric by inspecting the row is a second copy of quality.py")
+    # The point is that max_tokens comes from the Benchmark and not a literal:
+    # it used to live in two places -- Benchmark.max_tokens sized the context
+    # filter while the scorer passed its own constant to gen() -- so changing
+    # one silently left the filter reserving room for a length nothing produced.
+    # Matching the whole source line instead made this fail when the call was
+    # split across two lines to capture the prompts, which tested formatting.
+    _q = Path("quality.py").read_text()
     check("run_benchmark takes max_tokens from the Benchmark",
-          "gen([prompt(r) for r in rows], b.max_tokens)" in Path("quality.py").read_text())
+          "b.max_tokens)" in _q and "outs = gen(" in _q)
+    check("run_benchmark passes no literal max_tokens to gen",
+          not _re.search(r"gen\([^)]*,\s*\d+\s*\)", _q),
+          "a numeric literal here is the second copy this guards against")
+    check("generations are recorded for later inspection",
+          "record" in _inspect.signature(
+              __import__("quality").run_benchmark).parameters,
+          "a score with no record of what the model said cannot be debugged -- "
+          "this is what made the RULER regression unresolvable")
 
     for name, b in BENCHMARKS.items():
         sig = list(_inspect.signature(b.judge).parameters)

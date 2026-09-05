@@ -1011,6 +1011,63 @@ def test_methods_comparable():
 
 
 # ==========================================================================
+def test_doe_analysis():
+    """The analysis layered on the screen: aliases, Lenth, every response."""
+    section("aliases: what a main effect is confounded with")
+    from pb_screen import pb_design, aliases, lenth, response_effects, effects
+
+    names = [f"f{i}" for i in range(6)]
+    fs = [{"id": n} for n in names]
+    design, N = pb_design(len(names))
+    al = aliases(design, fs)
+
+    check("every factor gets an alias list", set(al) == set(names))
+    check("a factor is never aliased with itself",
+          all(f not in h["with"].split("*") for f in names for h in al[f]),
+          "an effect confounded with its own interaction is a bug")
+    rs = [abs(h["r"]) for f in names for h in al[f]]
+    check("aliasing is PARTIAL, not total", rs and max(rs) < 1.0,
+          f"max |r| {max(rs) if rs else 0}; r=1.0 would be a regular fraction, "
+          f"not Plackett-Burman")
+    check("aliasing is non-zero", rs and min(rs) > 0.0,
+          "no confounding at all would mean this is not resolution III")
+    check("correlations are bounded by 1", all(r <= 1.0 + 1e-9 for r in rs))
+
+    section("Lenth's PSE")
+    # One huge effect among inert ones: PSE must come from the inert ones, so
+    # the big one lands far outside the margin.
+    L = lenth([40.0, 0.5, -0.4, 0.6, -0.3, 0.2])
+    check("PSE is estimated from the small effects, not the large one",
+          L["pse"] < 2.0, f"pse {L['pse']} -- a 40.0 effect has contaminated it")
+    check("the large effect exceeds the margin", 40.0 > L["me"], f"me {L['me']}")
+    check("an inert effect does not", 0.6 < L["me"])
+    # All effects equal: nothing should be called active.
+    L2 = lenth([5.0, -5.0, 5.0, -5.0, 5.0, -5.0])
+    check("when every effect is the same size, none stands out",
+          5.0 <= L2["me"], f"me {L2['me']} -- would call all six active")
+    check("too few effects is refused, not guessed",
+          lenth([1.0, 2.0]).get("pse") is None)
+    check("PSE scales with the data",
+          abs(lenth([80.0, 1.0, -0.8, 1.2, -0.6, 0.4])["pse"] - 2 * L["pse"]) < 1e-9,
+          "doubling every effect must double the noise estimate")
+
+    section("effects on every response")
+    # A factor that leaves goodput alone and wrecks TTFT must be visible.
+    gp = [100.0 for _ in design]
+    ttft = [300.0 + (250.0 if row[0] else 0.0) for row in design]
+    allf = response_effects(design, fs, {"goodput": gp, "ttft_p99_ms": ttft})
+    check("both responses are analysed", set(allf) == {"goodput", "ttft_p99_ms"})
+    g0 = next(x["effect"] for x in allf["goodput"] if x["id"] == "f0")
+    t0 = next(x["effect"] for x in allf["ttft_p99_ms"] if x["id"] == "f0")
+    check("a factor flat on goodput reads ~0 there", abs(g0) < 1e-9, f"{g0}")
+    check("...and is caught on TTFT", abs(t0 - 250.0) < 1e-9,
+          f"{t0}; a goodput-only screen would call this factor harmless")
+    check("an unrelated factor moves neither response",
+          abs(next(x["effect"] for x in allf["ttft_p99_ms"]
+                   if x["id"] == "f3")) < 1e-9)
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -1153,7 +1210,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
