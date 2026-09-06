@@ -1259,6 +1259,82 @@ def _err(fn):
 
 
 # ==========================================================================
+def test_strategies():
+    """Three search strategies behind one protocol, with a declared asymmetry."""
+    section("strategies: the shared protocol")
+    from inferopt.strategies import (STRATEGIES, ScreenStrategy, SearchResult,
+                                     SequentialStrategy, Strategy, YoloStrategy)
+
+    check("all three are registered",
+          set(STRATEGIES) == {"sequential", "yolo", "screen"}, f"{set(STRATEGIES)}")
+    for n, cls in STRATEGIES.items():
+        check(f"{n}: declares a name matching its key", cls.name == n)
+        check(f"{n}: declares whether it chains an incumbent",
+              isinstance(cls.chains_incumbent, bool))
+
+    # THE ASYMMETRY IS THE POINT. PB's arithmetic requires every row to share a
+    # background -- the difference of means only isolates a factor if it does --
+    # so chaining it would destroy the property the method exists for. The
+    # protocol declares this rather than forcing one behaviour.
+    check("only the sequential walk chains",
+          SequentialStrategy.chains_incumbent
+          and not YoloStrategy.chains_incumbent
+          and not ScreenStrategy.chains_incumbent,
+          "chaining PB would break the balance its estimates rest on")
+
+    section("strategies: yolo measures two configs, whatever the budget")
+    factors = [{"id": f"f{i}", "on": {f"flag{i}": True}} for i in range(6)]
+    seed = {"model": "m", "gpu_memory_utilization": 0.9}
+    ev = _Runner({"all_off-rep1": 100.0, "all_off-rep2": 110.0,
+                  "all_on-rep1": 300.0, "all_on-rep2": 290.0})
+    out = YoloStrategy(factors, repeats=2).search(_ctx(), ev, seed, log=lambda *_: None)
+    check("four launches for two cells at two repeats", out.launches == 4, out.launches)
+    seen = {json.dumps({k: v for k, v in t.config.items() if k != "model"},
+                       sort_keys=True) for t in out.trials}
+    check("only TWO distinct configs are ever measured", len(seen) == 2,
+          f"{len(seen)} -- yolo cannot attribute a result to any single factor")
+    check("it ships the better cell", out.chosen.goodput in (300.0, 290.0),
+          f"{out.chosen.goodput}")
+    check("the cell's value is the MEAN, not the best launch",
+          abs(out.extra["cells"]["all_on"]["mean_goodput"] - 295.0) < 1e-9,
+          "taking the max would keep whichever launch drew luckiest")
+    check("the lift is reported against all-off",
+          abs(out.extra["lift_all_on_vs_all_off"] - (295.0 / 105.0 - 1)) < 1e-9)
+
+    section("strategies: SearchResult counts dead launches")
+    r = SearchResult(method="x", trials=[_T(10.0), _T(0.0), _T(5.0)])
+    check("a launch with no goodput counts as failed", r.failed_launches == 1,
+          f"{r.failed_launches} -- a dead launch cost the same as a live one")
+
+
+class _T:
+    def __init__(self, gp):
+        self.goodput = gp
+
+
+class _Runner:
+    """The narrow Measurer a strategy sees: measure(config, label) -> Trial.
+
+    Not ScriptedEvaluator, which implements the RAW evaluator signature with
+    probes, benchmarks and levels. The distinction is the point: a strategy
+    does not choose those, because letting each one choose is how "goodput"
+    came to mean three different things across the three implementations.
+    """
+
+    def __init__(self, script: dict, default: float = 10.0):
+        self.script, self.default = script, default
+        self.calls: list[tuple[str, dict]] = []
+
+    def measure(self, config: dict, label: str):
+        from inferopt.traverse import Trial
+        self.calls.append((label, dict(config)))
+        gp = self.script.get(label, self.default)
+        return Trial(node_id=label, config=dict(config), goodput=gp,
+                     ttft_p99_ms=100.0, itl_p99_ms=10.0, memory_gb=1.0,
+                     slo_ok=bool(gp), concurrency=8)
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1401,7 +1477,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_strategies, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
