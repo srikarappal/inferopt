@@ -1335,6 +1335,59 @@ class _Runner:
 
 
 # ==========================================================================
+def test_result_api():
+    """Result: what a caller reads, and what it refuses to guess."""
+    section("Result: reporting")
+    from inferopt.api import Result
+    from inferopt.api_types import QualityChange
+
+    class _R:
+        def __init__(self, gp, L=8, q=None, node="n", inherited=False):
+            self.goodput, self.concurrency = gp, L
+            self.quality, self.node_id = q or {}, node
+            self.quality_inherited = inherited
+
+    r = Result(model="m", strategy="sequential",
+               chosen=_R(100.0), best_seen=_R(120.0),
+               baselines={"stock": _R(11.9, 30)},
+               provenance={"workload": {"mean_output_tokens": 259.6}})
+
+    check("replicas divides demand by the shipped goodput",
+          r.replicas(16) == 42, f"{r.replicas(16)}  (ceil(16*259.6/100))")
+    check("replicas can ask the same of a baseline",
+          r.replicas(16, config=r.baselines["stock"]) == 350,
+          "the report's stock figure is 350 replicas")
+    check("replicas returns None without a workload, rather than guessing",
+          Result(model="m", strategy="s", chosen=_R(100.0)).replicas(16) is None,
+          "a fabricated demand would silently scale every capacity claim")
+    check("replicas returns None when nothing was shipped",
+          Result(model="m", strategy="s",
+                 provenance={"workload": {"mean_output_tokens": 100}}).replicas(16) is None)
+
+    check("a gap between shipped and best-seen is surfaced",
+          "above what it ships" in r.summary(),
+          "a strategy that walks past something better is worth reporting")
+
+    section("Result: regressions are reported, never acted on")
+    r.quality_changes = [
+        QualityChange("math_500", "exact_match", 0.7333, 0.7300, 0.04),   # noise
+        QualityChange("math_500", "exact_match", 0.6633, 0.6380, 0.006),  # real
+        QualityChange("math_500", "exact_match", 0.70, 0.76, 0.006),      # better
+    ]
+    check("only the real, wrong-direction movement is a regression",
+          len(r.regressions) == 1
+          and abs(r.regressions[0].delta + 0.0253) < 1e-9,
+          f"{[str(c) for c in r.regressions]}")
+    check("the noisy one is not reported as a regression",
+          all(not c.within_noise for c in r.regressions))
+    check("an improvement is not a regression",
+          all(c.delta < 0 for c in r.regressions))
+    check("regressions do not remove the config from the frontier",
+          r.chosen is not None,
+          "quality is an axis; dropping the point removes the choice")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1477,7 +1530,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_strategies, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

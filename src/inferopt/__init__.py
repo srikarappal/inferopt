@@ -19,6 +19,7 @@ module path; everything else is an implementation detail and may move.
 
 __version__ = "0.1.0"
 
+from inferopt.api import Result, optimize
 from inferopt.api_types import (
     Metric,
     QualityChange,
@@ -30,10 +31,12 @@ from inferopt.quality import Benchmark
 
 __all__ = [
     "Benchmark",
+    "Result",
     "Metric",
     "QualityChange",
     "SLO",
     "Sample",
     "Verdict",
     "__version__",
+    "optimize",
 ]
