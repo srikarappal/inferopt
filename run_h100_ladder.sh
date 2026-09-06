@@ -44,6 +44,13 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 MODEL=${1:-Qwen/Qwen3-14B}
 BENCH=${2:-math_500}
 N=${3:-500}
@@ -100,7 +107,7 @@ except Exception as e:
     print(f"  fingerprint failed: {type(e).__name__}: {e}")
 PY
 
-SKIP=$($PY check_support.py 2>/dev/null)
+SKIP=$($PY -m inferopt.check_support 2>/dev/null)
 if [ -n "$SKIP" ]; then
     echo
     echo "  cannot run here: $SKIP  (needs FP4 tensor cores, sm100+)"
@@ -126,7 +133,7 @@ if have "$LOSSLESS_DIR/result.json"; then
 else
     echo "  ~2-4h, ~12 launches. Progress is journaled to trials.jsonl as it goes,"
     echo "  so an interrupted run is not lost."
-    $PY run.py optimize \
+    $PY -m inferopt.run optimize \
         --model "$MODEL" --trace "$TRACE" \
         --ttft-p99 500 --itl-p99 250 \
         --lossless-only \
@@ -152,7 +159,7 @@ for KIND in w4a16 autoquant@6.0 autoquant@5.0 nvfp4; do
     fi
     echo "  building $KIND  (hours; a failure here is recorded and the rest continue)"
     rm -rf "$DIR"
-    if $PY quantize.py --model "$MODEL" --trace "$TRACE" --produce "$KIND" \
+    if $PY -m inferopt.quantize --model "$MODEL" --trace "$TRACE" --produce "$KIND" \
             2>&1 | tee "logs/h100-produce-$TAG.log" | tail -3; then
         echo "  built    $KIND"
     else
@@ -187,7 +194,7 @@ PY
 }
 echo
 echo "  lossy ladder:"
-$PY summarize.py "$LADDER_DIR" 2>/dev/null | head -14
+$PY -m inferopt.summarize "$LADDER_DIR" 2>/dev/null | head -14
 
 cat <<EOF
 

@@ -25,6 +25,13 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 PY=${PYTHON:-python}
 note() { printf '\n=== %s ===\n' "$*"; }
 
@@ -50,7 +57,7 @@ if missing:
         print(f"  pytorch.org FIRST if pip's default build is wrong for this box.")
     print(f"\n  Then verify with the SAME interpreter:")
     print(f"      {sys.executable} -c 'import vllm; print(vllm.__version__)'")
-    print(f"  Running run.py with a different python than the one vLLM lives in")
+    print(f"  Running -m inferopt.run with a different python than the one vLLM lives in")
     print(f"  is the most common failure on a new host.")
 PY
 
@@ -95,7 +102,7 @@ if [ -f data/mbpp_plus_full.jsonl ] && [ -f data/math_500.jsonl ]; then
     ls -la data/*.jsonl | awk '{printf "    %-34s %6.1f MB\n", $9, $5/1e6}'
 else
     echo "  fetching (needs the network once) ..."
-    $PY fetch_data.py || {
+    $PY -m inferopt.fetch_data || {
         echo
         echo "  If this failed on SSL certificate verification:"
         echo "      export SSL_CERT_FILE=\$($PY -m certifi)"
@@ -106,7 +113,7 @@ else
 fi
 
 note "what this GPU can run"
-SKIP=$($PY check_support.py 2>/dev/null)
+SKIP=$($PY -m inferopt.check_support 2>/dev/null)
 if [ -n "$SKIP" ]; then
     echo "  UNSUPPORTED: $SKIP"
     echo "  NVFP4 needs Blackwell FP4 hardware (sm100+). Those ladder rows are"
@@ -116,7 +123,7 @@ else
 fi
 
 note "self-test"
-$PY selftest.py 2>&1 | tail -4
+$PY -m inferopt.selftest 2>&1 | tail -4
 
 cat <<'EOF'
 
@@ -127,12 +134,12 @@ cat <<'EOF'
   ./eval_ladder.sh math_500  500 3       # reasoning ladder
   ./eval_ladder.sh mbpp_plus 378 3       # code ladder
 
-  python summarize.py runs/ladder-math_500
+  python -m inferopt.summarize runs/ladder-math_500
 
 Artifacts are NOT in the repo -- they are 10-12 GB each. To build the lossy
 variants on this host (hours of GPU time):
 
-  python quantize.py --model Qwen/Qwen3-14B --trace data/trace_shared.jsonl \
+  python -m inferopt.quantize --model Qwen/Qwen3-14B --trace data/trace_shared.jsonl \
       --produce fp8            # and w4a16, autoquant@6.0, nvfp4 if supported
 
 Without them the ladder measures stock, lossless and fp8, which needs no

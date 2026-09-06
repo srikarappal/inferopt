@@ -83,8 +83,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-PKGS = HERE / ".evalplus-pkgs"
+from inferopt._paths import home as _home, workspace as _workspace
+HERE = _home()
+PKGS = _workspace(".evalplus-pkgs")
 
 
 def _configure_memory_guard() -> str:

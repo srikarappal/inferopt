@@ -33,6 +33,8 @@ costs two launches and removes the objection that yolo lost to noise.
 
 from __future__ import annotations
 
+from inferopt._paths import default_dag
+
 import argparse
 import json
 import statistics
@@ -48,7 +50,8 @@ def main() -> int:
     ap.add_argument("--itl-p99", type=float, default=250)
     ap.add_argument("--qps", type=float, default=None,
                     help="arrival rate; overrides the trace's arrival_ts")
-    ap.add_argument("--dag", default="dag/llm.json")
+    ap.add_argument("--dag", default=None,
+                    help="DAG to screen against; defaults to the shipped one")
     ap.add_argument("--run-dir", default="runs/yolo")
     ap.add_argument("--repeats", type=int, default=2,
                     help="LAUNCHES per cell. Separate launches, because "
@@ -61,12 +64,12 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8400)
     a = ap.parse_args()
 
-    from methods import MethodRunner, setup
-    from pb_screen import factors_from_dag
-    from run import seed_config
+    from inferopt.methods import MethodRunner, setup
+    from inferopt.pb_screen import factors_from_dag
+    from inferopt.run import seed_config
 
     fp, slo, ctx = setup(a.model, a.trace, a.ttft_p99, a.itl_p99, a.qps)
-    dag = json.loads(Path(a.dag).read_text())
+    dag = json.loads(Path(a.dag or default_dag()).read_text())
 
     base = seed_config(fp)
     factors = factors_from_dag(dag, ctx)

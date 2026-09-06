@@ -28,6 +28,17 @@ It asserts on structure and invariants, not on exact numbers.
 
 from __future__ import annotations
 
+from inferopt._paths import default_dag, package_file
+
+
+def _src(name: str) -> Path:
+    """A module's SOURCE file. selftest reads source in two places: to load
+    an isolated evaluator it can monkeypatch without mutating the real one,
+    and to assert properties of code it cannot conveniently import. Both used
+    repo-root-relative paths, which stopped existing when the modules moved
+    into the package -- and would never have worked from an install."""
+    return package_file(name)
+
 import asyncio
 import json
 import os
@@ -88,7 +99,7 @@ def configs_under_test_backend(er, fp):
 def main() -> int:
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("ev", "evaluator.py")
+    spec = importlib.util.spec_from_file_location("ev", str(_src("evaluator.py")))
     ev = importlib.util.module_from_spec(spec)
     sys.modules["ev"] = ev
     spec.loader.exec_module(ev)
@@ -97,15 +108,15 @@ def main() -> int:
     # Short windows so the whole file runs in seconds.
     ev.SETTLE_S, ev.SWEEP_WINDOW_S, ev.WARMUP_S = 0.15, 0.6, 0.1
 
-    from fingerprint import SLO
-    from request import InferOptRequest, build_fingerprint
+    from inferopt.fingerprint import SLO
+    from inferopt.request import InferOptRequest, build_fingerprint
 
     fp, slo = build_fingerprint(InferOptRequest(
         model="Qwen/Qwen3-14B", trace="data/trace.jsonl",
         ttft_p99_ms=500, itl_p99_ms=250, allow_loss=0.03))
 
     print("\n=== fingerprint: single-file checkpoints (no index) ===")
-    from request import InferOptRequest as _R, build_fingerprint as _bf
+    from inferopt.request import InferOptRequest as _R, build_fingerprint as _bf
     small, _ = _bf(_R(model="Qwen/Qwen3-0.6B", trace="data/trace.jsonl"))
     check("attention_type is a TYPE, not a parameter count",
           small.model.attention_type in ("mha", "gqa", "mqa", "mla"),
@@ -115,8 +126,8 @@ def main() -> int:
           0.5 < small.model.weight_gb < 5.0, f"{small.model.weight_gb} GB")
 
     print("\n=== MoE and MLA across providers (config + headers only, no weights) ===")
-    from request import MoEReconciliationError, detect_model as _dm
-    from request import InferOptRequest as _R2
+    from inferopt.request import MoEReconciliationError, detect_model as _dm
+    from inferopt.request import InferOptRequest as _R2
 
     # THIS SECTION NEEDS THE NETWORK, and says so rather than failing
     # ambiguously. It reads safetensors headers from the Hub over HTTP Range to
@@ -287,7 +298,7 @@ def main() -> int:
 
     print("\n=== provenance: one record, shared by run.py and eval_repro ===")
     import argparse as _ap
-    from provenance import banner as _banner, environment as _env, provenance as _prov
+    from inferopt.provenance import banner as _banner, environment as _env, provenance as _prov
     _p = _ap.ArgumentParser()
     _p.add_argument("--alpha", default=1)
     _p.add_argument("--beta", default="x")
@@ -308,7 +319,7 @@ def main() -> int:
     import pathlib as _pl
     for f in ("run.py", "eval_repro.py"):
         check(f"{f} uses the shared module",
-              "from provenance import" in _pl.Path(f).read_text(),
+              "from inferopt.provenance import" in _src(f).read_text(),
               "two implementations of one record diverge")
 
     print("\n=== serving_metrics(): ONE implementation, used by both callers ===")
@@ -332,8 +343,8 @@ def main() -> int:
           "number gets reported against a claim it does not support")
     import pathlib as _p
     check("eval_repro uses the same function, not a lookalike",
-          "ev.serving_metrics(" in _p.Path("eval_repro.py").read_text()
-          and "ev._point(" not in _p.Path("eval_repro.py").read_text())
+          "ev.serving_metrics(" in _src("eval_repro.py").read_text()
+          and "ev._point(" not in _src("eval_repro.py").read_text())
 
     print("\n=== aggregate(): worst case in BOTH directions ===")
     a = {"goodput": 200.0, "ttft_p99_ms": 400.0, "slo_attainment": 1.0, "concurrency": 30}
@@ -363,13 +374,13 @@ def main() -> int:
     PEAK_L = 32
     import json
     from pathlib import Path
-    from fingerprint import Context
-    from traverse import traverse
+    from inferopt.fingerprint import Context
+    from inferopt.traverse import traverse
 
     ctx = Context(fingerprint=fp, slo=slo, incumbent={"max_num_seqs": 64},
                   quality_baseline={"math_500": 0.74})
     ctx.incumbent_metrics = None
-    dag = json.loads(Path("dag/llm.json").read_text())
+    dag = json.loads(default_dag().read_text())
     res = traverse(dag, ctx, e, log=lambda *a: None, baseline=t, concurrency=16)
 
     check("traverse completes without error", res is not None)
@@ -388,7 +399,7 @@ def main() -> int:
     check("Result carries the operating point", res.concurrency is not None)
 
     print("\n=== report() and the frontier plot render ===")
-    from traverse import report
+    from inferopt.traverse import report
     lines: list[str] = []
     report(res, log=lines.append, demand_tok_s=3988.0)
     blob = "\n".join(lines)
@@ -408,9 +419,9 @@ def main() -> int:
     import inspect as _inspect
     import re as _re
 
-    from quality import BENCHMARKS
+    from inferopt.quality import BENCHMARKS
 
-    src = Path("eval_repro.py").read_text()
+    src = _src("eval_repro.py").read_text()
     check("score_once calls bench.judge rather than re-deriving verdicts",
           "bench.judge(rows, texts)" in src)
     check("score_once no longer sniffs the row shape",
@@ -422,7 +433,7 @@ def main() -> int:
     # one silently left the filter reserving room for a length nothing produced.
     # Matching the whole source line instead made this fail when the call was
     # split across two lines to capture the prompts, which tested formatting.
-    _q = Path("quality.py").read_text()
+    _q = _src("quality.py").read_text()
     check("run_benchmark takes max_tokens from the Benchmark",
           "b.max_tokens)" in _q and "outs = gen(" in _q)
     check("run_benchmark passes no literal max_tokens to gen",
@@ -544,7 +555,7 @@ def main() -> int:
     # use a backend vLLM accepts for that artifact's quant_algo.
     # ==================================================================
     print("\n=== the served config is valid for the artifact it loads ===")
-    from evaluator import (_artifact_quant_algo, _moe_backends,
+    from inferopt.evaluator import (_artifact_quant_algo, _moe_backends,
                            _nvfp4_moe_backends, moe_expert_state,
                            reconcile_moe_backend)
     valid = _nvfp4_moe_backends()
@@ -607,12 +618,12 @@ def main() -> int:
           f"got {cfg['moe_backend']!r} -- this is what avoids the sm120 JIT hang")
 
     print("\n=== MoE on sm12x avoids FlashInfer's CUTLASS JIT ===")
-    from run import seed_config as _seed
+    from inferopt.run import seed_config as _seed
     # EVERY launch path, not just the traversal. moe_backend was set only in
     # run.py's seed_config, so a stock eval_repro run on the same model went
     # down FlashInfer's sm120 path and hung 30 min compiling kernels while the
     # traversal beside it ran fine.
-    import eval_repro as _er
+    import inferopt.eval_repro as _er
     import argparse as _ap
     for mid, want in (("Qwen/Qwen3-30B-A3B", "triton"), ("Qwen/Qwen3-14B", None)):
         _fp, _ = _bf(_R(model=mid, trace="data/trace.jsonl"))

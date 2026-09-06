@@ -81,9 +81,9 @@ from typing import Any
 
 import httpx
 
-from calibration import STORE
-from fingerprint import SLO, Fingerprint
-from traverse import Trial
+from inferopt.calibration import STORE
+from inferopt.fingerprint import SLO, Fingerprint
+from inferopt.traverse import Trial
 
 _VLLM_CMD: list[str] | None = None
 
@@ -763,7 +763,7 @@ class VllmEvaluator:
                 raise LaunchError("quantize=autoquant requires quantize_bits")
             kind = f"autoquant@{float(bits)}"
         if kind:
-            from quantize import ensure_variant
+            from inferopt.quantize import ensure_variant
             path = ensure_variant(self.fp, kind, self.trace_path, log=self.log)
             if path:
                 config["model"] = path
@@ -1086,7 +1086,7 @@ class VllmEvaluator:
                                  f"first-{self.equiv_k}-token prefixes differ")
                     qual = {}
                     if "quality" in probes and benchmarks:
-                        from quality import resolution, run_benchmark
+                        from inferopt.quality import resolution, run_benchmark
                         for b in benchmarks:
                             qual[b] = run_benchmark(
                                 b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
@@ -1214,7 +1214,7 @@ class VllmEvaluator:
                              f"prefixes differ from the reference")
                 qual = {}
                 if "quality" in probes and benchmarks:
-                    from quality import resolution, run_benchmark
+                    from inferopt.quality import resolution, run_benchmark
                     for b in benchmarks:
                         qual[b] = run_benchmark(
                             b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),

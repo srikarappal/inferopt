@@ -15,6 +15,13 @@
 
 set -uo pipefail
 cd "$(dirname "$0")"
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 PY=${PYTHON:-python}
 rc=0
 
@@ -45,11 +52,11 @@ run() {
 }
 
 echo
-run "unit (DAG)"        $PY test_dag_unit.py
-run "integration (DAG)" $PY test_dag_integration.py
-run "selftest"          $PY selftest.py
-run "validate_dag"      $PY validate_dag.py dag/llm.json
-run "dryrun"            $PY dryrun.py
+run "unit (DAG)"        $PY tests/test_dag_unit.py
+run "integration (DAG)" $PY tests/test_dag_integration.py
+run "selftest"          $PY -m inferopt.selftest
+run "validate_dag"      $PY -m inferopt.validate_dag src/inferopt/dag/llm.json
+run "dryrun"            $PY -m inferopt.dryrun
 echo
 [ $rc -eq 0 ] && echo "  all suites passed" || echo "  SOME SUITES FAILED"
 exit $rc

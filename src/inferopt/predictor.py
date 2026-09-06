@@ -58,14 +58,15 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fingerprint import SLO, Fingerprint
+from inferopt.fingerprint import SLO, Fingerprint
 
 # NOT a venv. A venv bakes absolute paths into its shebang, its python symlink
 # and pyvenv.cfg, so one created on the host is broken inside a container that
 # mounts the same files at a different path -- which is exactly what happened.
 # `pip install --target` produces a plain directory with no absolute paths, and
 # PYTHONPATH is computed relative to this file, so it works from either side.
-AIC_PKGS = Path(__file__).resolve().parent / ".aic-pkgs"
+from inferopt._paths import workspace as _workspace
+AIC_PKGS = _workspace(".aic-pkgs")
 
 # Unsupported GPU -> nearest supported member of the same architecture family.
 # Same tensor-core generation and kernel shapes, so the RANKING transfers; the

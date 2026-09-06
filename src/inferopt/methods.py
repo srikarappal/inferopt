@@ -46,7 +46,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
-from traverse import Trial
+from inferopt.traverse import Trial
 
 
 class MethodRunner:
@@ -58,9 +58,9 @@ class MethodRunner:
                  quality_every: bool = True,
                  sweep: bool = True,
                  log=print):
-        from evaluator import VllmEvaluator
-        from provenance import trial_stamp
-        from run import free_port
+        from inferopt.evaluator import VllmEvaluator
+        from inferopt.provenance import trial_stamp
+        from inferopt.run import free_port
 
         self.method = method
         self.fp, self.slo = fp, slo
@@ -91,7 +91,7 @@ class MethodRunner:
         it is visible in the comparison as something the method spent a launch
         on -- which is exactly what happened.
         """
-        from evaluator import SWEEP_LEVELS
+        from inferopt.evaluator import SWEEP_LEVELS
         want_q = self.quality_every if quality is None else quality
         benches = self.benchmarks if want_q else []
         probes = ["goodput"] + (["quality"] if benches else [])
@@ -170,8 +170,8 @@ def setup(model: str, trace: str, ttft_p99: float, itl_p99: float,
     Shared so a method cannot accidentally search a different space than the
     one the walk searched -- which would make every comparison meaningless.
     """
-    from fingerprint import Context
-    from request import InferOptRequest, build_fingerprint
+    from inferopt.fingerprint import Context
+    from inferopt.request import InferOptRequest, build_fingerprint
     fp, slo = build_fingerprint(InferOptRequest(
         model=model, trace=trace, ttft_p99_ms=ttft_p99, itl_p99_ms=itl_p99,
         **({"qps": qps} if qps else {})))

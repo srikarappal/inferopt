@@ -19,6 +19,12 @@ from __future__ import annotations
 import json
 import math
 import sys
+from pathlib import Path as _P
+sys.path.insert(0, str(_P(__file__).resolve().parent.parent / 'src'))
+
+from inferopt._paths import default_dag
+
+_DAG = default_dag()
 from pathlib import Path
 
 FAIL: list[str] = []
@@ -50,7 +56,7 @@ def raises(fn, *exc) -> bool:
 # ==========================================================================
 def test_predicates():
     section("predicates: parsing and schema checking")
-    from predicates import Predicate, PredicateError
+    from inferopt.predicates import Predicate, PredicateError
 
     ok = [
         "workload.prefix_overlap > 0.05",
@@ -85,14 +91,14 @@ def test_predicates():
         except Exception:
             continue                       # refused at parse: good
         # If it parsed, evaluating it must still fail rather than execute.
-        from fingerprint import Context
+        from inferopt.fingerprint import Context
         check(f"refuses to execute: {e}",
               raises(lambda: p.evaluate(_ctx())),
               "parsed AND evaluated -- the predicate language executes arbitrary code")
 
     # THE SUPPORTED SURFACE, pinned. A DAG author needs to know what is legal,
     # and a silent change here turns a working predicate into a skipped node.
-    from fingerprint import Context
+    from inferopt.fingerprint import Context
     surface = [
         ("2 ** 3", 8), ("7 // 2", 3), ("7 % 3", 1), ("-5", -5),
         ("1 < 2 < 3", True), ("'a' == 'a'", True),
@@ -114,7 +120,7 @@ def test_predicates():
 
     # Typos must be caught by check(), which is the entire reason it exists:
     # a mistyped path silently disables a node otherwise.
-    from predicates import resolve_path_type
+    from inferopt.predicates import resolve_path_type
     bad_paths = ["workload.prefix_overlapp", "fingerprint.model.n_param_b",
                  "fingerprint.hw.memry_gb", "nonexistent.field", "model.n_params_b"]
     for bp in bad_paths:
@@ -137,7 +143,7 @@ def _mk(td, name):
 
 def _ctx(**over):
     """A Context with a real fingerprint, cheap and offline."""
-    from fingerprint import (Context, Fingerprint, HardwareFingerprint,
+    from inferopt.fingerprint import (Context, Fingerprint, HardwareFingerprint,
                              ModelFingerprint, WorkloadFingerprint, LoraFingerprint, SLO)
     model = ModelFingerprint(
         id="test/model", architecture="TestForCausalLM", n_params_b=14.0,
@@ -165,7 +171,7 @@ def _ctx(**over):
 
 def test_predicate_eval():
     section("predicates: evaluation against a Context")
-    from predicates import Predicate
+    from inferopt.predicates import Predicate
     ctx = _ctx()
     cases = [
         ("workload.prefix_overlap > 0.05", True),
@@ -197,7 +203,7 @@ def test_predicate_eval():
 # ==========================================================================
 def test_value():
     section("traverse._value: expression detection")
-    from traverse import _value
+    from inferopt.traverse import _value
     ctx = _ctx()
 
     # Plain strings that CONTAIN punctuation must survive unchanged. The
@@ -240,7 +246,7 @@ def test_value():
 
 def test_variants():
     section("traverse._variants: config construction")
-    from traverse import _variants
+    from inferopt.traverse import _variants
     ctx = _ctx()
     base = {"a": 1, "keep": "me"}
 
@@ -286,7 +292,7 @@ def test_variants():
 # ==========================================================================
 def _t(node_id="n", goodput=10.0, ttft=100.0, itl=10.0, mem=10.0,
        quality=None, slo_ok=True, **kw):
-    from traverse import Trial
+    from inferopt.traverse import Trial
     return Trial(node_id=node_id, config=kw.pop("config", {}), goodput=goodput,
                  ttft_p99_ms=ttft, itl_p99_ms=itl, memory_gb=mem,
                  quality=quality if quality is not None else {"math_500": 0.5},
@@ -306,14 +312,14 @@ def test_trial_axes():
           f"measured one on the quality axis and lands on the frontier for free")
 
     ax = _t().axes()
-    from traverse import OBJECTIVES
+    from inferopt.traverse import OBJECTIVES
     check("axes covers exactly the objectives", set(ax) == set(OBJECTIVES),
           f"axes={sorted(ax)} objectives={sorted(OBJECTIVES)}")
 
 
 def test_frontier():
     section("Result.frontier: non-domination")
-    from traverse import Result
+    from inferopt.traverse import Result
 
     def R(trials):
         return Result(trials=trials, incumbent={}, visited=[], skipped=[],
@@ -398,7 +404,7 @@ def test_frontier():
              itl=rng.uniform(1, 100), mem=rng.uniform(1, 100),
              quality={"q": rng.uniform(0, 1)}) for i in range(60)]
     fr = R(ts).frontier()
-    from traverse import OBJECTIVES
+    from inferopt.traverse import OBJECTIVES
     def dominates(x, y):
         xa, ya = x.axes(), y.axes()
         return (all((xa[k] >= ya[k]) if d == "max" else (xa[k] <= ya[k])
@@ -424,7 +430,7 @@ def test_pb_design():
     still prints, the numbers still look like effects, and they are wrong.
     """
     section("plackett-burman: design properties")
-    from pb_screen import pb_design, effects
+    from inferopt.pb_screen import pb_design, effects
 
     for nf, want_n in ((5, 12), (8, 12), (11, 12), (12, 20), (15, 20)):
         design, n = pb_design(nf)
@@ -562,7 +568,7 @@ def test_replay():
     strategy wins, so its own arithmetic has to be beyond doubt."""
     section("replay: the table")
     import random as _r
-    from replay import (Table, regret, sequential_dag, pb_then_factorial,
+    from inferopt.replay import (Table, regret, sequential_dag, pb_then_factorial,
                         pb_anchored, random_search, yolo, screen_fidelity,
                         STRATEGIES, _spearman)
 
@@ -695,7 +701,7 @@ def test_moe_backend_and_int_flags():
     """
     section("moe backend: the expert layers, not the declared algorithm")
     import tempfile
-    from evaluator import (moe_expert_state, reconcile_moe_backend,
+    from inferopt.evaluator import (moe_expert_state, reconcile_moe_backend,
                            _moe_backends, to_cli)
 
     # vLLM's own lists. An empty set here is not a neutral result -- the caller
@@ -778,7 +784,7 @@ def test_moe_backend_and_int_flags():
         # the overlap. Picking from the NVFP4 list alone would return cutlass,
         # which vLLM refuses for the unquantized expert layers -- the same class
         # of failure as the original bug, one branch further down.
-        import evaluator as _ev
+        import inferopt.evaluator as _ev
         real = _ev._moe_backends
         try:
             _ev._moe_backends = lambda kind: (
@@ -834,8 +840,8 @@ def test_moe_backend_and_int_flags():
     check("strings are untouched", pair.get("--kv-cache-dtype") == "fp8_e4m3")
 
     section("the DAG's own arithmetic yields integers")
-    d = json.loads(Path("dag/llm.json").read_text())
-    from predicates import Predicate
+    d = json.loads(_DAG.read_text())
+    from inferopt.predicates import Predicate
     ctx = _ctx(incumbent={"max_num_seqs": 256})
     bad = []
     for n in d["nodes"]:
@@ -862,7 +868,7 @@ def test_qps_source():
     matters as much as its value."""
     section("qps: stated, derived, or refused")
     import tempfile
-    from fingerprint import WorkloadFingerprint
+    from inferopt.fingerprint import WorkloadFingerprint
 
     rows = [{"prompt": "x", "input_tokens": 100, "output_tokens": 50,
              "arrival_ts": i * 0.5, "prefix_id": None, "temperature": 0.0}
@@ -905,7 +911,7 @@ def test_qps_source():
               f"{w.n_requests} reqs, out {w.mean_output_tokens}")
 
     section("qps: the request surface")
-    from request import InferOptRequest
+    from inferopt.request import InferOptRequest
     tr = "data/trace_shared.jsonl"      # InferOptRequest validates the path
     if Path(tr).exists():
         check("qps must be positive",
@@ -922,7 +928,7 @@ def test_methods_comparable():
     """Three search methods must emit records that can be put in one table."""
     section("methods: yolo's cells")
     import tempfile
-    from pb_screen import pb_design
+    from inferopt.pb_screen import pb_design
 
     # yolo measures exactly two DISTINCT configs however many launches it makes.
     # That is its defining property: cheapest possible, and unable to attribute
@@ -971,7 +977,7 @@ def test_methods_comparable():
           any(all(c.get(f"flag{f[1]}") for f in top) for c in cfgs))
 
     section("methods: compare.py reads every shape")
-    from compare import load, num, acc
+    from inferopt.compare import load, num, acc
     check("num formats and falls back", num(1.234) == "1.2" and num(None) == "-")
     check("num survives a bad type", num("x") == "-", "must not raise mid-table")
     check("acc reads a benchmark out of a trial",
@@ -1013,7 +1019,7 @@ def test_methods_comparable():
               "'incumbent' matches no trial, so nothing is ever marked shipped")
 
     section("compare: the joint Pareto frontier")
-    from compare import pareto, collect, AXES
+    from inferopt.compare import pareto, collect, AXES
 
     # Domination, on points where the answer is not in doubt.
     pts = [{"goodput": 100.0, "quality": 0.9, "ttft_p99_ms": 100.0},   # best at all
@@ -1062,7 +1068,7 @@ def test_methods_comparable():
 def test_doe_analysis():
     """The analysis layered on the screen: aliases, Lenth, every response."""
     section("aliases: what a main effect is confounded with")
-    from pb_screen import pb_design, aliases, lenth, response_effects, effects
+    from inferopt.pb_screen import pb_design, aliases, lenth, response_effects, effects
 
     names = [f"f{i}" for i in range(6)]
     fs = [{"id": n} for n in names]
@@ -1120,7 +1126,7 @@ def test_seed_from_run():
     """Continuing from a previous run's answer, rather than from the seed."""
     section("seed-from-run: the config a stage starts at")
     import tempfile
-    from evaluator import hardware_defaults
+    from inferopt.evaluator import hardware_defaults
 
     prev = {
         "incumbent": {"config": {"enable_prefix_caching": True,
@@ -1178,7 +1184,7 @@ def test_seed_from_run():
 def test_api_types():
     """The user-facing quality layer: judge, metric, and a reported change."""
     section("Metric: direction is mandatory, never inferred")
-    from api_types import Sample, Verdict, Metric, QualityChange
+    from inferopt.api_types import Sample, Verdict, Metric, QualityChange
 
     check("a built-in gets its direction", Metric("pass@1").direction == "max")
     check("a lower-is-better built-in is not assumed to be max",
@@ -1255,7 +1261,7 @@ def _err(fn):
 # ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
-    d = json.loads(Path("dag/llm.json").read_text())
+    d = json.loads(_DAG.read_text())
     nodes = {n["id"]: n for n in d["nodes"]}
     check("node ids are unique", len(nodes) == len(d["nodes"]),
           f"{len(d['nodes'])} nodes, {len(nodes)} unique ids")
@@ -1272,7 +1278,7 @@ def test_dag_file():
 
     # Every benchmark a node asks for must be registered in quality.py, or the
     # traversal raises at the first quality node -- hours in.
-    from quality import BENCHMARKS
+    from inferopt.quality import BENCHMARKS
     for n in d["nodes"]:
         for b in (n.get("quality_benchmarks") or []):
             check(f"{n['id']} asks for a registered benchmark: {b}", b in BENCHMARKS,
@@ -1282,7 +1288,7 @@ def test_dag_file():
               f"declared in the DAG but absent from quality.py")
 
     # Every predicate parses AND type-checks against the real schema.
-    from predicates import Predicate
+    from inferopt.predicates import Predicate
     ids = set(nodes) | {"incumbent"}
     for n in d["nodes"]:
         e = n.get("applicable_when")
@@ -1336,7 +1342,7 @@ def test_dag_file():
 def test_requires_matches_edges():
     section("dag: `requires` agrees with the actual edges")
     import networkx as nx
-    d = json.loads(Path("dag/llm.json").read_text())
+    d = json.loads(_DAG.read_text())
     nodes = {n["id"]: n for n in d["nodes"]}
     g = nx.DiGraph()
     for i in nodes:
@@ -1362,7 +1368,7 @@ def test_requires_matches_edges():
 
 def test_reachability():
     section("dag/llm.json: reachability and termination")
-    d = json.loads(Path("dag/llm.json").read_text())
+    d = json.loads(_DAG.read_text())
     nodes = {n["id"]: n for n in d["nodes"]}
     start = d.get("traversal", {}).get("start") or "incumbent"
 

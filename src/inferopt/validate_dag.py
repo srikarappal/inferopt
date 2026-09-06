@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import json
 import sys
+
+from inferopt._paths import default_dag
 from typing import Literal
 
 import networkx as nx
-from predicates import Predicate, PredicateError
+from inferopt.predicates import Predicate, PredicateError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 NodeClass = Literal["root", "lossless", "lossy", "checkpoint", "terminal"]
@@ -282,4 +284,4 @@ def main(path: str) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "dag/llm.json"))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else str(default_dag())))

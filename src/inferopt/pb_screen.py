@@ -54,6 +54,8 @@ whatever reasoning went into the nodes.
 
 from __future__ import annotations
 
+from inferopt._paths import default_dag
+
 import argparse
 import json
 import math
@@ -92,8 +94,8 @@ def factors_from_dag(dag: dict, ctx) -> list[dict]:
     False for this workload is not a factor -- it would be off in all 12 runs
     and the column would be degenerate.
     """
-    from predicates import Predicate
-    from traverse import _variants
+    from inferopt.predicates import Predicate
+    from inferopt.traverse import _variants
 
     out = []
     for n in dag["nodes"]:
@@ -242,7 +244,8 @@ def main() -> int:
     ap.add_argument("--trace", required=True)
     ap.add_argument("--ttft-p99", type=float, default=500)
     ap.add_argument("--itl-p99", type=float, default=250)
-    ap.add_argument("--dag", default="dag/llm.json")
+    ap.add_argument("--dag", default=None,
+                    help="DAG to screen against; defaults to the shipped one")
     ap.add_argument("--run-dir", default="runs/pb")
     ap.add_argument("--repeats", type=int, default=1,
                     help="LAUNCHES per design row. Repeats must be separate "
@@ -265,11 +268,11 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8300)
     a = ap.parse_args()
 
-    from methods import MethodRunner, setup
-    from run import seed_config
+    from inferopt.methods import MethodRunner, setup
+    from inferopt.run import seed_config
 
     fp, slo, ctx = setup(a.model, a.trace, a.ttft_p99, a.itl_p99, a.qps)
-    dag = json.loads(Path(a.dag).read_text())
+    dag = json.loads(Path(a.dag or default_dag()).read_text())
 
     base = seed_config(fp)              # all factors OFF, same seed the walk uses
     factors = factors_from_dag(dag, ctx)
@@ -288,7 +291,7 @@ def main() -> int:
           f"of {len(design)} rows. No row is 'everything on' -- each is a different\n"
           f"  mix, which is what lets the difference of means isolate one factor.\n")
 
-    from provenance import banner, provenance
+    from inferopt.provenance import banner, provenance
     meta = provenance(ap, a, fp, extra={
         "design": "plackett-burman", "n": n,
         "factors": [f["id"] for f in factors],

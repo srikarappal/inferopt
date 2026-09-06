@@ -73,9 +73,12 @@ import sys
 import textwrap
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-QUANT_PKGS = HERE / ".quant-pkgs"
-ARTIFACTS = HERE / "artifacts"
+from inferopt._paths import home as _home, workspace as _workspace
+# The workspace, not the package. Artifacts are 10-60 GB each and must never
+# be written into site-packages.
+HERE = _home()
+QUANT_PKGS = _workspace(".quant-pkgs")
+ARTIFACTS = _workspace("artifacts")
 
 # NVIDIA's own quantizer, replacing llmcompressor. Two reasons beyond provenance:
 #
@@ -153,7 +156,7 @@ def _child_env() -> dict:
     most of why it replaced llmcompressor. The subprocess remains only to keep a
     multi-GB model load out of the parent process.
     """
-    from evaluator import child_env
+    from inferopt.evaluator import child_env
     return child_env()
 
 
@@ -493,7 +496,7 @@ def smoke(log=print) -> bool:
     for kind in ("nvfp4", "w4a16", "autoquant@8.0"):
         log(f"\n  --- {kind} on {SMOKE_MODEL} ---")
         try:
-            from request import InferOptRequest, build_fingerprint
+            from inferopt.request import InferOptRequest, build_fingerprint
             fp, _ = build_fingerprint(InferOptRequest(
                 model=SMOKE_MODEL, trace=str(calib)))
             path = ensure_variant(fp, kind, str(calib), log=log)
@@ -516,7 +519,7 @@ def smoke(log=print) -> bool:
         # out to `ninja`, which lives beside this interpreter. A subprocess
         # inherits only PATH, so a bare env dies deep in engine init with
         # FileNotFoundError: ninja -- which reads like a format problem and is not.
-        from evaluator import child_env
+        from inferopt.evaluator import child_env
         r = subprocess.run([sys.executable, str(probe), path],
                            env=child_env(), capture_output=True, text=True, timeout=1800)
         if "[load] OK" in r.stdout:
@@ -574,7 +577,7 @@ def main() -> int:
                      f"{sorted(MODELOPT_CFG)} or autoquant@<bits>")
         if base == "autoquant" and "@" not in a.produce:
             ap.error("autoquant needs a bit budget, e.g. autoquant@5.0")
-        from request import InferOptRequest, build_fingerprint
+        from inferopt.request import InferOptRequest, build_fingerprint
         fp, _ = build_fingerprint(InferOptRequest(model=a.model, trace=a.trace))
         path = ensure_variant(fp, a.produce, a.trace)
         print(path or f"{a.produce}: no artifact -- this is a load-time vLLM flag")

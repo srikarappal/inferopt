@@ -48,9 +48,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from calibration import STORE
-from fingerprint import Context, NodeMeasurement
-from predicates import Predicate
+from inferopt.calibration import STORE
+from inferopt.fingerprint import Context, NodeMeasurement
+from inferopt.predicates import Predicate
 
 # Frontier axes and their direction. Goodput already encodes the latency SLO
 # (requests that miss it earn nothing), but ttft is kept as its own axis because

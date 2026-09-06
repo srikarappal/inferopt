@@ -52,7 +52,7 @@ import statistics
 from pathlib import Path
 from typing import Callable
 
-from pb_screen import pb_design, effects
+from inferopt.pb_screen import pb_design, effects
 
 
 # ---------------------------------------------------------------- the table

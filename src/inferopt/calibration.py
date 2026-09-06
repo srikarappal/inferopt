@@ -41,9 +41,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from fingerprint import Fingerprint
+from inferopt.fingerprint import Fingerprint
 
-STORE_PATH = Path(__file__).parent / "calibration.json"
+from inferopt._paths import workspace as _workspace
+STORE_PATH = _workspace("calibration.json")
 
 # Used until a real measurement exists for this (model, hardware) pair.
 DEFAULT_ACCEPT_BAND = 0.05

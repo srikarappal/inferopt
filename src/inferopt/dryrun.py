@@ -26,11 +26,11 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from calibration import STORE
-from fingerprint import (
+from inferopt.calibration import STORE
+from inferopt.fingerprint import (
     Context, NodeMeasurement, Fingerprint, HardwareFingerprint, ModelFingerprint, SLO, WorkloadFingerprint,
 )
-from traverse import Trial, report, traverse
+from inferopt.traverse import Trial, report, traverse
 
 BASE_GOODPUT = 480.0
 NOISE = 0.019          # the measured across-launch spread
@@ -120,7 +120,10 @@ def build_context() -> Context:
 
 if __name__ == "__main__":
     import json
-    dag = json.load(open("dag/llm.json"))
+
+    from inferopt._paths import default_dag
+
+    dag = json.loads(default_dag().read_text())
     ctx = build_context()
     ev = DryRunEvaluator(seed=7)
     # A synthetic baseline so the report's anchor path is exercised. Without one

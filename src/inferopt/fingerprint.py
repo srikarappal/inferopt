@@ -1,6 +1,6 @@
 """The stage-0 fingerprint: the contract every DAG predicate reads.
 
-    from fingerprint import Fingerprint, Context
+    from inferopt.fingerprint import Fingerprint, Context
 
 Each field below is referenced by at least one `applicable_when` expression in
 dag/*.json. Defining them here turns "predicate silently evaluated false because

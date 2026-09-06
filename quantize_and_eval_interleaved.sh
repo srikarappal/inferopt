@@ -23,6 +23,13 @@
 # others comparable, and status.tsv says which are missing.
 
 set -uo pipefail
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 
 MODEL="Qwen/Qwen3-14B"
 TRACE="data/trace_shared.jsonl"
@@ -67,7 +74,7 @@ for K in "${KINDS[@]}"; do
     else
         note "converting $K"
         rm -rf "$DIR"
-        if python quantize.py --model "$MODEL" --trace "$TRACE" --produce "$K" \
+        if python -m inferopt.quantize --model "$MODEL" --trace "$TRACE" --produce "$K" \
                 2>&1 | tee "$LOGS/produce-$TAG.log"; then
             record produce "$K" ok
         else
@@ -83,7 +90,7 @@ for K in "${KINDS[@]}"; do
         record eval "$K" cached
     else
         note "evaluating $K"
-        if python eval_repro.py --model "$DIR" --trace "$TRACE" \
+        if python -m inferopt.eval_repro --model "$DIR" --trace "$TRACE" \
                 --benchmark "$BENCH" --repeats "$REPEATS" \
                 --run-dir "$OUT/q_$TAG" 2>&1 | tee "$LOGS/eval-$TAG.log"; then
             record eval "$K" ok
@@ -93,7 +100,7 @@ for K in "${KINDS[@]}"; do
     fi
 
     note "results so far"
-    python summarize.py || true
+    python -m inferopt.summarize || true
 done
 
 # The two variants with no artifact.
@@ -107,7 +114,7 @@ for C in stock fp8; do
         continue
     fi
     note "evaluating $C (config, no artifact)"
-    if python eval_repro.py --model "$MODEL" --trace "$TRACE" \
+    if python -m inferopt.eval_repro --model "$MODEL" --trace "$TRACE" \
             --config "configs/$C.json" --benchmark "$BENCH" --repeats "$REPEATS" \
             --run-dir "$OUT/q_$C" 2>&1 | tee "$LOGS/eval-$C.log"; then
         record eval "$C" ok
@@ -115,11 +122,11 @@ for C in stock fp8; do
         record eval "$C" FAILED
     fi
     note "results so far"
-    python summarize.py || true
+    python -m inferopt.summarize || true
 done
 
 note "final"
-python summarize.py
+python -m inferopt.summarize
 echo
 echo "  per-step status: $STATUS"
 echo "  logs:            $LOGS/"

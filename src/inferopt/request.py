@@ -48,6 +48,7 @@ HISTORY -- detection bugs, all of which produced believable wrong answers
 from __future__ import annotations
 
 import json
+import time
 import os
 import subprocess
 from pathlib import Path
@@ -56,7 +57,7 @@ from huggingface_hub import hf_hub_download
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from fingerprint import (
+from inferopt.fingerprint import (
     DTYPE_BYTES,
     SLO,
     Fingerprint,
@@ -402,8 +403,21 @@ def _checkpoint_params(model: str, log=print, config: dict | None = None) -> tup
             for sh in shards:
                 url = hf_hub_url(model, sh)
                 def rd(a, b, url=url):
-                    r = requests.get(url, headers={"Range": f"bytes={a}-{b}"}, timeout=30)
-                    return r.content if r.status_code in (200, 206) else None
+                    # Retried, because this now issues one request PER SHARD --
+                    # sixty for a large MoE -- and a single reset by peer would
+                    # otherwise discard the whole count and fall back to the
+                    # bytes/width estimate this function exists to replace.
+                    for attempt in range(3):
+                        try:
+                            r = requests.get(url, headers={"Range": f"bytes={a}-{b}"},
+                                             timeout=30)
+                            if r.status_code in (200, 206):
+                                return r.content
+                        except Exception:
+                            if attempt == 2:
+                                raise
+                            time.sleep(0.5 * (attempt + 1))
+                    return None
                 readers.append(rd)
 
         qm = str(((config or {}).get("quantization_config") or {})
@@ -619,7 +633,7 @@ def detect_quantization_capability(sm_major: int, *, log=print) -> dict[str, boo
                 write a checkpoint. awq_marlin kernels need cc >= 8.0.
       nvfp4     Blackwell-native FP4; needs cc >= 10.0 and llmcompressor.
     """
-    from quantize import producer_available
+    from inferopt.quantize import producer_available
     have_producer = producer_available()
     caps = {
         "fp8": sm_major >= 8,          # 8.9+ in practice; cc_major==8 covers Ada

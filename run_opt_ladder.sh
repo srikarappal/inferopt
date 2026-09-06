@@ -31,6 +31,13 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 MODEL=${MODEL:-${1:-Qwen/Qwen3-1.7B}}
 TAG=${TAG:-$(echo "$MODEL" | sed 's|.*/||; s|Qwen3[.-]*||; s|-Instruct||' | tr 'A-Z' 'a-z')}
 TRACE=${TRACE:-data/trace_shared.jsonl}
@@ -59,7 +66,7 @@ echo "  baseline  $BASE"
   NOTE: no $BASE/eval.json. The comparison still runs, but with no stock
   reference to read the three methods against. To produce one:
 
-    $PY eval_repro.py --model $MODEL --benchmark math_500 --n 500 --repeats 3 \\
+    $PY -m inferopt.eval_repro --model $MODEL --benchmark math_500 --n 500 --repeats 3 \\
         --trace $TRACE --serving-concurrency 30 --run-dir $BASE
 MSG
 echo
@@ -87,7 +94,7 @@ step() {
 
 # Order is cheapest first, so a short run still produces something comparable.
 step "yolo   (4 launches)" "$YOLO" \
-    $PY yolo_run.py --model "$MODEL" --trace "$TRACE" \
+    $PY -m inferopt.yolo_run --model "$MODEL" --trace "$TRACE" \
         --ttft-p99 "$TTFT" --itl-p99 "$ITL" --qps "$QPS" \
         --repeats 2 --run-dir "$YOLO"
 
@@ -106,7 +113,7 @@ step "yolo   (4 launches)" "$YOLO" \
 # The aiconfigurator config belongs in the comparison as its own BASELINE row,
 # measured like stock is, not as one competitor's starting point.
 step "seqDAG (~7 launches)" "$SEQ" \
-    $PY run.py optimize --model "$MODEL" --trace "$TRACE" \
+    $PY -m inferopt.run optimize --model "$MODEL" --trace "$TRACE" \
         --ttft-p99 "$TTFT" --itl-p99 "$ITL" --qps "$QPS" \
         --lossless-only --skip-predict --quality-every-node --run-dir "$SEQ"
 
@@ -114,7 +121,7 @@ step "seqDAG (~7 launches)" "$SEQ" \
 # across-launch spread on each row mean, so the survivors are chosen by Lenth's
 # margin rather than by group spread; raise it to 2 if nothing resolves.
 step "pbDAG  (20 launches)" "$PB" \
-    $PY pb_screen.py --model "$MODEL" --trace "$TRACE" \
+    $PY -m inferopt.pb_screen --model "$MODEL" --trace "$TRACE" \
         --ttft-p99 "$TTFT" --itl-p99 "$ITL" --qps "$QPS" \
         --survivors 3 --run-dir "$PB"
 
@@ -132,7 +139,7 @@ if [ -z "$DIRS" ]; then
 fi
 ARGS=""
 [ -f "$BASE/eval.json" ] && ARGS="--baseline $BASE"
-$PY compare.py $DIRS $ARGS --plot "runs/${TAG}-frontier.png" 2>&1 \
+$PY -m inferopt.compare $DIRS $ARGS --plot "runs/${TAG}-frontier.png" 2>&1 \
     | tee "runs/${TAG}-comparison.txt"
 echo
 echo "  wrote runs/${TAG}-comparison.txt and runs/${TAG}-frontier.png"

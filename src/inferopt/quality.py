@@ -87,8 +87,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-HERE = Path(__file__).resolve().parent
-DATA = HERE / "data"
+from inferopt._paths import data as _data, home as _home
+HERE = _home()
+DATA = _data()
 TRAVERSAL_N = 100
 
 # Said once per process: a caveat repeated 21 times in a ladder is noise.

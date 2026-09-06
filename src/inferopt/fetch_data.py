@@ -32,7 +32,8 @@ import random
 import sys
 from pathlib import Path
 
-DATA = Path(__file__).parent / "data"
+from inferopt._paths import data as _data, workspace as _workspace
+DATA = _data()
 
 
 
@@ -78,7 +79,7 @@ def fetch_mbpp_plus() -> None:
     installed for a side feature.
     """
     import subprocess
-    pkgs = Path(__file__).parent / ".evalplus-pkgs"
+    pkgs = _workspace(".evalplus-pkgs")
     if not pkgs.is_dir():
         raise RuntimeError(
             f"{pkgs} not found. Install evalplus isolated -- NOT into the serving "

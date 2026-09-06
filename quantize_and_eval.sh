@@ -14,6 +14,13 @@
 # Each step logs to runs/quantize/logs/ so a failure is diagnosable afterwards.
 
 set -uo pipefail
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 
 MODEL="Qwen/Qwen3-14B"
 TRACE="data/trace_shared.jsonl"
@@ -46,7 +53,7 @@ for K in "${KINDS[@]}"; do
         continue
     fi
     note "producing $K"
-    if python quantize.py --model "$MODEL" --trace "$TRACE" --produce "$K" \
+    if python -m inferopt.quantize --model "$MODEL" --trace "$TRACE" --produce "$K" \
             2>&1 | tee "$LOGS/produce-${K/@/_}.log"; then
         record produce "$K" ok
     else
@@ -63,7 +70,7 @@ for K in "${KINDS[@]}"; do
     TAG="${K/@/_}"
     [ -d "$DIR" ] || { record eval "$K" "no artifact"; continue; }
     note "evaluating $K"
-    if python eval_repro.py --model "$DIR" --trace "$TRACE" \
+    if python -m inferopt.eval_repro --model "$DIR" --trace "$TRACE" \
             --benchmark "$BENCH" --repeats "$REPEATS" \
             --run-dir "$OUT/q_$TAG" 2>&1 | tee "$LOGS/eval-$TAG.log"; then
         record eval "$K" ok
@@ -81,7 +88,7 @@ done
 # --------------------------------------------------------------------------
 for C in stock fp8; do
     note "evaluating $C (config, no artifact)"
-    if python eval_repro.py --model "$MODEL" --trace "$TRACE" \
+    if python -m inferopt.eval_repro --model "$MODEL" --trace "$TRACE" \
             --config "configs/$C.json" --benchmark "$BENCH" --repeats "$REPEATS" \
             --run-dir "$OUT/q_$C" 2>&1 | tee "$LOGS/eval-$C.log"; then
         record eval "$C" ok

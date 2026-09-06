@@ -33,16 +33,18 @@ HISTORY
 
 from __future__ import annotations
 
+from inferopt._paths import default_dag
+
 import argparse
 import json
 import random
 import sys
 from pathlib import Path
 
-from calibration import STORE
-from fingerprint import NodeMeasurement
-from request import InferOptRequest, build_fingerprint
-from traverse import report, traverse
+from inferopt.calibration import STORE
+from inferopt.fingerprint import NodeMeasurement
+from inferopt.request import InferOptRequest, build_fingerprint
+from inferopt.traverse import report, traverse
 
 # Benchmarks run once on the seed so the frontier has a quality axis. Lossless
 # nodes inherit these; lossy nodes re-measure.
@@ -133,7 +135,7 @@ def seed_config(fp) -> dict:
     # Hardware-required flags come from ONE place, so every launch path gets
     # them -- see evaluator.hardware_defaults. They go UNDER the seed, so
     # anything set above wins.
-    from evaluator import hardware_defaults
+    from inferopt.evaluator import hardware_defaults
     cfg = {**hardware_defaults(fp), **cfg}
     return cfg
 
@@ -241,8 +243,8 @@ def cmd_optimize(args) -> int:
     prefetch_weights(fp.model.id)
     print()
 
-    from evaluator import VllmEvaluator
-    from fingerprint import Context
+    from inferopt.evaluator import VllmEvaluator
+    from inferopt.fingerprint import Context
 
     cfg = seed_config(fp)
 
@@ -277,7 +279,7 @@ def cmd_optimize(args) -> int:
         # config may predate (unified-memory utilisation, moe_backend). Imported
         # here, as seed_config does -- evaluator pulls in torch and vLLM, and
         # importing it at module scope makes `run.py --help` load the CUDA stack.
-        from evaluator import hardware_defaults
+        from inferopt.evaluator import hardware_defaults
         cfg = {**inc, **{k: v for k, v in hardware_defaults(fp).items()
                          if k not in inc}}
         kept = [t.get("node_id") for t in (prev.get("trials") or []) if t.get("kept")]
@@ -289,7 +291,7 @@ def cmd_optimize(args) -> int:
     elif args.skip_predict:
         print(f"  stage 1.2 skipped by --skip-predict")
     else:
-        from predictor import describe, predict
+        from inferopt.predictor import describe, predict
         try:
             pred = predict(fp, slo)
             describe(pred)
@@ -314,7 +316,7 @@ def cmd_optimize(args) -> int:
     journal.write_text("")          # truncate once, here; traverse only appends
 
     port = free_port(args.port)
-    from provenance import banner, provenance, trial_stamp
+    from inferopt.provenance import banner, provenance, trial_stamp
     stamp = trial_stamp(fp, args.trace, slo)
     meta = provenance(ap_ref[0], args, fp, extra={
         "port": port,
@@ -339,7 +341,7 @@ def cmd_optimize(args) -> int:
         # quality axis is empty.
         # levels=SWEEP_LEVELS makes this one launch do both jobs: measure the
         # baseline AND characterise capacity across the full geometric range.
-        from evaluator import SWEEP_LEVELS
+        from inferopt.evaluator import SWEEP_LEVELS
         sweep_off = args.skip_sweep or args.fixed_concurrency
         t = ev.measure(cfg, probes=["goodput", "equivalence", "quality"],
                        benchmarks=BASELINE_BENCHMARKS, node_id="stage_1_3",
@@ -457,7 +459,7 @@ def cmd_optimize(args) -> int:
                   f"moves with the incumbent")
             print(f"  {'-'*68}\n")
 
-    dag = json.loads(Path(args.dag).read_text())
+    dag = json.loads(Path(args.dag or default_dag()).read_text())
     res = traverse(dag, ctx, ev, lossless_only=args.lossless_only,
                    journal=journal, baseline=baseline,
                    concurrency=operating_L,
@@ -584,7 +586,8 @@ def main() -> int:
                         "is flagged. Default 0.03. A lossless step should not move the "
                         "eval at all -- this is a defect threshold, not a budget.")
     o.add_argument("--adapter", action="append")
-    o.add_argument("--dag", default="dag/llm.json")
+    o.add_argument("--dag", default=None,
+                   help="DAG to walk; defaults to the shipped one")
     o.add_argument("--gpu", default="0")
     o.add_argument("--port", type=int, default=8100,
                    help="first port to try; the next free one is used if taken")

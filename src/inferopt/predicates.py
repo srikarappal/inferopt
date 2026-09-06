@@ -37,7 +37,7 @@ from typing import Any, get_args, get_origin
 
 from pydantic import BaseModel
 
-from fingerprint import Context, NodeMeasurement
+from inferopt.fingerprint import Context, NodeMeasurement
 
 ALLOWED_FUNCS: dict[str, Any] = {
     "ceil": lambda x, to=1: math.ceil(x / to) * to,

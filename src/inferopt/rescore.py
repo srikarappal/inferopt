@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 def rescore_dir(d: Path, benchmark: str) -> bool:
-    from quality import BENCHMARKS
+    from inferopt.quality import BENCHMARKS
 
     ev = d / "eval.json"
     gens = sorted(d.glob("generations-*.jsonl"))

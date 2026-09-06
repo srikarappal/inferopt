@@ -82,7 +82,7 @@ def memory_fraction(fp) -> float:
     per card on an H100 -- the number was right for the machine it was written on
     and wrong everywhere else.
     """
-    from evaluator import hardware_defaults
+    from inferopt.evaluator import hardware_defaults
     return hardware_defaults(fp)["gpu_memory_utilization"]
 
 
@@ -99,7 +99,7 @@ def stock_config(fp) -> dict:
     That is a requirement to start at all, not a tuning decision, and it is
     printed so it is never mistaken for one.
     """
-    from evaluator import hardware_defaults
+    from inferopt.evaluator import hardware_defaults
     return dict(hardware_defaults(fp))
 
 
@@ -123,7 +123,7 @@ def configs_under_test(a, fp) -> list[tuple[str, dict]]:
         # names one explicitly, so a config file is portable across hardware.
         out = []
         for i, p in enumerate(a.config):
-            from evaluator import hardware_defaults
+            from inferopt.evaluator import hardware_defaults
             # Hardware requirements UNDER the file, so the file always wins.
             c = {**hardware_defaults(fp), **load_config(p)}
             out.append((Path(p).stem, c))
@@ -146,7 +146,7 @@ def score_once(ev, model, rows, bench, concurrency, prompt=None):
     """
     import httpx
 
-    from evaluator import _one
+    from inferopt.evaluator import _one
 
     prompt = prompt or bench.prompt
     prompts = [prompt(r) for r in rows]
@@ -212,10 +212,10 @@ def main() -> int:
     ap.add_argument("--run-dir", default="runs/eval")
     a = ap.parse_args()
 
-    from evaluator import VllmEvaluator
-    from quality import BENCHMARKS, _load
-    from request import InferOptRequest, build_fingerprint
-    from run import free_port
+    from inferopt.evaluator import VllmEvaluator
+    from inferopt.quality import BENCHMARKS, _load
+    from inferopt.request import InferOptRequest, build_fingerprint
+    from inferopt.run import free_port
 
     if a.benchmark not in BENCHMARKS:
         raise SystemExit(f"  unknown benchmark {a.benchmark!r}; have {', '.join(BENCHMARKS)}")
@@ -231,7 +231,7 @@ def main() -> int:
     # _chat_wrapper); measuring the filter against untemplated text while
     # generating from templated text would under-count the prompt by the
     # template's own tokens.
-    from quality import _chat_wrapper
+    from inferopt.quality import _chat_wrapper
     prompt = _chat_wrapper(bench.prompt, a.model) if bench.chat else bench.prompt
 
     # Every config is scored on the IDENTICAL problem list. A traversal filters
@@ -266,7 +266,7 @@ def main() -> int:
     outdir = Path(a.run_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    from provenance import banner, provenance
+    from inferopt.provenance import banner, provenance
     meta = provenance(ap, a, fp, extra={
         "port": port,                       # free_port may differ from --port
         "configs": {name: cfg for name, cfg in tests},

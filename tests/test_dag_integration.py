@@ -18,6 +18,12 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path as _P
+sys.path.insert(0, str(_P(__file__).resolve().parent.parent / 'src'))
+
+from inferopt._paths import default_dag
+
+_DAG = default_dag()
 import tempfile
 from pathlib import Path
 
@@ -56,7 +62,7 @@ class ScriptedEvaluator:
 
     def measure(self, config, *, probes, benchmarks, node_id,
                 concurrency=None, levels=None, fixed_concurrency=None):
-        from traverse import Trial
+        from inferopt.traverse import Trial
         self.calls.append((node_id, dict(config)))
         self.concurrencies.append(concurrency)
         spec = self.script.get(node_id, self.default)
@@ -93,7 +99,7 @@ def node(i, nxt="end", cls="lossless", **kw):
 
 
 def ctx(**over):
-    from fingerprint import (Context, Fingerprint, HardwareFingerprint, SLO,
+    from inferopt.fingerprint import (Context, Fingerprint, HardwareFingerprint, SLO,
                              LoraFingerprint, ModelFingerprint, WorkloadFingerprint)
     fp = Fingerprint(
         model=ModelFingerprint(id="t/m", architecture="A", n_params_b=14.0,
@@ -120,7 +126,7 @@ def ctx(**over):
 
 
 def run(dag, script, *, default=10.0, c=None, **kw):
-    from traverse import traverse
+    from inferopt.traverse import traverse
     ev = ScriptedEvaluator(script, default)
     res = traverse(dag, c or ctx(), ev, log=lambda *a: None, **kw)
     return res, ev
@@ -298,7 +304,7 @@ def test_launch_failure():
 def test_evaluator_exception():
     section("an evaluator exception does not lose completed trials")
     d = mkdag([node("a", "boom"), node("boom", "c"), node("c")])
-    from traverse import traverse
+    from inferopt.traverse import traverse
     ev = ScriptedEvaluator({"incumbent": 10.0, "a": 50.0,
                             "boom": RuntimeError("engine died"), "c": 99.0})
     with tempfile.TemporaryDirectory() as td:
@@ -320,7 +326,7 @@ def test_evaluator_exception():
 def test_journal():
     section("the journal is complete and readable mid-run")
     d = mkdag([node("a", "b"), node("b")])
-    from traverse import traverse
+    from inferopt.traverse import traverse
     ev = ScriptedEvaluator({"incumbent": 10.0, "a": 50.0, "b": 12.0})
     with tempfile.TemporaryDirectory() as td:
         j = Path(td) / "t.jsonl"
@@ -399,7 +405,7 @@ def test_sweep_variants_all_measured():
 
 def test_real_dag_walks():
     section("the real DAG walks end to end")
-    dag = json.loads(Path("dag/llm.json").read_text())
+    dag = json.loads(_DAG.read_text())
     res, ev = run(dag, {}, default=10.0, c=ctx(), lossless_only=True)
     check("it terminates", isinstance(res.visited, list) and res.visited,
           "no nodes visited")
@@ -462,7 +468,7 @@ def test_malformed_dag_errors_clearly():
     which node to look at.
     """
     section("malformed DAGs fail with a usable message")
-    from traverse import traverse
+    from inferopt.traverse import traverse
 
     def go(dag):
         try:
@@ -490,8 +496,8 @@ def test_malformed_dag_errors_clearly():
           e and "ghost" in e and not e.startswith("KeyError"), f"{e}")
 
     # the validator catches the same three, plus multi-target edges
-    import validate_dag as V
-    d = json.loads(Path("dag/llm.json").read_text())
+    import inferopt.validate_dag as V
+    d = json.loads(_DAG.read_text())
     for n in d["nodes"]:
         if n["id"] == "prefix_caching":
             n["on_keep"] = ["max_model_len_rightsize", "chunked_prefill"]
@@ -501,7 +507,7 @@ def test_malformed_dag_errors_clearly():
           f"errors={errs} -- traverse follows [0], so the rest is unreachable "
           f"while the validator counts it in route lengths")
 
-    d = json.loads(Path("dag/llm.json").read_text())
+    d = json.loads(_DAG.read_text())
     d["nodes"].append(dict(d["nodes"][3]))
     _, _, errs = V.build(d)
     check("the validator refuses duplicate ids",
@@ -550,7 +556,7 @@ def test_branch_semantics():
     # This asserts that convention still holds, so a future node that breaks it
     # fails here rather than silently taking the wrong branch.
     import networkx as nx
-    dag = json.loads(Path("dag/llm.json").read_text())
+    dag = json.loads(_DAG.read_text())
     nodes = {n["id"]: n for n in dag["nodes"]}
     for nid, n in nodes.items():
         if n.get("status") != "active" or n.get("on_keep") == n.get("on_revert"):
@@ -576,10 +582,10 @@ def test_validator_rejects_bad_dags():
     its own coverage.
     """
     section("validate_dag rejects malformed DAGs")
-    import validate_dag as V
+    import inferopt.validate_dag as V
 
     def errs_for(mutate):
-        d = json.loads(Path("dag/llm.json").read_text())
+        d = json.loads(_DAG.read_text())
         mutate(d)
         _, _, errs = V.build(d)
         return errs
@@ -621,7 +627,7 @@ def test_validator_rejects_bad_dags():
           f"errors={e}")
 
     # The unmodified DAG must be clean, or every check above is meaningless.
-    _, _, clean = V.build(json.loads(Path("dag/llm.json").read_text()))
+    _, _, clean = V.build(json.loads(_DAG.read_text()))
     check("the real DAG produces no errors", not clean, f"errors={clean}")
 
 
@@ -792,13 +798,13 @@ def test_zero_incumbent():
 
 def test_baseline_carried():
     section("the stage 1.3 baseline reaches the Result")
-    from traverse import traverse, Trial
+    from inferopt.traverse import traverse, Trial
     base = Trial(node_id="stage_1_3", config={"seed": True}, goodput=5.7,
                  ttft_p99_ms=5419.0, itl_p99_ms=175.0, memory_gb=95.0,
                  quality={"math_500": 0.71})
     ev = ScriptedEvaluator({"a": 50.0})
     c = ctx()
-    from fingerprint import NodeMeasurement
+    from inferopt.fingerprint import NodeMeasurement
     c.incumbent_metrics = NodeMeasurement(kept=True, goodput=5.7)
     res = traverse(mkdag([node("a")]), c, ev, log=lambda *a: None, baseline=base)
     check("Result.baseline is the seed measurement",
@@ -811,7 +817,7 @@ def test_baseline_carried():
 
 def test_report_renders():
     section("report() renders every shape without raising")
-    from traverse import report, Result, Trial
+    from inferopt.traverse import report, Result, Trial
     def T(**kw):
         d = {"node_id": "n", "config": {}, "goodput": 10.0, "ttft_p99_ms": 100.0,
              "itl_p99_ms": 10.0, "memory_gb": 10.0}

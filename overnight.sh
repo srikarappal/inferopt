@@ -20,6 +20,13 @@
 
 set -uo pipefail
 cd "$(dirname "$0")"
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 PY=${PYTHON:-/home/srikar/miniconda3/envs/verticalinference/bin/python}
 export CUDA_VISIBLE_DEVICES=0
 TRACE=data/trace_shared.jsonl
@@ -30,7 +37,7 @@ say() { printf '\n[%s] === %s ===\n' "$(date '+%F %T')" "$*"; }
 # because the job was started from another shell and is not our child.
 wait_for_gpu() {
     local n=0
-    while pgrep -f "pb_screen.py|run.py optimize|yolo_run.py|eval_repro.py" >/dev/null 2>&1; do
+    while pgrep -f "-m inferopt.pb_screen|-m inferopt.run optimize|-m inferopt.yolo_run|-m inferopt.eval_repro" >/dev/null 2>&1; do
         [ $((n % 30)) -eq 0 ] && say "waiting for the in-flight job ($((n)) min so far)"
         sleep 60; n=$((n+1))
         [ $n -gt 480 ] && { say "STILL running after 8h; giving up on the wait"; return 1; }
@@ -54,7 +61,7 @@ wait_for_gpu
 # ---- 1.7B: the same-seed re-run, so the three methods are comparable at all
 run_step "1.7B seqDAG (--skip-predict, same seed as yolo/pb)" \
     runs/1.7b-seqdag-2/result.json \
-    $PY run.py optimize --model Qwen/Qwen3-1.7B --trace $TRACE \
+    $PY -m inferopt.run optimize --model Qwen/Qwen3-1.7B --trace $TRACE \
         --ttft-p99 500 --itl-p99 250 --qps 16 --lossless-only \
         --skip-predict --quality-every-node --run-dir runs/1.7b-seqdag-2
 
@@ -69,18 +76,18 @@ cat > /tmp/aic-1.7b.json <<'JSON'
  "enforce_eager": true}
 JSON
 run_step "1.7B aiconfigurator baseline" runs/1.7b-aiconfig/eval.json \
-    $PY eval_repro.py --model Qwen/Qwen3-1.7B --benchmark math_500 \
+    $PY -m inferopt.eval_repro --model Qwen/Qwen3-1.7B --benchmark math_500 \
         --n 500 --repeats 3 --trace $TRACE --serving-concurrency 30 \
         --config /tmp/aic-1.7b.json --run-dir runs/1.7b-aiconfig
 
 say "1.7B comparison (with the same-seed walk)"
-$PY compare.py runs/1.7b-seqdag-2 runs/1.7b-yolo runs/1.7b-pb \
+$PY -m inferopt.compare runs/1.7b-seqdag-2 runs/1.7b-yolo runs/1.7b-pb \
     --baseline runs/1.7b-baseline --plot runs/1.7b-frontier.png \
     2>&1 | tee runs/1.7b-comparison.txt
 
 # ---- 14B: stock baseline first, so the methods have an anchor
 run_step "14B stock baseline" runs/14b-baseline/eval.json \
-    $PY eval_repro.py --model Qwen/Qwen3-14B --benchmark math_500 \
+    $PY -m inferopt.eval_repro --model Qwen/Qwen3-14B --benchmark math_500 \
         --n 500 --repeats 3 --trace $TRACE --serving-concurrency 30 \
         --run-dir runs/14b-baseline
 
@@ -95,7 +102,7 @@ wait_for_gpu
 # are not comparable with any walk. This is last because it is the longest --
 # autoquant@5.0 is not built for the 14B and will be produced here.
 run_step "14B lossy walk (builds autoquant@5.0)" runs/14b-lossy-1/result.json \
-    $PY run.py optimize --model Qwen/Qwen3-14B --trace $TRACE \
+    $PY -m inferopt.run optimize --model Qwen/Qwen3-14B --trace $TRACE \
         --ttft-p99 500 --itl-p99 250 --qps 16 --allow-loss 0.1 \
         --skip-predict --run-dir runs/14b-lossy-1
 

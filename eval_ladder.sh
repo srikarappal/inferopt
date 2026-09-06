@@ -23,6 +23,13 @@
 # others comparable, and status.tsv says which are missing.
 
 set -uo pipefail
+# Prefer an INSTALLED package (pip install -e .). Only fall back to src/ when
+# there is none, so a bare checkout works with no install step and an
+# editable install is never shadowed by a stale tree.
+if ! "${PYTHON:-python}" -c "import inferopt" >/dev/null 2>&1; then
+    export PYTHONPATH="$(cd "$(dirname "$0")" && pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 
 BENCH="${1:-mbpp_plus}"
 N="${2:-378}"
@@ -51,7 +58,7 @@ done
 # mbpp_plus executes generated code. Say so once, plainly, before it starts.
 if [ "$BENCH" = "mbpp_plus" ]; then
     echo "  NOTE: mbpp_plus EXECUTES model-written Python in a subprocess"
-    echo "        (mbpp_score.py, under evalplus rlimits and timeouts)."
+    echo "        (-m inferopt.mbpp_score, under evalplus rlimits and timeouts)."
     echo "        That guards against runaway code, not against an adversary."
 fi
 
@@ -82,7 +89,7 @@ PY
         rm -rf "$OUT/$name"
     fi
     note "evaluating $name"
-    if python eval_repro.py --benchmark "$BENCH" --n "$N" --repeats "$REPEATS" \
+    if python -m inferopt.eval_repro --benchmark "$BENCH" --n "$N" --repeats "$REPEATS" \
             --trace "$TRACE" --run-dir "$OUT/$name" "$@" \
             2>&1 | tee "$LOGS/$name.log"; then
         record "$name" ok
@@ -90,7 +97,7 @@ PY
         record "$name" FAILED
     fi
     note "results so far"
-    python summarize.py "$OUT" || true
+    python -m inferopt.summarize "$OUT" || true
 }
 
 # The three with no artifact, in the order that makes the ladder readable:
@@ -112,7 +119,7 @@ run_one q_fp8      --model "$MODEL" --config configs/fp8.json
 # What this GPU can actually run. NVFP4 needs Blackwell (sm100+/sm120+); on an
 # H100 (sm90) the engine refuses to load, so the row would burn a model load and
 # a launch timeout to discover what the fingerprint already knows.
-SKIP=$(python check_support.py 2>/dev/null || echo "")
+SKIP=$(python -m inferopt.check_support 2>/dev/null || echo "")
 [ -n "$SKIP" ] && echo "  NOTE: unsupported on this GPU, skipping: $SKIP"
 
 # Then whatever was actually built, in whatever precision it landed at.
@@ -132,7 +139,7 @@ for DIR in artifacts/${SAFE}--*; do
 done
 
 note "final"
-python summarize.py "$OUT"
+python -m inferopt.summarize "$OUT"
 echo
 echo "  per-step status: $STATUS"
 echo "  logs:            $LOGS/"

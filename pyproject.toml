@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inferopt"
+version = "0.1.0"
+description = "Search serving configurations for an LLM and return a measured Pareto frontier"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+
+# vLLM and torch are DELIBERATELY not dependencies. They are large, CUDA-version
+# specific, and usually already provisioned on a GPU host; resolving them here
+# would be more likely to break a working environment than to fix a broken one.
+# setup.sh checks for them and says what to install. Same reasoning as evalplus,
+# which is installed into an isolated tree because it drags in openai, anthropic
+# and google-generativeai for generation backends this project never uses.
+dependencies = [
+    "pydantic>=2",
+    "httpx",
+    "huggingface-hub",
+    "requests",
+    "platformdirs",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.7"]
+data = ["datasets"]
+dev = ["networkx", "python-docx", "matplotlib>=3.7"]
+
+[project.scripts]
+inferopt = "inferopt.run:main"
+inferopt-screen = "inferopt.pb_screen:main"
+inferopt-yolo = "inferopt.yolo_run:main"
+inferopt-compare = "inferopt.compare:main"
+inferopt-eval = "inferopt.eval_repro:main"
+inferopt-fetch-data = "inferopt.fetch_data:main"
+inferopt-selftest = "inferopt.selftest:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["inferopt"]
+
+[tool.setuptools.package-data]
+# The shipped DAG travels with the wheel; runs/, artifacts/ and data/ do not --
+# they are workspace data and resolve through inferopt._paths.
+inferopt = ["dag/*.json"]

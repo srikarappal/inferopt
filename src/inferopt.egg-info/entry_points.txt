@@ -1,0 +1,8 @@
+[console_scripts]
+inferopt = inferopt.run:main
+inferopt-compare = inferopt.compare:main
+inferopt-eval = inferopt.eval_repro:main
+inferopt-fetch-data = inferopt.fetch_data:main
+inferopt-screen = inferopt.pb_screen:main
+inferopt-selftest = inferopt.selftest:main
+inferopt-yolo = inferopt.yolo_run:main
