@@ -60,6 +60,22 @@ def load(d: str | Path) -> dict | None:
         q_ship = (kept[-1].get("quality") if kept else None) or \
                  ((base or {}).get("quality") or {})
         ship_id = kept[-1].get("node_id") if kept else "stage_1_3 (seed)"
+        # A missing incumbent_peak is not "this method shipped nothing". The
+        # finalist sweep used to skip the incumbent whenever it was off the
+        # frontier, leaving a run that kept a node and deployed it looking, in
+        # this table, like it produced no answer at all. Fall back to the trial
+        # that node was measured at -- lower than a swept peak, and honest.
+        if not peak.get("goodput") and kept:
+            best_kept = max((t for t in trials
+                             if t.get("node_id") == ship_id and t.get("goodput")),
+                            key=lambda t: t["goodput"], default=None)
+            if best_kept:
+                peak = {"goodput": best_kept["goodput"],
+                        "concurrency": best_kept.get("concurrency"),
+                        "ttft_p99_ms": best_kept.get("ttft_p99_ms"),
+                        "itl_p99_ms": best_kept.get("itl_p99_ms"),
+                        "slo_attainment": (best_kept.get("diagnostics") or {}).get("slo_attainment"),
+                        "_from_trial": True}
         if peak.get("goodput"):
             chosen = {"node_id": ship_id, "goodput": peak["goodput"],
                       "concurrency": peak.get("concurrency"),

@@ -433,6 +433,19 @@ def cmd_optimize(args) -> int:
     finalist_curves = {}
     if not args.skip_sweep and not args.no_finalist_sweep and not args.fixed_concurrency:
         finalists = res.frontier()[: args.finalists]
+        # THE INCUMBENT IS NOT NECESSARILY ON THE FRONTIER, and the run ships the
+        # incumbent. On Qwen3-1.7B the walk kept prefix_caching, graph_capture
+        # dominated it on the frontier, and all three finalists swept were nodes
+        # the run did NOT deploy -- so incumbent_peak came back empty and the
+        # shipped config had no capacity number at all. A capacity sweep that
+        # skips the thing being shipped measures the wrong configs.
+        inc_id = _incumbent_node(res)
+        if inc_id and not any(t.node_id == inc_id for t in finalists):
+            extra = [t for t in res.trials if t.node_id == inc_id and t.goodput]
+            if extra:
+                finalists = finalists + [max(extra, key=lambda t: t.goodput)]
+                print(f"\n  the incumbent ({inc_id}) is not on the frontier; "
+                      f"sweeping it anyway -- it is what this run ships")
         if finalists:
             print(f"\n  sweeping {len(finalists)} frontier finalist(s) for capacity\n")
         for t in finalists:

@@ -335,6 +335,131 @@ def _stored_bytes_per_param(model: str, log=print, sample: int = 3) -> float | N
         return None
 
 
+# Bits per LOGICAL value for checkpoints that pack several values into one
+# stored element. Read from quantization_config.quant_method, which is
+# trustworthy about the packing even where it lies about the width -- DeepSeek-V3
+# declares fp8 and ships BF16, but no checkpoint declares a packing it does not
+# use, because the loader would produce garbage.
+_PACKED_BITS = {"mxfp4": 4, "nvfp4": 4, "int4": 4, "awq": 4, "gptq": 4,
+                "fp4": 4, "int8": 8, "fp8": 8}
+_STORED_BITS = {"U8": 8, "I8": 8, "UINT8": 8, "INT8": 8}
+
+
+def _checkpoint_params(model: str, log=print, config: dict | None = None) -> tuple[float, dict] | None:
+    """EXACT parameter count, by summing prod(shape) over every stored tensor.
+
+    Reads all shard headers rather than sampling, and never converts bytes into
+    parameters. That conversion is what broke on natively mixed-precision
+    checkpoints: gpt-oss-120b stores its experts in MXFP4 and its attention,
+    router, embeddings and lm_head in bf16, so no single bytes-per-param is
+    true. Dividing its 65.2 GB by one width reported 65.2B parameters against
+    114.7B of routed experts computed from config geometry, and the MoE
+    reconciliation correctly concluded the two disagreed -- about a checkpoint
+    that was entirely fine.
+
+    A safetensors header already names every tensor's shape, so the count needs
+    no assumption at all. The information was being computed and then discarded:
+    _stored_bytes_per_param summed the same shapes purely to divide them away.
+
+    Returns (parameters in billions, bytes-by-dtype), or None if unreadable.
+    Headers are a few KB each; the weights are never fetched.
+    """
+    import math
+    import struct
+
+    def header(read_range):
+        raw = read_range(0, 7)
+        if not raw or len(raw) < 8:
+            return None
+        n = struct.unpack("<Q", raw[:8])[0]
+        if n <= 0 or n > 200_000_000:
+            return None
+        blob = read_range(8, 8 + n - 1)
+        if not blob or len(blob) < n:
+            return None
+        try:
+            return json.loads(blob[:n])
+        except Exception:
+            return None
+
+    try:
+        local = Path(model)
+        readers = []
+        if local.is_dir():
+            for f in sorted(local.glob("*.safetensors")):
+                readers.append(lambda a, b, f=f: _slice(f, a, b))
+        else:
+            import requests
+            from huggingface_hub import hf_hub_url
+            try:
+                idx = json.loads(Path(hf_hub_download(
+                    model, "model.safetensors.index.json")).read_text())
+                shards = sorted(set(idx["weight_map"].values()))
+            except Exception:
+                shards = ["model.safetensors"]
+            # EVERY shard, not a sample. A sample is enough to estimate a ratio
+            # and not enough to count anything.
+            for sh in shards:
+                url = hf_hub_url(model, sh)
+                def rd(a, b, url=url):
+                    r = requests.get(url, headers={"Range": f"bytes={a}-{b}"}, timeout=30)
+                    return r.content if r.status_code in (200, 206) else None
+                readers.append(rd)
+
+        qm = str(((config or {}).get("quantization_config") or {})
+                 .get("quant_method", "")).lower()
+        logical_bits = _PACKED_BITS.get(qm)
+
+        params = 0.0
+        by_dtype: dict[str, float] = {}
+        packed_tensors = 0
+        for rd in readers:
+            h = header(rd)
+            if not h:
+                return None                      # a partial count is worse than none
+            names = set(h)
+            for name, meta in h.items():
+                if name == "__metadata__" or not isinstance(meta, dict):
+                    continue
+                shape = meta.get("shape") or []
+                offs = meta.get("data_offsets") or [0, 0]
+                dt = str(meta.get("dtype", "?")).upper()
+                by_dtype[dt] = by_dtype.get(dt, 0.0) + (offs[1] - offs[0])
+
+                # Scales are quantization METADATA, not model parameters. They
+                # occupy bytes -- so they stay in the footprint -- but counting
+                # them as parameters inflates the total by one value per block.
+                if name.endswith("_scales") or name.endswith(".scale") \
+                        or name.endswith("_scale") or name.endswith(".weight_scale"):
+                    continue
+
+                n = math.prod(shape) if shape else 0
+
+                # PACKING. An MXFP4 tensor arrives as U8 with a trailing block
+                # dimension: down_proj_blocks is [32, 2880, 90, 16] -- 16 bytes
+                # per block holding 32 four-bit values. prod(shape) counts the
+                # BYTES, so the logical parameter count is twice that. Counting
+                # storage elements is how a 117B model reported 63B.
+                if logical_bits and dt in _STORED_BITS:
+                    sibling = (name.rsplit("_blocks", 1)[0] + "_scales") in names
+                    if name.endswith("_blocks") or sibling:
+                        n *= _STORED_BITS[dt] // logical_bits
+                        packed_tensors += 1
+                params += n
+        if params <= 0:
+            return None
+        mix = ", ".join(f"{k} {v/1e9:.1f}GB" for k, v in
+                        sorted(by_dtype.items(), key=lambda x: -x[1])[:4])
+        log(f"    checkpoint holds {params/1e9:.2f}B parameters exactly "
+            f"({len(readers)} shard header(s); {mix}"
+            + (f"; {packed_tensors} packed {qm} tensors unpacked "
+               f"x{8 // logical_bits}" if packed_tensors else "") + ")")
+        return params / 1e9, by_dtype
+    except Exception as e:
+        log(f"    could not count parameters ({type(e).__name__}: {e})")
+        return None
+
+
 def _slice(path: Path, a: int, b: int) -> bytes:
     with open(path, "rb") as fh:
         fh.seek(a)
@@ -561,7 +686,19 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
                   f"to torch_dtype ({stored_bytes} bytes/param), which may be wrong -- "
                   f"DeepSeek-V3 declares fp8 and stores BF16")
 
-    if ck_bytes:
+    # THE EXACT COUNT WINS. bytes / bytes-per-param is an estimate that assumes
+    # one storage width for the whole file, and a natively mixed-precision
+    # checkpoint has none: gpt-oss-120b keeps experts in MXFP4 and attention in
+    # bf16, so the division reported 65.2B parameters for a 117B model and the
+    # MoE reconciliation rejected a checkpoint that was correct.
+    #
+    # stored_bytes is still computed and still useful -- it describes the
+    # FOOTPRINT, which is what weight_gb and the memory budget need -- but it is
+    # no longer asked to answer a question about parameter counts.
+    exact = _checkpoint_params(req.model, config=c)
+    if exact:
+        n_params_b = exact[0]
+    elif ck_bytes:
         n_params_b = ck_bytes / stored_bytes / 1e9
     else:
         h, L, V = c["hidden_size"], n_layers, c.get("vocab_size", 0)
