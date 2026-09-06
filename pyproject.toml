@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plots = ["matplotlib>=3.7"]
+plots = ["matplotlib>=3.7", "seaborn"]
 data = ["datasets"]
-dev = ["networkx", "python-docx", "matplotlib>=3.7"]
+dev = ["networkx", "python-docx", "matplotlib>=3.7", "seaborn"]
 
 [project.scripts]
 inferopt = "inferopt.run:main"

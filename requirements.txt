@@ -48,3 +48,11 @@ python-docx==1.2.0
 #
 # This project has been broken twice by a dependency installed for a side
 # feature. Both stay isolated.
+
+# Plotting. compare.py --plot and plot_pb.py need matplotlib; without it they
+# report "plot failed" and the run continues, which is the right behaviour for
+# an optional output but a poor surprise at the end of a six-hour comparison.
+# seaborn is not imported anywhere -- listed because it travels with these
+# analyses in practice and costs nothing to have.
+matplotlib>=3.7
+seaborn
