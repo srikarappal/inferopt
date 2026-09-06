@@ -28,14 +28,24 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# A checkout is recognised by things a wheel would not carry: the DAG directory
-# alongside a pyproject, or the run outputs of previous work. Deliberately not
+# A checkout is recognised by things a wheel would not carry. Deliberately not
 # ".git" -- a user may vendor this without the history.
-_WORKSPACE_MARKERS = ("pyproject.toml", "dag", "runs")
+#
+# "dag" WAS a marker and became stale in the same commit that introduced these:
+# the migration moved it to src/inferopt/dag, and runs/ does not exist in a
+# fresh clone, so a newly cloned checkout matched one marker out of three and
+# fell through to the platformdirs directory. setup.sh then installed evalplus
+# into ./.evalplus-pkgs while fetch_data looked for it under
+# ~/.local/share/inferopt, and the dataset fetch failed on a machine where
+# everything was in fact present.
+_WORKSPACE_MARKERS = ("pyproject.toml", "src/inferopt", "runs", "data", "setup.sh")
 
 
 def _looks_like_workspace(p: Path) -> bool:
-    return sum((p / m).exists() for m in _WORKSPACE_MARKERS) >= 2
+    # pyproject alone is not enough -- any Python project has one, and a
+    # checkout nested inside another would otherwise claim its parent.
+    return ((p / "pyproject.toml").exists() and (p / "src" / "inferopt").is_dir()) \
+        or sum((p / m).exists() for m in _WORKSPACE_MARKERS) >= 3
 
 
 def home() -> Path:
