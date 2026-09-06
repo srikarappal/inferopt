@@ -1,17 +1,28 @@
 # Serving environment. Install into ONE venv and run everything with that
-# interpreter -- the most common failure on a new host is running run.py with a
+# interpreter -- the most common failure on a new host is running the CLI with a
 # different python than the one vLLM lives in, which surfaces as
 # `FileNotFoundError: 'vllm'` from deep inside a subprocess.
 #
-#   python -m pip install -r requirements.txt
-#   python -c "import vllm; print(vllm.__version__)"     # must succeed
+#   ./install_vllm.sh                                    # NOT plain pip
+#   python -c "import vllm; print(vllm.__version__)"      # must succeed
 #
-# vLLM is pinned because it is the measurement instrument. 0.26 removed flags
-# that earlier versions accepted (--disable-log-requests, --swap-space,
-# --cuda-graph-sizes, --tokenizer-pool-size) and renamed Prometheus metrics
-# (gpu_cache_usage_perc -> kv_cache_usage_perc). Numbers from a different
-# version are not comparable to the ones in docs/.
-vllm==0.26.0
+# vLLM IS NOT LISTED HERE, and that is deliberate.
+#
+# `pip install vllm==0.26.0` resolves to the PyPI default wheel, which for 0.26
+# is built against CUDA 13. On a host whose driver reports 12.x that wheel
+# imports and then dies on `libcudart.so.13: cannot open shared object file` --
+# and worse, it drags torch, torchvision, torchaudio and torchcodec in as CUDA 13
+# builds too, so fixing them one at a time fails one import deeper each round.
+#
+# The right build depends on the DRIVER, which a requirements file cannot see.
+# install_vllm.sh reads it from nvidia-smi and picks the matching wheel.
+#
+# vLLM stays version-pinned inside that script because it is the measurement
+# instrument: 0.26 removed flags earlier versions accepted
+# (--disable-log-requests, --swap-space, --cuda-graph-sizes,
+# --tokenizer-pool-size) and renamed Prometheus metrics (gpu_cache_usage_perc ->
+# kv_cache_usage_perc). Numbers from a different version are not comparable to
+# the ones in docs/. A different CUDA BUILD of the same version is fine.
 
 # torch is NOT pinned here on purpose. vLLM depends on it and the correct build
 # is CUDA-version specific: cu126/cu128 for H100 (sm90), cu130 for GB10 (sm121).

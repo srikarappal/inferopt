@@ -50,6 +50,7 @@ for m in ("torch", "vllm", "transformers", "httpx", "pydantic", "datasets"):
 if missing:
     print(f"\n  MISSING: {', '.join(missing)}")
     print(f"  Install them into THIS interpreter -- not another env:")
+    print(f"      ./install_vllm.sh          # picks the CUDA build your driver runs")
     print(f"      {sys.executable} -m pip install -r requirements.txt")
     if "torch" in missing or "vllm" in missing:
         print(f"  torch must match this host's CUDA (cu126/cu128 for H100 sm90,")
