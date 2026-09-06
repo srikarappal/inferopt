@@ -1116,6 +1116,65 @@ def test_doe_analysis():
 
 
 # ==========================================================================
+def test_seed_from_run():
+    """Continuing from a previous run's answer, rather than from the seed."""
+    section("seed-from-run: the config a stage starts at")
+    import tempfile
+    from evaluator import hardware_defaults
+
+    prev = {
+        "incumbent": {"config": {"enable_prefix_caching": True,
+                                 "max_model_len": 7168, "max_num_seqs": 256}},
+        "incumbent_peak": {"goodput": 118.7},
+        "trials": [{"node_id": "prefix_caching", "kept": True, "goodput": 100.0},
+                   {"node_id": "chunked_prefill", "kept": False, "goodput": 90.0}],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "prev"; d.mkdir()
+        (d / "result.json").write_text(json.dumps(prev))
+
+        # The loader is the piece under test: read the incumbent, let
+        # hardware_defaults fill only what the incumbent does not state.
+        r = json.loads((d / "result.json").read_text())
+        inc = (r.get("incumbent") or {})
+        inc = inc.get("config") or inc
+        fp = _ctx().fingerprint
+        cfg = {**inc, **{k: v for k, v in hardware_defaults(fp).items() if k not in inc}}
+
+        check("the previous incumbent's settings survive",
+              cfg["enable_prefix_caching"] is True and cfg["max_model_len"] == 7168,
+              f"{cfg}")
+        check("the incumbent WINS over a hardware default it also sets",
+              cfg["max_num_seqs"] == 256,
+              "a measured config must not be overwritten by a default")
+        for k, v in hardware_defaults(fp).items():
+            if k not in inc:
+                check(f"hardware default {k} is still applied", cfg.get(k) == v,
+                      "rails the previous config predates must still land")
+                break
+
+        # A run that kept nothing still has an incumbent -- the seed -- and must
+        # not be mistaken for an empty file.
+        (d / "result.json").write_text(json.dumps(
+            {"incumbent": {"config": {"max_model_len": 4096}}, "trials": []}))
+        r2 = json.loads((d / "result.json").read_text())
+        i2 = (r2.get("incumbent") or {}); i2 = i2.get("config") or i2
+        check("a run that kept nothing still yields its config", i2 == {"max_model_len": 4096})
+
+        # An older result.json stores the incumbent flat rather than under
+        # "config"; both shapes are on disk in runs/ today.
+        r3 = {"incumbent": {"max_model_len": 2048}}
+        i3 = (r3.get("incumbent") or {}); i3 = i3.get("config") or i3
+        check("a flat incumbent (older result.json) is read too",
+              i3 == {"max_model_len": 2048},
+              "runs/ holds both shapes; only one of them is nested")
+
+        empty = Path(td) / "empty"; empty.mkdir()
+        check("a directory with no result.json is detectable",
+              not (empty / "result.json").exists())
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -1258,7 +1317,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

@@ -245,7 +245,45 @@ def cmd_optimize(args) -> int:
     from fingerprint import Context
 
     cfg = seed_config(fp)
-    if args.skip_predict:
+
+    # CONTINUE FROM A PREVIOUS RUN'S ANSWER, rather than restarting from the
+    # conservative seed.
+    #
+    # Within ONE traversal this already happens by construction: the lossy nodes
+    # sit after the lossless ones and inherit the incumbent, which is why the
+    # MoE runs quantized on top of speculative decoding rather than instead of
+    # it. The gap is between INVOCATIONS. Running the lossless stage and the
+    # lossy stage as two commands restarts the second from the seed, and on
+    # Qwen3-14B that seed cannot meet the SLO at all -- stage 1.3 measured a
+    # TTFT p99 of 2948ms against a 500ms target, goodput ~0, and the run
+    # correctly refused to continue because every downstream percentage would
+    # have been a ratio against zero. Six hours of queued work produced nothing.
+    #
+    # The lossless answer is already on disk and cost 155 minutes. Quantization
+    # explored from a config that serves is both cheaper and the only version
+    # where the ratios mean anything.
+    if args.seed_from_run:
+        src = Path(args.seed_from_run) / "result.json"
+        if not src.exists():
+            print(f"  --seed-from-run: no result.json in {args.seed_from_run}")
+            return 1
+        prev = json.loads(src.read_text())
+        inc = (prev.get("incumbent") or {})
+        inc = inc.get("config") or inc
+        if not inc:
+            print(f"  --seed-from-run: {src} records no incumbent config")
+            return 1
+        # hardware_defaults still wins: it carries the rails the previous run's
+        # config may predate (unified-memory utilisation, moe_backend).
+        cfg = {**inc, **{k: v for k, v in hardware_defaults(fp).items()
+                         if k not in inc}}
+        kept = [t.get("node_id") for t in (prev.get("trials") or []) if t.get("kept")]
+        pk = (prev.get("incumbent_peak") or {}).get("goodput")
+        print(f"  seeding from {args.seed_from_run}")
+        print(f"    it kept {kept or ['(nothing)']}"
+              + (f" and peaked at {pk:.1f} tok/s" if pk else ""))
+        print(f"    stage 1.2 is skipped -- a measured incumbent beats a prediction")
+    elif args.skip_predict:
         print(f"  stage 1.2 skipped by --skip-predict")
     else:
         from predictor import describe, predict
@@ -549,6 +587,13 @@ def main() -> int:
                    help="first port to try; the next free one is used if taken")
     o.add_argument("--run-dir", default="runs/latest")
     o.add_argument("--budget-minutes", type=int, default=180)
+    o.add_argument("--seed-from-run", default=None, metavar="RUNDIR",
+                   help="start from a previous run's incumbent config instead "
+                        "of the conservative seed. Use it to run the lossy "
+                        "stage on top of a finished lossless search rather than "
+                        "restarting from a config that may not even meet the "
+                        "SLO. Implies --skip-predict: a measured incumbent is "
+                        "better evidence than a prediction.")
     o.add_argument("--skip-predict", action="store_true",
                    help="skip stage 1.2 and use the conservative seed")
     o.add_argument("--fixed-concurrency", type=int, default=None, metavar="N",
