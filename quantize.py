@@ -310,6 +310,36 @@ if kind.startswith("autoquant@"):
         print(f"[job] effective_bits={bits} is below this model's floor of {floor}. "
               f"Producing at {achieved} instead -- the floor is set by the "
               f"embeddings, lm_head and routers that are never quantized.", flush=True)
+
+        # RELOAD BEFORE RETRYING. auto_quantize mutates the model on its way to
+        # deciding the budget is infeasible, so the object handed to the retry is
+        # already partly quantized and modelopt refuses it:
+        #
+        #     AssertionError: Model must not be quantized!
+        #
+        # raised from replace_quant_module's `assert not is_quantized(model)`.
+        # This retry path had therefore never once succeeded -- every variant
+        # whose budget fell below the model's floor died here rather than being
+        # produced at the floor, which is the entire point of the branch. It
+        # cost a 14B lossy walk nine hours in, with three of four quantization
+        # variants still unmeasured.
+        #
+        # Reloading costs one checkpoint read. Trying to un-quantize in place
+        # would depend on modelopt's internal state being fully reversible,
+        # which is not a promise it makes.
+        print(f"[job] reloading {model_id} -- the failed attempt left the model "
+              f"partly quantized and modelopt requires a clean one", flush=True)
+        del model
+        try:
+            import gc
+            import torch as _t
+            gc.collect()
+            _t.cuda.empty_cache()
+        except Exception:
+            pass
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype="auto", device_map="auto")
+
         model, state = mtq.auto_quantize(
             model,
             constraints={"effective_bits": achieved},
