@@ -1227,7 +1227,14 @@ class VllmEvaluator:
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:
             self.log(f"        launch failed: {e}")
-            (self.run_dir / "launches" / tag / "why.txt").write_text(f"{e}\n\n{e.stderr}")
+            # mkdir first. The launch directory is created when a server is
+            # actually started, so a failure BEFORE that -- a rejected flag,
+            # an unreadable flag list -- had nowhere to write its explanation
+            # and raised FileNotFoundError from the error handler, replacing a
+            # precise LaunchError with a confusing one about a missing file.
+            wd = self.run_dir / "launches" / tag
+            wd.mkdir(parents=True, exist_ok=True)
+            (wd / "why.txt").write_text(f"{e}\n\n{getattr(e, 'stderr', '')}")
             return Trial(node_id=node_id, config=dict(config), goodput=0.0,
                          ttft_p99_ms=float("inf"), itl_p99_ms=float("inf"),
                          memory_gb=0.0, slo_ok=False,

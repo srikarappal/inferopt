@@ -152,7 +152,18 @@ def detect_hardware(req: InferOptRequest) -> HardwareFingerprint:
     out = subprocess.run(q, capture_output=True, text=True, timeout=20).stdout.strip()
     if not out:
         raise RuntimeError("nvidia-smi returned no GPUs")
-    rows = [r.split(",") for r in out.splitlines()]
+    rows = [r.split(",") for r in out.splitlines() if r.strip()]
+    # An IndexError here says "list index out of range", which reads like a bug
+    # in this file rather than what it is: nvidia-smi answered in a shape we did
+    # not expect. That happened on a host where NVML would not initialise --
+    # a driver/runtime mismatch -- and the real cause was three frames away.
+    if not rows or len(rows[0]) < 3:
+        raise RuntimeError(
+            f"nvidia-smi did not report name, compute_cap and memory.total.\n"
+            f"  got: {out[:200]!r}\n"
+            f"  Check `nvidia-smi` runs at all, and that NVML initialises -- a "
+            f"torch built for a newer CUDA than the driver supports makes this "
+            f"return nothing useful.")
     name, cc, mem = rows[0][0].strip(), rows[0][1].strip(), rows[0][2].strip()
 
     sys_ram_gb = 0.0
