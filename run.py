@@ -274,7 +274,10 @@ def cmd_optimize(args) -> int:
             print(f"  --seed-from-run: {src} records no incumbent config")
             return 1
         # hardware_defaults still wins: it carries the rails the previous run's
-        # config may predate (unified-memory utilisation, moe_backend).
+        # config may predate (unified-memory utilisation, moe_backend). Imported
+        # here, as seed_config does -- evaluator pulls in torch and vLLM, and
+        # importing it at module scope makes `run.py --help` load the CUDA stack.
+        from evaluator import hardware_defaults
         cfg = {**inc, **{k: v for k, v in hardware_defaults(fp).items()
                          if k not in inc}}
         kept = [t.get("node_id") for t in (prev.get("trials") or []) if t.get("kept")]
