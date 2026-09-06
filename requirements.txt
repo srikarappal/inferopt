@@ -24,7 +24,10 @@ datasets==5.0.1
 huggingface-hub
 httpx==0.28.1
 pydantic==2.13.4
-networkx==3.6.1
+# Only validate_dag.py uses it, for graph properties any 3.x has.
+# Pinned exactly, it made the install fail on Python 3.10, where 3.4.2
+# is the last release -- a hard stop for a dev-only dependency.
+networkx>=3.0
 requests
 certifi
 
