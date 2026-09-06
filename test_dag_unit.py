@@ -1175,6 +1175,84 @@ def test_seed_from_run():
 
 
 # ==========================================================================
+def test_api_types():
+    """The user-facing quality layer: judge, metric, and a reported change."""
+    section("Metric: direction is mandatory, never inferred")
+    from api_types import Sample, Verdict, Metric, QualityChange
+
+    check("a built-in gets its direction", Metric("pass@1").direction == "max")
+    check("a lower-is-better built-in is not assumed to be max",
+          Metric("wer").direction == "min",
+          "wer and pass@1 move opposite ways and no naming rule separates them")
+    check("higher_is_better follows direction",
+          Metric("pass@1").higher_is_better and not Metric("wer").higher_is_better)
+
+    # THE TYPO CASE. A hyphen where the built-in has an underscore would
+    # otherwise become a silent custom metric with no direction and no fn,
+    # scoring 0.0 for every config -- which reads as "quality unchanged".
+    check("an unknown name RAISES rather than defaulting",
+          raises(lambda: Metric("exact-match")),
+          "a silent custom metric scores 0.0 everywhere and looks like no change")
+    check("the error names the built-ins",
+          "exact_match" in str(_err(lambda: Metric("exact-match"))))
+    check("a custom metric is fine WITH a direction and fn",
+          Metric("mine", direction="max", fn=lambda s, v: 1.0).compute([], []) == 1.0)
+    check("a custom metric with a direction but no fn raises",
+          raises(lambda: Metric("mine", direction="max")),
+          "nothing to compute")
+
+    section("Verdict carries a reason and still acts like a bool")
+    vs = [Verdict(True), Verdict(False, reason="JSON did not parse"), Verdict(True)]
+    check("bool() works, so existing sum()/mean code is unaffected",
+          bool(vs[0]) and not bool(vs[1]))
+    check("pass@1 aggregates verdicts", abs(Metric("pass@1").compute([], vs) - 2/3) < 1e-9)
+    check("error_rate is the complement",
+          abs(Metric("error_rate").compute([], vs) - 1/3) < 1e-9)
+    check("the reason survives to the caller",
+          vs[1].reason == "JSON did not parse",
+          "a False with no reason is what made RULER's 0.05 undiagnosable")
+    check("aggregating no verdicts raises rather than returning 0.0",
+          raises(lambda: Metric("pass@1").compute([], [])),
+          "0.0 from an empty set is indistinguishable from total failure")
+
+    section("QualityChange: noise-aware and direction-aware")
+    # Real numbers from this project's own runs.
+    lossless = QualityChange("math_500", "exact_match", 0.7333, 0.7300, 0.04)
+    check("a delta inside the benchmark's resolution is not a finding",
+          lossless.within_noise and not lossless.is_regression,
+          "the lossless step moved 0.0033 against a 0.04 resolution")
+    real = QualityChange("math_500", "exact_match", 0.6633, 0.6380, 0.006)
+    check("a delta outside it IS a regression",
+          real.is_regression and not real.within_noise,
+          "nvfp4 at n=500 lost 0.0253 against a 0.006 spread")
+    up = QualityChange("math_500", "exact_match", 0.70, 0.76, 0.04)
+    check("an improvement is not reported as a regression",
+          not up.is_regression and abs(up.delta - 0.06) < 1e-9)
+    lower = QualityChange("asr", "wer", 0.10, 0.14, 0.01)
+    check("for a lower-is-better metric, a RISE is the regression",
+          lower.is_regression,
+          "direction must come from the metric, not from the sign")
+    check("...and a fall is not",
+          not QualityChange("asr", "wer", 0.14, 0.10, 0.01).is_regression)
+    check("str() states the verdict in words", "REGRESSION" in str(real))
+
+    section("Sample keeps the row intact")
+    sm = Sample(row={"answer": "42", "subject": "algebra"}, text="\\boxed{42}", index=3)
+    check("the dataset row is passed through untouched",
+          sm.row["subject"] == "algebra",
+          "judges need fields that differ per benchmark; normalising loses them")
+    check("the index is kept so verdicts can be zipped back to rows", sm.index == 3)
+
+
+def _err(fn):
+    try:
+        fn()
+    except Exception as e:
+        return e
+    return None
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(Path("dag/llm.json").read_text())
@@ -1317,7 +1395,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
