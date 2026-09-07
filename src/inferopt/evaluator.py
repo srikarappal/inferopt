@@ -72,6 +72,7 @@ import re
 import signal
 import shutil
 import subprocess
+import threading
 import sys
 import time
 from contextlib import contextmanager
@@ -704,6 +705,32 @@ def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
         "slo_attainment": (sum(r.meets(slo) for r in done) / len(done)) if done else 0.0,
         "ttft_p99_ms": pct(ttfts, 0.99) * 1e3,
         "itl_p99_ms": pct(itls, 0.99) * 1e3,
+        # p95 ALONGSIDE p99, and the sample count that both are computed over.
+        #
+        # A 45s window at L=128 completes ~384 requests, so p99 is the slowest
+        # 3.8 of them -- a max over a handful, not a percentile. Measured across
+        # three identical launches of one configuration, TTFT p99 varied 6.63x
+        # at L=64 (149, 160, 988 ms) and 3.72x at L=128, while goodput over the
+        # same launches varied 1.06x and 1.20x. The instability is in the
+        # statistic, not the server.
+        #
+        # p95 over the same window is the slowest ~19 requests, which is a
+        # percentile rather than a maximum. It is reported BESIDE p99 rather
+        # than replacing it, because p99 is what the SLO is written against and
+        # silently redefining a target is worse than exposing a noisy one.
+        #
+        # ttft_n is the count both are drawn from. A p99 over 4 requests and a
+        # p99 over 1500 are different measurements wearing the same name, and
+        # carrying the count is what lets a reader tell them apart. Lengthening
+        # the window would fix it properly and multiplies every run's cost by
+        # four, which this project does not have.
+        #
+        # None of this touches the search: goodput counts SLO-conforming
+        # requests aggregated over all ~384 completions, which is why it is
+        # stable, and goodput is what keep/revert runs on.
+        "ttft_p95_ms": pct(ttfts, 0.95) * 1e3,
+        "itl_p95_ms": pct(itls, 0.95) * 1e3,
+        "ttft_n": len(ttfts),
         "completed": len(done), "failed": len(started) - len(done), "window_s": win,
     }
 
@@ -885,6 +912,29 @@ class VllmEvaluator:
             text = httpx.get(f"{self.base_url}/metrics", timeout=10).text
         except httpx.HTTPError:
             return {}
+        return self._parse_metrics(text)
+
+    # GAUGES MUST BE SAMPLED WHILE LOAD IS ON THE SERVER. This was called only
+    # after serving_metrics returned -- that is, after the load had drained --
+    # so counters survived and gauges did not. kv_cache_usage_perc is a gauge,
+    # and it read exactly 0.000 in 32 of 32 trials across three independent
+    # search methods, which is not "the cache was empty" but "we measured it at
+    # the one moment it is guaranteed to be empty".
+    #
+    # The cost was not the number itself. It is that the whole class of
+    # KV-pressure reasoning had no data: retune_batching_after_kv exists to
+    # re-tune batching once quantization frees KV, and the signal telling it
+    # whether KV is the constraint was dead.
+    def sample_gauges(self) -> dict:
+        """Instantaneous metrics, for calling DURING a measurement window."""
+        import httpx
+        try:
+            return self._parse_metrics(
+                httpx.get(f"{self.base_url}/metrics", timeout=5).text)
+        except Exception:
+            return {}
+
+    def _parse_metrics(self, text: str) -> dict:
         raw: dict[str, float] = {}
         for line in text.splitlines():
             if line and not line.startswith("#"):
@@ -926,6 +976,22 @@ class VllmEvaluator:
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
     # --- capacity ---
+    def _gauge_watch(self, stop, out: dict, period: float = 2.0) -> None:
+        """Poll instantaneous metrics until `stop` is set, keeping the PEAK.
+
+        Peak, not mean: the question a gauge answers here is "did this
+        configuration ever run out of KV", and an average over a window that
+        includes ramp-up hides exactly the moment that matters.
+        """
+        import time as _t
+        while not stop.is_set():
+            g = self.sample_gauges()
+            for k in ("kv_cache_util", "preemptions"):
+                v = g.get(k)
+                if v is not None:
+                    out[k] = max(out.get(k, 0.0), float(v))
+            stop.wait(period)
+
     def serving_metrics(self, model, concurrency: int, *, el=lambda: "",
                         cursor: list[int] | None = None, warmup: bool = True):
         """THE serving measurement. One implementation, used by everything.
@@ -986,11 +1052,25 @@ class VllmEvaluator:
         Settle and window are a single continuous run so the window observes a
         pipeline that is already full -- see _closed_loop.
         """
-        reqs, t0, t1 = asyncio.run(_closed_loop(
-            self.base_url, model, self.prompts, self.max_tokens, L,
-            getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S, cursor=cursor))
+        # Gauges are sampled ACROSS the window and the peak kept. Read after
+        # the load drains -- which is what happened until now -- an
+        # instantaneous gauge reports the idle value, and kv_cache_usage_perc
+        # read exactly 0.000 in 32 of 32 trials across three search methods.
+        # Peak rather than mean, because the question is whether this config
+        # ever ran out of KV, and an average over the ramp hides that.
+        peak: dict = {}
+        stop = threading.Event()
+        w = threading.Thread(target=self._gauge_watch, args=(stop, peak), daemon=True)
+        w.start()
+        try:
+            reqs, t0, t1 = asyncio.run(_closed_loop(
+                self.base_url, model, self.prompts, self.max_tokens, L,
+                getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S, cursor=cursor))
+        finally:
+            stop.set(); w.join(timeout=5)
         m = summarize(reqs, t0, t1, self.slo)
         m["concurrency"] = L
+        m.update(peak)                 # kv_cache_util / preemptions, measured live
         self.log(f"        {el()} L={L:<4d} goodput {m['goodput']:7.1f} tok/s "
                  f"({m['goodput_req_s']:.2f} req/s)  thru {m['throughput']:7.1f}  "
                  f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  slo {m['slo_attainment']:.0%}  "
@@ -1077,9 +1157,19 @@ class VllmEvaluator:
                     # one.
                     conc = fixed_concurrency
                     pts = []
-                    med, passes = self.serving_metrics(
-                        model, conc, el=el, cursor=cursor, warmup=False)
-                    diag = self._metrics()
+                    peak: dict = {}
+                    _stop = threading.Event()
+                    _w = threading.Thread(target=self._gauge_watch,
+                                          args=(_stop, peak), daemon=True)
+                    _w.start()
+                    try:
+                        med, passes = self.serving_metrics(
+                            model, conc, el=el, cursor=cursor, warmup=False)
+                    finally:
+                        _stop.set(); _w.join(timeout=5)
+                    # The live peak wins over the post-drain read for gauges;
+                    # counters are identical either way.
+                    diag = {**self._metrics(), **peak}
                     div = self._equivalence(model) if "equivalence" in probes else None
                     if div is not None:
                         self.log(f"        {el()} equivalence  {div:.1%} of "
@@ -1206,7 +1296,14 @@ class VllmEvaluator:
                              f"keep/revert decision here is not resolvable at this "
                              f"sample size")
 
-                diag = self._metrics()
+                # Counters from the post-run scrape, gauges from the live peak
+                # across every level in the sweep -- the highest KV pressure any
+                # operating point reached is the number that matters.
+                diag = dict(self._metrics())
+                for k in ("kv_cache_util", "preemptions"):
+                    vals = [p[k] for p in pts if p.get(k) is not None]
+                    if vals:
+                        diag[k] = max(vals)
                 div = None
                 if "equivalence" in probes:
                     div = self._equivalence(model)

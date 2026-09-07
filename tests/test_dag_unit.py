@@ -1695,6 +1695,52 @@ def test_legality():
 
 
 # ==========================================================================
+def test_percentile_stability():
+    """p95 beside p99, and the sample count both are drawn from."""
+    section("summarize: a p99 over a handful is a maximum, not a percentile")
+    from inferopt.evaluator import Req, summarize
+    from inferopt.fingerprint import SLO
+
+    def measure(n_slow, n=400):
+        reqs = []
+        for i in range(n):
+            r = Req()
+            r.start, r.ok, r.n_out = i * 0.05, True, 10
+            r.ttft = 0.05 + (2.0 if i >= n - n_slow else 0.0)
+            r.latency = r.ttft + 0.5
+            r.token_times = [r.start + r.ttft + j * 0.05 for j in range(10)]
+            reqs.append(r)
+        return summarize(reqs, 0.0, 30.0, SLO(ttft_p99_ms=500, itl_p99_ms=250))
+
+    clean = measure(0)
+    check("the sample count is reported", clean["ttft_n"] == 400, clean["ttft_n"])
+    check("with no outliers p95 and p99 agree",
+          abs(clean["ttft_p99_ms"] - clean["ttft_p95_ms"]) < 1e-6)
+
+    # THE MEASURED INSTABILITY. Across three identical launches of one config,
+    # TTFT p99 varied 6.63x at L=64 (149/160/988ms) while goodput varied 1.06x.
+    # A 45s window at L=128 completes ~384 requests, so p99 is the slowest ~4.
+    few = measure(10)
+    check("TEN slow requests in 400 move p99",
+          few["ttft_p99_ms"] > 1000, f"{few['ttft_p99_ms']:.0f}ms")
+    check("...and do NOT move p95",
+          few["ttft_p95_ms"] < 100,
+          f"{few['ttft_p95_ms']:.0f}ms -- p95 needs ~20 of 400, p99 needs ~4")
+    many = measure(25)
+    check("twenty-five DO move p95", many["ttft_p95_ms"] > 1000)
+
+    section("summarize: the search is unaffected")
+    # goodput counts SLO-conforming requests across ALL completions, which is
+    # why it is stable at 1.0-1.06x where p99 swings 6.6x -- and goodput is what
+    # keep/revert runs on.
+    check("goodput barely moves on the same outliers",
+          abs(measure(10)["goodput"] / clean["goodput"] - 1) < 0.05,
+          "if goodput moved with p99, every keep/revert decision would be noise")
+    check("itl gets the same treatment",
+          "itl_p95_ms" in clean and "itl_p99_ms" in clean)
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1837,7 +1883,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

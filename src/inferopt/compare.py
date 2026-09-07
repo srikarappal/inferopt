@@ -313,7 +313,7 @@ def main() -> int:
 
     # --- per method
     print(f"  METHODS  ({a.benchmark} for accuracy)")
-    hdr = (f"    {'method':14s} {'ships':>9s} {'L':>4s} {'TTFT p99':>9s} "
+    hdr = (f"    {'method':14s} {'ships':>9s} {'L':>4s} {'TTFT p95':>9s} {'TTFT p99':>9s} {'n':>5s} "
            f"{'ITL p99':>8s} {'SLO':>5s} {'acc':>7s} {'launch':>7s} {'fail':>5s} "
            f"{'min':>5s} {'best seen':>10s}")
     print(hdr); print("    " + "-" * (len(hdr) - 4))
@@ -326,7 +326,9 @@ def main() -> int:
         print(f"    {r['method']:14s} "
               f"{num(gp):>9s} "
               f"{str(g(c, 'concurrency') or '-'):>4s} "
+              f"{num(g(c, 'ttft_p95_ms'), '{:.0f}ms'):>9s} "
               f"{num(g(c, 'ttft_p99_ms'), '{:.0f}ms'):>9s} "
+              f"{num(g(c, 'ttft_n'), '{:.0f}'):>5s} "
               f"{num(g(c, 'itl_p99_ms'), '{:.1f}ms'):>8s} "
               f"{num(d.get('slo_attainment'), '{:.0%}'):>5s} "
               f"{num(acc(c, a.benchmark), '{:.4f}'):>7s} "
@@ -376,7 +378,11 @@ def main() -> int:
                   f"{(num(t.get('itl_p99_ms'), '{:.1f}ms') if gp else '-'):>7s} "
                   f"{num(d.get('slo_attainment'), '{:.0%}'):>5s} "
                   f"{(f'{q:.4f}{inh}' if q is not None else '-'):>7s}")
-    print(f"\n    ~ = accuracy INHERITED from the baseline, not measured on that")
+    print(f"\n    n = requests the percentiles are drawn from. p99 over a few hundred")
+    print(f"        completions is the slowest handful, not a percentile: across three")
+    print(f"        identical launches TTFT p99 varied 6.6x at L=64 while goodput varied")
+    print(f"        1.06x. Read p95 for stability and p99 against the SLO it is written for.")
+    print(f"    ~ = accuracy INHERITED from the baseline, not measured on that")
     print(f"        config. Run the walk with --quality-every-node to remove these.")
 
     # --- who owns the joint frontier
