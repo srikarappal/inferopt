@@ -380,6 +380,74 @@ Scored on best goodput found, Pareto hypervolume, evaluations to reach a target,
 total cost. **The gate is explicit: if GEPA + sweeps does not beat the rule DAG at
 matched budget, ship stage 2 without it and say so.**
 
+### The loop, concretely
+
+The selector is an agent with a turn budget, not a genetic algorithm. Each turn it
+hypothesises one experiment, runs it, reads the result, and decides whether to continue.
+
+```
+INPUT   criteria      model, dataset, SLO, host count
+        priors        a curated list of techniques it MAY explore, and their
+                      preconditions -- not a free hand over every vLLM flag
+        history       every trial from stages 1-2: config, goodput, TTFT, ITL,
+                      SLO attainment, kv_cache_util, preemptions, prefix hit
+                      rate, the concurrency curve -- AND every failed launch
+                      with its error
+        incumbent     the best config stage 2 shipped, and what it measured
+
+LOOP    <= 16 turns
+        hypothesise -> validate -> launch -> observe -> keep or discard
+        exits early when two consecutive turns fail to clear the noise band
+
+OUTPUT  a config, and the frontier it sits on, scored against stage 2's
+```
+
+Sixteen turns is roughly 3.5 hours on a 14B, which is the same order as PB's twenty
+launches. The budget is the point: a reasoner that needs a hundred evaluations has not
+reduced sample complexity, it has renamed random search.
+
+### Four things the loop needs that stage 2 does not
+
+**A noise band it must clear before believing a result.** This is the one that decides
+whether stage 3 works at all. Two identical launches of the same config measured 633.9
+and 375.1 tok/s -- a 1.69x spread -- and three identical MoE traversals disagreed about
+which factors to keep. An agent that hypothesises from one measurement per turn will
+spend sixteen turns building a confident story out of noise. Decisive turns need
+repeats, and the prompt must state the band rather than leaving the model to infer it
+from numbers that do not carry it.
+
+**Failed launches, with their errors.** Half of what this project learned came from
+launches that died: that `moe_backend=triton` is refused for an NvFP4 MoE, that
+`max_num_batched_tokens` below `max_model_len` is illegal without chunked prefill, that
+an infeasible bit budget has a floor set by the layers modelopt never quantizes. A
+selector shown only successes will re-propose all of them.
+
+**A combination validator, not just a flag check.** The existing check catches a flag
+vLLM does not accept. It does not catch a flag it accepts in an illegal combination,
+which is the failure an agent will actually generate. Catching those before launch is
+the difference between sixteen useful turns and six.
+
+**Provenance for a non-deterministic optimizer.** Two stage-3 runs will differ. The
+stamp needs the reasoner's model, the prompt, and the seed, or the runs cannot be
+compared to each other -- let alone to stage 2, which is the whole point of the gate.
+
+### Why this rather than GEPA proper
+
+GEPA's power is reflective mutation over a Pareto frontier of candidates, sampled across
+many cheap rollouts. That regime does not exist here: an evaluation is a model load, a
+concurrency sweep and a benchmark -- thirteen minutes and a GPU. With sixteen evaluations
+there is no population to maintain and no frontier to sample from, so the machinery that
+makes GEPA GEPA has nothing to work with.
+
+What transfers is the idea worth having: reflect on execution traces in natural language
+and propose a targeted experiment, rather than perturbing a number. That is a prompt and
+a loop, and it drops into the existing `Strategy` protocol as a fourth implementation --
+scored by the same `compare.py`, against the same baselines, on the same axes.
+
+So: borrow the reflection, skip the genetics. Revisit if evaluations ever become cheap
+enough for a population to mean something -- a tabular benchmark of measured cells would
+do it, since replaying against a table costs milliseconds rather than minutes.
+
 ### Other stage-3 candidates
 
 - Custom kernel generation for an operator the profiler flags as dominant
