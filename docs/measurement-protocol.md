@@ -4,6 +4,10 @@ How inferopt measures a serving configuration, and why each choice is what it is
 Every decision here was made after a specific measurement failure; the failures
 are in `docs/decision-log.md`.
 
+The SLO below is treated as fixed. It is not: every run also writes a
+per-request record so the TTFT and ITL bounds can be moved afterwards without
+touching the GPU. See `docs/slo-replay.md`.
+
 ---
 
 ## The objective: goodput

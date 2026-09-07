@@ -266,6 +266,94 @@ problem: it can still detect damage but has no headroom to rank.
 
 ---
 
+## The load driver was measuring a workload nobody runs
+
+**September 2026, found by stage 3.** The largest correction after the goodput
+one, and it invalidates every serving number taken before it.
+
+Turn 2 of the stage-3 loop ran one configuration three times, changing nothing,
+and got TTFT p99 of 1040, 300 and 279ms with SLO attainment 0.67, 0.93 and 1.00.
+Not a spread around one value — **bimodal**, two clusters with nothing between.
+Measurement noise does not do that.
+
+Two defects, both in the load generator, both present since the initial commit.
+
+**The convoy.** `_closed_loop` started all L workers in the same instant. They
+finished together and re-fired together, and nothing broke the lockstep, so the
+load was never L requests in steady flight — it was a convoy of L arriving at
+once, every request-duration. In a convoy of 256 simultaneous prefills the last
+one served waits behind 255 others, which is exactly the 0.68 attainment. Only
+2–3 convoys fit a 45s window, so whether the window opened on a convoy head was
+close to a coin flip.
+
+Measured directly, one launch, arrivals recorded per request:
+
+| L=128, two identical drives | goodput | arrival burst |
+|---|---|---|
+| locked | 205.1 / 2181.6 → **10.63x** | 10.5–14.9x |
+| dephased | 1891.0 / 1893.8 → **1.00x** | 1.52x |
+
+It also explains the one thing that made no sense: L=32 measured *worse* than
+L=64 (673–987ms vs 149–165ms). No capacity argument permits that. Phase
+alignment does.
+
+**The constant output length — the actual root cause.** `VllmEvaluator.__init__`
+read the trace, kept the prompts, and then set `self.max_tokens =
+int(fp.workload.mean_output_tokens)` — one line after the rows were built with
+every row's `output_tokens` still in scope. `trace_shared.jsonl` carries mean
+259.6, **sd 167.7**, p10–p90 spanning 102–466, up to 1464. All of it collapsed to
+259 for every request. `Fingerprint.from_trace` had already read the column and
+computed both mean and p99; the distribution was measured, kept, and discarded
+one layer later.
+
+That constant is what made the convoy *permanent*. On a 1.7B, prefilling even a
+4431-token prompt is under a second while 259 decode steps is 17–28s, so decode
+dominates and identical decode counts mean identical durations. The completion
+counts said it plainly: 384 at L=128 is exactly 3 per worker, 512 at L=256
+exactly 2. The stagger holds workers apart; only varying lengths stop them
+re-converging.
+
+It also means the tail was never measured. A 466-token request and a 102-token
+one have different tail behaviour, and at one constant length neither existed.
+
+**Both are the same failure**: the harness substituting a tidy idealisation for
+the messy input it was handed. Finding the convoy first and shipping the stagger
+fixed the symptom; the constant was underneath it.
+
+### What it invalidated
+
+Every closed-loop number taken before the fix, on both hosts. Specifically:
+
+- All TTFT/ITL percentiles and everything derived from them — SLO attainment,
+  "ships within SLO", the 100%-attainment claims, "none met SLO on the 14B".
+- Every ranking with a margin under ~1.2x. `pb > seqDAG` was claimed on 1.11x
+  against a 1.15x fixed-config spread: **not supported**. So is
+  `aiconfigurator < stock` (934.4 vs 1021.6 = 1.09x).
+- The chosen operating point L — peak selection flipped between 128 and 256.
+
+What survived: anything not measured through the load driver (math_500 and
+MBPP+ accuracy, equivalence divergence, memory, launch failures, the H100
+legality finding, the MoE backend oracle); margins above ~2x (optimized vs stock
+2.3x, the 14B lossy 5.6x); and the **configurations themselves** — the search
+walked real config space, so those are still good candidates. Re-measure, do not
+re-discover.
+
+After the fix, three fresh launches per level: goodput within **1.02x** and TTFT
+within 1.3x up to L=128, and the curve monotone again. L=256 remains unstable
+(1989/2097/2388) and that one looks real — it is the capacity edge.
+
+**Rejected:** lengthening `SWEEP_WINDOW_S` from 45s to 180s. It would also have
+worked and it quadruples every run — the 14B lossy walk goes from 9 hours to over
+30. The stagger costs nothing.
+
+### The corollary: the SLO should never have been frozen either
+
+The same runs threw away the per-request record, which meant the 500ms/250ms
+guess was baked into every result and could only be revisited on the GPU. It is
+now captured — see `slo-replay.md`.
+
+---
+
 ## Open
 
 - **RULER saturates at 1.00** — needs contexts that fit `max_model_len` while
