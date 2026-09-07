@@ -244,7 +244,7 @@ def cmd_optimize(args) -> int:
     prefetch_weights(fp.model.id)
     print()
 
-    from inferopt.evaluator import VllmEvaluator
+    from inferopt.evaluator import LAUNCH_TIMEOUT_S, VllmEvaluator
     from inferopt.fingerprint import Context
 
     cfg = seed_config(fp)
@@ -361,7 +361,7 @@ def cmd_optimize(args) -> int:
             print(f"\n  full log: {run_dir}/launches/*/server.log")
             print(f"  if it says 'not healthy in Ns', the launch was still working when "
                   f"the clock ran out -- raise INFEROPT_LAUNCH_TIMEOUT_S (currently "
-                  f"{__import__('evaluator').LAUNCH_TIMEOUT_S:.0f}s).")
+                  f"{LAUNCH_TIMEOUT_S:.0f}s).")
             return 1
         if not t.slo_ok:
             print(f"\n  the seed config MEASURED ttft_p99 {t.ttft_p99_ms:.0f}ms against an "

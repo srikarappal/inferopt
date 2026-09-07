@@ -40,11 +40,52 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PY=${PYTHON:-/home/srikar/miniconda3/envs/verticalinference/bin/python}
+# FIND AN INTERPRETER THAT ACTUALLY HAS vLLM, rather than hardcoding one.
+# A baked-in conda path works on exactly the host it was written on: this
+# script died on line 75 with "No such file or directory" for an interpreter
+# that exists on the GB10 box and not on the H100. Running a 41-hour queue
+# under the wrong python is worse than failing, so the choice is made once,
+# reported, and checked.
+pick_python() {
+    local c
+    # An EXPLICIT PYTHON is honoured or refused, never quietly replaced --
+    # substituting a different interpreter for the one you named is how a run
+    # ends up measuring a vLLM you did not choose.
+    if [ -n "${PYTHON:-}" ]; then
+        if command -v "$PYTHON" >/dev/null 2>&1 && "$PYTHON" -c "import vllm" >/dev/null 2>&1; then
+            command -v "$PYTHON"; return 0
+        fi
+        echo "PYTHON=$PYTHON is not usable (missing, or no vllm in it)" >&2
+        return 1
+    fi
+    for c in python python3 /home/srikar/miniconda3/envs/verticalinference/bin/python; do
+        command -v "$c" >/dev/null 2>&1 || continue
+        if "$c" -c "import vllm" >/dev/null 2>&1; then
+            command -v "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+PY=$(pick_python) || {
+    cat >&2 <<'MSG'
+No interpreter with vLLM found. Tried $PYTHON, python, python3, and this
+project's usual conda env.
+
+  PYTHON=/path/to/env/bin/python ./rerun_all.sh
+
+Check the one you mean with:  <python> -c 'import vllm; print(vllm.__version__)'
+Running the queue under an interpreter without vLLM fails 20 launches in.
+MSG
+    exit 1
+}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export PYTHONPATH="$(pwd)/src${PYTHONPATH:+:$PYTHONPATH}"
 TRACE=data/trace_shared.jsonl
-MODELS=${MODELS:-"1.7b 14b moe"}
+# ${MODELS-...}, not ${MODELS:-...}: an EMPTY MODELS means "no families, just
+# run the preflight checks", which is how you verify a host before committing
+# 41 hours to it. With :- an empty value silently became the full queue.
+MODELS=${MODELS-"1.7b 14b moe"}
 TAG=${RUN_TAG:-}
 OUT=runs; [ -n "$TAG" ] && OUT="runs_${TAG}"
 mkdir -p "$OUT"
@@ -64,14 +105,46 @@ wait_for_gpu() {
     say "GPU is free"
 }
 
+# A vLLM server outliving the queue that started it is not a nuisance, it is a
+# silent 41-hour failure. _serve launches with start_new_session=True and kills
+# its process group in a `finally`; SIGKILL the queue, or kill it while a
+# launch is in flight, and that finally never runs. The orphan keeps ~94 GB and
+# every later launch dies with "Engine core initialization failed", which reads
+# as a config problem and is not. Observed exactly that, twice.
+#
+# Only servers running from THIS interpreter's environment prefix, and only
+# those already reparented to init. dextract's OCR server runs from a different
+# conda env and is production traffic -- it must never match.
+reap_orphans() {
+    local prefix pid ppid n=0
+    prefix=$(dirname "$(dirname "$PY")")          # .../envs/<env>
+    for pid in $(pgrep -f "vllm serve" 2>/dev/null); do
+        case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in
+            *"$prefix"*) ;;                        # ours
+            *) continue ;;                         # someone else's -- leave it
+        esac
+        ppid=$(awk '{print $4}' /proc/$pid/stat 2>/dev/null)
+        [ "$ppid" = "1" ] || continue              # still parented: in use
+        say "reaping orphaned vLLM pid $pid (holding GPU memory from a killed run)"
+        kill -INT "-$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" 2>/dev/null
+        n=$((n+1))
+    done
+    [ "$n" -gt 0 ] && sleep 15
+    return 0
+}
+trap 'echo; say "interrupted -- reaping before exit"; reap_orphans; exit 130' INT TERM
+
 step() {
     local name=$1 marker=$2; shift 2
     if [ -e "$marker" ]; then say "$name: already done, skipping"; return 0; fi
+    reap_orphans                       # before, not after: a leftover from the
+                                       # previous step is what breaks this one
     say "$name: starting"
     if "$@"; then say "$name: OK"; else say "$name: FAILED (continuing)"; fi
     wait_for_gpu
 }
 
+say "interpreter  $PY  (vLLM $("$PY" -c 'import vllm;print(vllm.__version__)' 2>/dev/null))"
 $PY - <<'CHECK' || exit 1
 import inspect
 import inferopt.evaluator as e
@@ -183,6 +256,7 @@ moe)
 esac
 done
 
+reap_orphans
 say "all families done"
 printf '\n  per-request capture written to:\n'
 for d in "${OUT}"/rerun-*/requests.jsonl.gz; do
