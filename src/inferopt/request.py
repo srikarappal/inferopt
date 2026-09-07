@@ -102,6 +102,9 @@ class InferOptRequest(BaseModel):
 
     ttft_p99_ms: float | None = Field(None, description="latency SLO; requests slower than this earn no goodput")
     itl_p99_ms: float | None = Field(None, description="inter-token latency SLO")
+    min_slo_attainment: float | None = Field(None, ge=0.0, le=1.0, description=
+        "Fraction of requests that must meet the latency targets before a "
+        "config may be shipped. Unset, goodput decides.")
     qps: float | None = Field(None, gt=0.0, description=
         "Arrival rate in requests/second. Overrides whatever the trace's "
         "arrival_ts implies. Most callers KNOW their target rate and have no "
@@ -435,11 +438,19 @@ def _checkpoint_params(model: str, log=print, config: dict | None = None) -> tup
                  .get("quant_method", "")).lower()
         logical_bits = _PACKED_BITS.get(qm)
 
+        # CONCURRENTLY. One range request per shard is sixty for a large MoE, and
+        # serially that took the selftest from five minutes to over twelve --
+        # a slow selftest is a selftest people skip. The requests are
+        # independent and each returns a few KB, so the only thing serialising
+        # them bought was latency.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(16, len(readers) or 1)) as pool:
+            headers = list(pool.map(header, readers))
+
         params = 0.0
         by_dtype: dict[str, float] = {}
         packed_tensors = 0
-        for rd in readers:
-            h = header(rd)
+        for h in headers:
             if not h:
                 return None                      # a partial count is worse than none
             names = set(h)
@@ -720,7 +731,19 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
     # stored_bytes is still computed and still useful -- it describes the
     # FOOTPRINT, which is what weight_gb and the memory budget need -- but it is
     # no longer asked to answer a question about parameter counts.
-    exact = _checkpoint_params(req.model, config=c)
+    # ONLY WHEN THE RATIO IS AMBIGUOUS. Reading every shard header is exact but
+    # costs one range request per shard -- sixty for a large MoE -- which turned
+    # a five-minute selftest into a twelve-minute one, and a slow selftest is a
+    # selftest people skip.
+    #
+    # For a uniformly stored checkpoint, bytes / bytes-per-param IS exact, and
+    # _stored_bytes_per_param already measures that ratio from a sample. The
+    # count is only needed where no single width is true: a packed or
+    # mixed-precision checkpoint, which announces itself in quantization_config.
+    qcfg = c.get("quantization_config") or {}
+    ambiguous = bool(qcfg) or any(
+        k in c for k in ("num_experts", "n_routed_experts", "num_local_experts"))
+    exact = _checkpoint_params(req.model, config=c) if ambiguous else None
     if exact:
         n_params_b = exact[0]
     elif ck_bytes:
@@ -814,6 +837,7 @@ def build_fingerprint(req: InferOptRequest) -> tuple[Fingerprint, SLO]:
         lora=detect_lora(req),
     )
     slo = SLO(ttft_p99_ms=req.ttft_p99_ms, itl_p99_ms=req.itl_p99_ms,
+              min_slo_attainment=req.min_slo_attainment,
               quality_budget=req.allow_loss,
               lossless_quality_budget=req.lossless_tolerance)
     return fp, slo

@@ -464,6 +464,33 @@ class SLO(BaseModel):
                     "to spend. Kept separate from quality_budget because conflating them "
                     "is how the lossy gate ended up with zero width -- the measured "
                     "lossless drift WAS the lossy budget.")
+    min_slo_attainment: float | None = Field(None, ge=0.0, le=1.0,
+        description="user | fraction of requests that must meet the latency targets "
+                    "before a config is eligible to SHIP. None reports attainment "
+                    "and lets goodput decide, which is the historical behaviour.")
+
+    def attainment_ok(self, attainment: float | None) -> bool:
+        """Whether this config may be SHIPPED, given its measured attainment.
+
+        Goodput already prices SLO misses in -- it counts only conforming
+        requests -- so maximising it happily accepts partial attainment when the
+        volume gained outweighs the requests lost. On Qwen3-14B that shipped a
+        config at 76% attainment with a TTFT p99 of 935ms against a 500ms
+        target, while a config that met the SLO completely existed at 7.4x less
+        goodput. Both are defensible answers to different questions:
+
+            goodput-max     how many on-time tokens per second can this produce
+            an SLA          how much throughput while p99 STAYS under the target
+
+        This makes the second expressible. It never removes a config from the
+        frontier -- a point that misses is still a measurement someone may want
+        -- it only decides eligibility to be shipped, and only when set.
+        """
+        if self.min_slo_attainment is None:
+            return True
+        if attainment is None:
+            return False          # unmeasured is not the same as passing
+        return attainment >= self.min_slo_attainment
 
 
 class Fingerprint(BaseModel):

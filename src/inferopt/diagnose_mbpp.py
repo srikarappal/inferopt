@@ -76,7 +76,8 @@ def main() -> int:
         return 0
     tmp.write_text("\n".join(
         json.dumps({"task_id": r["answer"], "raw": r["text"]}) for r in sample) + "\n")
-    p = subprocess.run([sys.executable, str(here / "mbpp_score.py"),
+    from inferopt._paths import package_file
+    p = subprocess.run([sys.executable, str(package_file("mbpp_score.py")),
                         "--samples", str(tmp), "--out", str(out)],
                        capture_output=True, text=True, timeout=1800, cwd=here)
     if out.exists():

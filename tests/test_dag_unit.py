@@ -1443,6 +1443,190 @@ def test_judges():
 
 
 # ==========================================================================
+def test_benchmark_surface():
+    """Benchmark carries a Metric with a direction, a role, and opt-in gates."""
+    section("Benchmark: metric direction is resolved, not assumed")
+    from inferopt.quality import BENCHMARKS, Benchmark
+
+    for n, b in BENCHMARKS.items():
+        check(f"{n}: metric resolves to a Metric with a direction",
+              b.metric_spec.direction in ("max", "min"), f"{b.metric}")
+        check(f"{n}: higher_is_better agrees with the metric",
+              b.higher_is_better == (b.metric_spec.direction == "max"))
+        check(f"{n}: defaults to an AXIS, not a gate", b.role == "axis")
+        check(f"{n}: no gate is set by default",
+              b.require is None and b.abandon_below is None,
+              "a default that stops the search stops exploration")
+
+    section("Benchmark.builtin: overrides a built-in without redefining it")
+    c = Benchmark.builtin("math_500", n_full=100, role="report")
+    check("the override applies", c.n_full == 100 and c.role == "report")
+    check("the original is untouched", BENCHMARKS["math_500"].n_full == 500,
+          "dataclasses.replace must not mutate the registry")
+    check("everything else is carried over",
+          c.judge is BENCHMARKS["math_500"].judge and c.max_tokens == 1024)
+    check("an unknown NAME raises, naming what exists",
+          raises(lambda: Benchmark.builtin("exact-match")))
+    # A typo'd FIELD would otherwise be swallowed and produce a benchmark that
+    # silently ignores the caller's intent.
+    check("an unknown FIELD raises rather than being ignored",
+          raises(lambda: Benchmark.builtin("math_500", n_ful=100)),
+          "a swallowed typo yields a benchmark that ignores what was asked")
+
+    section("Benchmark: gates are opt-in and do not remove points")
+    g = Benchmark.builtin("math_500", require=0.70, abandon_below=0.20)
+    check("require and abandon_below are set when asked",
+          g.require == 0.70 and g.abandon_below == 0.20)
+    check("...and still default off elsewhere",
+          BENCHMARKS["math_500"].require is None)
+
+
+def test_slo_attainment():
+    """The attainment floor: expressible, off by default, never deletes a point."""
+    section("SLO: attainment eligibility")
+    from inferopt.fingerprint import SLO
+
+    loose = SLO(ttft_p99_ms=500, itl_p99_ms=250)
+    check("with no floor, ANY attainment may ship",
+          loose.attainment_ok(0.43) and loose.attainment_ok(0.0),
+          "this is the historical behaviour and must not change silently")
+    check("...including unmeasured", loose.attainment_ok(None))
+
+    strict = SLO(ttft_p99_ms=500, itl_p99_ms=250, min_slo_attainment=0.95)
+    check("at or above the floor ships",
+          strict.attainment_ok(0.95) and strict.attainment_ok(0.99))
+    # The real case: Qwen3-14B shipped at 76% attainment, TTFT p99 935ms against
+    # a 500ms target, because goodput counts only conforming requests.
+    check("below the floor does not ship", not strict.attainment_ok(0.76))
+    check("UNMEASURED is not the same as passing",
+          not strict.attainment_ok(None),
+          "an absent measurement must never satisfy a floor")
+
+    check("the floor is bounded to a fraction",
+          raises(lambda: SLO(min_slo_attainment=1.5))
+          and raises(lambda: SLO(min_slo_attainment=-0.1)))
+
+    section("Result: eligibility is reported, not enforced by deletion")
+    from inferopt.api import Result
+
+    class _T:
+        def __init__(self, gp, att):
+            self.goodput, self.concurrency = gp, 32
+            self.diagnostics = {"slo_attainment": att}
+            self.quality, self.node_id, self.quality_inherited = {}, "n", False
+
+    r = Result(model="m", strategy="s", chosen=_T(118.7, 0.76), slo=strict,
+               frontier=[_T(118.7, 0.76), _T(15.8, 1.0)])
+    check("a config below the floor is NOT eligible to ship",
+          r.ships_within_slo() is False)
+    check("...but is still on the frontier",
+          len(r.frontier) == 2,
+          "a point that misses is still a measurement someone may want")
+    check("the summary warns rather than hiding it",
+          "MISSES the attainment floor" in r.summary(), r.summary())
+
+    r2 = Result(model="m", strategy="s", chosen=_T(118.7, 0.76), slo=loose)
+    check("with no floor, eligibility is None -- not True",
+          r2.ships_within_slo() is None,
+          "unset must be distinguishable from passing")
+    check("...and a low attainment is still surfaced as a note",
+          "76% of requests" in r2.summary(), r2.summary())
+
+
+# ==========================================================================
+def test_run_benchmark_guards():
+    """run_benchmark's own guards. Untested until a mutation pass showed the
+    earlier 'coverage' was collateral from neighbouring mutations."""
+    section("run_benchmark: a broken judge must not look like a broken model")
+    import dataclasses
+
+    from inferopt import quality as Q
+    from inferopt.api_types import Verdict
+
+    class _Out:
+        def __init__(self, t): self.text = t
+
+    def gen(prompts, max_tokens):
+        return [_Out("\\boxed{42}") for _ in prompts]
+
+    real = Q.BENCHMARKS["math_500"]
+
+    def with_judge(judge, metric=None):
+        b = dataclasses.replace(real, judge=judge,
+                                **({"metric": metric} if metric else {}))
+        return {**Q.BENCHMARKS, "math_500": b}
+
+    saved = Q.BENCHMARKS
+    saved_n = Q.TRAVERSAL_N
+    try:
+        Q.TRAVERSAL_N = 5
+
+        # THE CENTRAL PROPERTY. A judge that returns nothing has not scored 0.0;
+        # it has failed to score, and 0.0 is indistinguishable from a model that
+        # got every answer wrong. That confusion is how a broken probe reads as
+        # a total collapse.
+        Q.BENCHMARKS = with_judge(lambda rows, texts: [])
+        check("a judge returning NO verdicts raises rather than scoring 0.0",
+              raises(lambda: Q.run_benchmark("math_500", gen)),
+              "0.0 from an empty judge looks exactly like total model failure")
+        # Metric.compute also refuses an empty list, so the check above passes
+        # either way. Pin the MESSAGE: run_benchmark's names the benchmark and
+        # the row count, which is what makes the failure actionable.
+        msg = str(_err(lambda: Q.run_benchmark("math_500", gen)))
+        check("...and the error names the benchmark and the row count",
+              "math_500" in msg and "5 rows" in msg, msg[:110])
+
+        # Verdicts are zipped against rows by position, so a short list silently
+        # misattributes every verdict after the gap.
+        Q.BENCHMARKS = with_judge(lambda rows, texts: [Verdict(True)] * (len(rows) - 1))
+        check("a SHORT verdict list raises rather than misaligning",
+              raises(lambda: Q.run_benchmark("math_500", gen)),
+              "verdicts are matched to rows by position")
+        Q.BENCHMARKS = with_judge(lambda rows, texts: [Verdict(True)] * (len(rows) + 3))
+        check("a LONG verdict list raises too",
+              raises(lambda: Q.run_benchmark("math_500", gen)))
+
+        section("run_benchmark: aggregation goes through the Metric")
+        # 3 of 5 pass. pass@1 is 0.6; error_rate over the SAME verdicts is 0.4.
+        # Averaging booleans would give 0.6 for both, which is the bug.
+        vs = lambda rows, texts: [Verdict(i < 3) for i in range(len(rows))]
+        Q.BENCHMARKS = with_judge(vs)
+        got = Q.run_benchmark("math_500", gen)
+        check("a max-direction metric aggregates as a pass rate",
+              abs(got - 0.6) < 1e-9, f"{got}")
+
+        Q.BENCHMARKS = with_judge(vs, metric="error_rate")
+        got = Q.run_benchmark("math_500", gen)
+        check("a metric with a different rule is NOT averaged as booleans",
+              abs(got - 0.4) < 1e-9,
+              f"{got} -- error_rate is the complement, not the mean of verdicts")
+
+        section("run_benchmark: bool judges still work")
+        Q.BENCHMARKS = with_judge(lambda rows, texts: [True, False, True, True, False])
+        got = Q.run_benchmark("math_500", gen)
+        check("a judge returning plain bools is unaffected",
+              abs(got - 0.6) < 1e-9,
+              f"{got} -- Verdict.__bool__ keeps every existing judge working")
+
+        section("run_benchmark: the record keeps the reason")
+        import json
+        import tempfile
+        Q.BENCHMARKS = with_judge(
+            lambda rows, texts: [Verdict(False, reason="did not parse")] * len(rows))
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "g.jsonl"
+            Q.run_benchmark("math_500", gen, record=f)
+            rows = [json.loads(l) for l in open(f)]
+            check("every generation is recorded", len(rows) == 5, f"{len(rows)}")
+            check("...with the judge's reason, not just the verdict",
+                  rows[0]["reason"] == "did not parse", rows[0])
+            check("...and the prompt and output", rows[0]["output"] and rows[0]["prompt"])
+    finally:
+        Q.BENCHMARKS = saved
+        Q.TRAVERSAL_N = saved_n
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1585,7 +1769,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

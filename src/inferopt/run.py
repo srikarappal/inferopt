@@ -209,6 +209,7 @@ def cmd_optimize(args) -> int:
     req = InferOptRequest(
         model=args.model, trace=args.trace,
         qps=args.qps,
+        min_slo_attainment=args.min_slo_attainment,
         ttft_p99_ms=args.ttft_p99, itl_p99_ms=args.itl_p99,
         allow_loss=args.allow_loss, lossless_tolerance=args.lossless_tolerance,
         adapters=args.adapter or [],
@@ -571,6 +572,13 @@ def main() -> int:
                         "for a method comparison: an inherited score is an "
                         "assumption, and the comparison's claim is about the "
                         "configs each method actually shipped.")
+    o.add_argument("--min-slo-attainment", type=float, default=None, metavar="F",
+                   help="fraction of requests that must meet the latency targets "
+                        "before a config may be SHIPPED, e.g. 0.95. Unset, "
+                        "goodput decides -- and because goodput counts only "
+                        "conforming requests, maximising it can ship a config "
+                        "that misses the target for a quarter of them. A config "
+                        "below the floor is still measured and still plotted.")
     o.add_argument("--qps", type=float, default=None,
                    help="arrival rate in requests/second. Overrides the rate "
                         "implied by the trace's arrival_ts, which is the "

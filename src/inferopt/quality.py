@@ -87,7 +87,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from inferopt._paths import data as _data, home as _home
+from inferopt._paths import data as _data, home as _home, package_file
 HERE = _home()
 DATA = _data()
 TRAVERSAL_N = 100
@@ -261,7 +261,12 @@ def _judge_mbpp_plus(rows, texts) -> list[bool]:
             for r, t in zip(rows, texts)) + "\n")
 
         proc = subprocess.run(
-            [sys.executable, str(HERE / "mbpp_score.py"),
+            # package_file, not HERE. HERE is the WORKSPACE -- where runs/
+            # and artifacts/ live -- while mbpp_score.py ships with the
+            # package. Before the src/ layout those were the same
+            # directory; afterwards the scorer was looked for beside the
+            # user's runs and was not there.
+            [sys.executable, str(package_file("mbpp_score.py")),
              "--samples", str(samples), "--out", str(verdicts)],
             capture_output=True, text=True, timeout=3600, cwd=HERE)
         if not verdicts.exists():
@@ -345,7 +350,13 @@ class Benchmark:
     A fixed reserve would be wrong for one of them.
     """
     judge: Callable
-    """(rows, texts) -> [bool], one verdict per row, IN ROW ORDER.
+    """(rows, texts) -> [bool] or [Verdict], one per row, IN ROW ORDER.
+
+    Verdict is preferred and bool still works: Verdict implements __bool__, so
+    every existing judge and every caller that sums them is unaffected. What a
+    Verdict adds is the REASON, which is the difference between a score that
+    moved and a score whose movement can be explained -- the question RULER
+    could never answer.
 
     Judging is separated from generation so that the two callers who need it --
     run_benchmark here, and eval_repro's score_once, which generates
@@ -356,6 +367,9 @@ class Benchmark:
     """
     prompt: Callable
     metric: str
+    """Aggregation name. Resolved to a Metric -- which carries DIRECTION -- by
+    the `metric_spec` property. A bare string cannot say whether a rise is an
+    improvement, and wer and pass@1 move opposite ways."""
     n_full: int
     max_tokens: int
     chat: bool = False
@@ -366,6 +380,57 @@ class Benchmark:
     make new rows incomparable to old ones for a reason unrelated to the config
     being tested. mbpp_plus is new, so it starts on the correct setting.
     """
+
+
+    role: str = "axis"
+    """"axis" puts this benchmark on the Pareto frontier; "report" measures and
+    reports it without letting it influence any decision.
+
+    Neither GATES. A config that costs accuracy stays on the frontier, because
+    "less accurate, far faster" is a trade someone may want and dropping the
+    point removes the choice rather than making it. Gating is opt-in per
+    benchmark through `require` / `abandon_below`, and defaults to off --
+    a default that stops the search stops exploration, which is the opposite of
+    what a frontier is for."""
+
+    require: float | None = None
+    """Opt-in floor. A config scoring below this is measured, recorded and
+    plotted, and simply not eligible to be SHIPPED. It is not skipped."""
+
+    abandon_below: float | None = None
+    """Opt-in circuit breaker. Below this the search stops exploring past this
+    config -- for a score so low it indicates a broken probe or a broken
+    checkpoint rather than a trade worth having."""
+
+    @property
+    def metric_spec(self):
+        """The metric as a Metric, with its direction."""
+        from inferopt.api_types import Metric
+        return Metric(self.metric)
+
+    @property
+    def higher_is_better(self) -> bool:
+        return self.metric_spec.higher_is_better
+
+    @classmethod
+    def builtin(cls, name: str, **overrides) -> "Benchmark":
+        """A built-in benchmark with fields overridden.
+
+        `Benchmark.builtin("math_500", n_full=100, role="report")`.
+
+        A bare string cannot carry a sample size or a role, so a caller wanting
+        MATH-500 as a watched canary at a smaller n had no way to say it.
+        """
+        import dataclasses
+        if name not in BENCHMARKS:
+            raise KeyError(
+                f"unknown benchmark {name!r}; have {', '.join(sorted(BENCHMARKS))}")
+        bad = set(overrides) - {f.name for f in dataclasses.fields(cls)}
+        if bad:
+            raise TypeError(
+                f"Benchmark.builtin({name!r}): no such field(s): "
+                f"{', '.join(sorted(bad))}")
+        return dataclasses.replace(BENCHMARKS[name], **overrides)
 
 
 BENCHMARKS: dict[str, Benchmark] = {
@@ -437,6 +502,26 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
     prompts = [prompt(r) for r in rows]
     outs = gen(prompts, b.max_tokens)
     verdicts = b.judge(rows, [o.text for o in outs])
+    if len(verdicts) != len(rows):
+        # ONE guard, not two. An empty verdict list was checked separately
+        # first, which a mutation pass showed to be unreachable -- an empty list
+        # fails this length check too, so the earlier branch could be deleted
+        # without any test noticing. A guard no test can distinguish is a guard
+        # nobody can trust.
+        #
+        # Two things are being prevented. A count mismatch misattributes every
+        # verdict after the gap, because verdicts are zipped against rows BY
+        # POSITION so the caller can say which sample regressed. And a count of
+        # zero would otherwise score 0.0, which is indistinguishable from a
+        # model that got every answer wrong -- how a broken probe reads as a
+        # total collapse.
+        raise ValueError(
+            f"{name}: judge returned {len(verdicts)} verdicts for {len(rows)} "
+            f"rows. They are matched by position, so a mismatch misattributes "
+            f"every verdict after the gap"
+            + (" -- and zero verdicts would score 0.0, which looks exactly like "
+               "total failure of the MODEL rather than of the probe."
+               if not verdicts else "."))
 
     # WHAT THE MODEL ACTUALLY SAID. A score is a single number standing in for
     # hundreds of generations, and when it moves there is no way to ask why.
@@ -458,10 +543,19 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                     "prompt": pr,
                     "output": o.text,
                     "verdict": bool(v),
+                    # Verdicts carry a reason when the judge supplied one. A
+                    # False with no reason is what made RULER undiagnosable.
+                    "reason": getattr(v, "reason", ""),
                     "expected": r.get("answer") or r.get("entry_point"),
                     "n_output_tokens": getattr(o, "n_out", None),
                 }, default=str) + "\n")
-    return round(sum(verdicts) / len(verdicts), 4)
+    # Aggregate THROUGH the metric, so a benchmark whose metric is not a plain
+    # pass-rate -- error_rate, wer, anything with an fn -- is computed correctly
+    # rather than being averaged as if every metric were a mean of booleans.
+    from inferopt.api_types import Sample
+    samples = [Sample(row=r, text=o.text, prompt=pr, index=i)
+               for i, (r, pr, o) in enumerate(zip(rows, prompts, outs))]
+    return round(b.metric_spec.compute(samples, list(verdicts)), 4)
 
 
 def resolution(name: str, *, full: bool = False) -> float:

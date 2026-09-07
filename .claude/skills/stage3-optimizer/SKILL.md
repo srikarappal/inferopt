@@ -81,7 +81,8 @@ right value under a specific workload is an empirical question nobody has asked.
 
 ## The loop
 
-Sixteen turns maximum. Each turn:
+Nine turns maximum. Each turn is expected to run sequentially where one experiment drives 
+the next hypothesis and experiment:
 
 1. **Observe.** Quote the specific numbers you are reasoning from. Not "throughput is
    low" — `slo_attainment 0.42 at L=32 while kv_cache_util is 0.0 and preemptions are 0`.

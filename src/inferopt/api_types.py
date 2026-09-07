@@ -136,7 +136,12 @@ class Metric:
             return float(self.fn(samples, verdicts))
         if not verdicts:
             raise ValueError(f"{self.name}: no verdicts to aggregate")
-        ok = sum(1 for v in verdicts if v.ok)
+        # bool(v), NOT v.ok. Verdict implements __bool__ precisely so that a
+        # judge returning plain bools keeps working -- and all three built-in
+        # judges do return bools. Reaching for .ok defeated that and would have
+        # raised AttributeError on every real benchmark, in production, after
+        # the launch and the generation had already been paid for.
+        ok = sum(1 for v in verdicts if bool(v))
         if self.name == "error_rate":
             return 1.0 - ok / len(verdicts)
         return ok / len(verdicts)

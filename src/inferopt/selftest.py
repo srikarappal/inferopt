@@ -171,20 +171,37 @@ def main() -> int:
                   abs(act - pub_a) / pub_a < 0.15, f"got {act:,.1f}B")
 
     # A MoE checkpoint whose weights do not add up must RAISE, not approximate.
-    # DeepSeek-V3's index reports 1369GB against 671B published parameters while
-    # its shard headers measure 1.22 bytes/param -- those cannot both be true.
-    raised = not _online          # nothing to prove when we cannot reach the Hub
+    #
+    # This used DeepSeek-V3 as the live example, because its index reported
+    # 1369GB against 671B published parameters. That is no longer an example:
+    # counting parameters from the shard headers rather than dividing bytes by
+    # an assumed width now reconciles it at 684.5B, within 2% of published. The
+    # bug the model demonstrated was fixed, so the model stopped demonstrating
+    # it -- and a test anchored to one checkpoint's happenstance fails for the
+    # right reason at the worst time.
+    #
+    # The guard is tested directly instead, on a shape that cannot reconcile by
+    # construction: more parameters in the routed experts than in the whole
+    # checkpoint. That is impossible for any real model and permanent as a test.
+    from inferopt.request import _reconcile_moe
+    shape = {"n_routed": 128, "n_active": 8, "moe_layers": 60,
+             "per_expert_b": 0.5, "routed_b": 900.0, "shared_b": 0.0}
+    raised = False
     try:
-        if _online:
-            _dm(_R2(model="deepseek-ai/DeepSeek-V3", trace="data/trace.jsonl"))
+        _reconcile_moe(shape, total_b=500.0, from_checkpoint=True, model="synthetic")
     except MoEReconciliationError:
         raised = True
-    except Exception:
-        pass
     check("an unreconcilable MoE checkpoint RAISES rather than approximating",
           raised,
-          "a wrong active count sets the roofline, the memory budget and the replica "
-          "count -- silently proceeding produces a whole run of confident wrong answers")
+          "a wrong active count sets the roofline, the memory budget and the "
+          "replica count -- silently proceeding produces a whole run of "
+          "confident wrong answers")
+    # And the opposite: a shape that DOES reconcile must not raise.
+    ok = _reconcile_moe({"n_routed": 128, "n_active": 8, "moe_layers": 60,
+                         "per_expert_b": 0.5, "routed_b": 400.0, "shared_b": 0.0},
+                        total_b=500.0, from_checkpoint=True, model="synthetic")
+    check("...and a checkpoint that DOES add up returns an active count",
+          ok and ok > 0, f"got {ok}")
 
     print("\n=== _closed_loop: window excludes settle and drain ===")
     reqs, t0, t1 = asyncio.run(ev._closed_loop(
@@ -441,7 +458,7 @@ def main() -> int:
           "a numeric literal here is the second copy this guards against")
     check("generations are recorded for later inspection",
           "record" in _inspect.signature(
-              __import__("quality").run_benchmark).parameters,
+              __import__("inferopt.quality", fromlist=["run_benchmark"]).run_benchmark).parameters,
           "a score with no record of what the model said cannot be debugged -- "
           "this is what made the RULER regression unresolvable")
 

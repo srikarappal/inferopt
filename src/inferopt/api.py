@@ -55,6 +55,24 @@ class Result:
     provenance: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
+    slo: Any = None
+    """The SLO this was searched against, so eligibility can be reported."""
+
+    def ships_within_slo(self, trial: Any = None) -> bool | None:
+        """Whether the shipped config met the attainment floor, if one was set.
+
+        None when no floor was set -- which is not the same as True, and the
+        summary says so. Goodput already prices SLO misses in, so maximising it
+        can ship a config at 76% attainment without comment; that is a defensible
+        answer to "how many on-time tokens per second", and a surprising one to
+        anybody who read the SLO as a promise.
+        """
+        t = trial if trial is not None else self.chosen
+        if self.slo is None or getattr(self.slo, "min_slo_attainment", None) is None:
+            return None
+        att = ((getattr(t, "diagnostics", None) or {}).get("slo_attainment"))
+        return self.slo.attainment_ok(att)
+
     @property
     def regressions(self) -> list[Any]:
         """Quality movements that are real AND in the wrong direction.
@@ -103,7 +121,17 @@ class Result:
                  f"({self.launches} launches, {self.minutes:.0f} min)"]
         for name, t in self.baselines.items():
             lines.append(f"  baseline   {name:16s} {_gp(t)}")
-        lines.append(f"  ships      {_gp(self.chosen)}")
+        att = ((getattr(self.chosen, "diagnostics", None) or {}).get("slo_attainment"))
+        lines.append(f"  ships      {_gp(self.chosen)}"
+                     + (f"  at {att:.0%} SLO attainment" if att is not None else ""))
+        ok = self.ships_within_slo()
+        if ok is False:
+            lines.append(f"  WARNING    the shipped config MISSES the attainment floor "
+                         f"({self.slo.min_slo_attainment:.0%}); goodput counts only "
+                         f"conforming requests, so a partial miss still maximises it")
+        elif ok is None and att is not None and att < 0.95:
+            lines.append(f"  NOTE       no attainment floor was set, and this config "
+                         f"meets the latency targets for {att:.0%} of requests")
         if self.best_seen is not None and self.chosen is not None:
             b, c = getattr(self.best_seen, "goodput", 0), getattr(self.chosen, "goodput", 0)
             if b > (c or 0) * 1.001:
@@ -200,7 +228,7 @@ def optimize(
     t0 = time.time()
     out = strat.search(ctx, runner, seed, log=log)
     res = Result(
-        model=fp.model.id, strategy=strategy, trials=out.trials,
+        model=fp.model.id, strategy=strategy, trials=out.trials, slo=slo_,
         chosen=out.chosen, best_seen=out.best_seen, frontier=out.frontier,
         launches=out.launches or len(out.trials),
         minutes=out.minutes or (time.time() - t0) / 60,
