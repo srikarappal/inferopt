@@ -78,14 +78,18 @@ def recompute(meta: dict, rows: list[dict], ttft_ms: float | None,
     all_tok = sum(r["w"] for r in rows)
     ttfts = sorted(r["t"] for r in done)
     itls = sorted((r["l"] - r["t"]) / (r["n"] - 1) for r in done if r["n"] > 1)
-    good_reqs = sum(1 for r in done if _meets(r, ttft_ms, itl_ms))
+    good_reqs = sum(1 for r in started if _meets(r, ttft_ms, itl_ms))
     out = {
         "node": meta.get("node"), "concurrency": meta.get("L"),
         "phase": meta.get("phase"),
         "ttft_bound_ms": ttft_ms, "itl_bound_ms": itl_ms,
         "goodput": good_tok / win, "throughput": all_tok / win,
         "goodput_req_s": good_reqs / win, "throughput_req_s": len(done) / win,
-        "slo_attainment": (good_reqs / len(done)) if done else 0.0,
+        # Mirrors summarize(): the denominator is everything that STARTED in
+        # the window, so a request that failed counts as a miss. Req.meets()
+        # says a failed request does not meet the SLO; the fraction has to
+        # agree with the predicate it is a fraction of.
+        "slo_attainment": (good_reqs / len(started)) if started else 0.0,
         "ttft_p99_ms": _pct(ttfts, 0.99), "ttft_p95_ms": _pct(ttfts, 0.95),
         "itl_p99_ms": _pct(itls, 0.99), "itl_p95_ms": _pct(itls, 0.95),
         "ttft_n": len(ttfts), "completed": len(done),

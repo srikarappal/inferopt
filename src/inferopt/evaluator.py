@@ -513,6 +513,7 @@ class Req:
     latency: float = 0.0
     n_out: int = 0
     ok: bool = False
+    error: str = ""
     text: str = ""
     token_times: list[float] = field(default_factory=list)
 
@@ -560,6 +561,7 @@ async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
         async with client.stream("POST", f"{base_url}/v1/completions",
                                  json=payload, timeout=900.0) as resp:
             if resp.status_code != 200:
+                r.error = f"HTTP {resp.status_code}"
                 return r
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
@@ -579,8 +581,12 @@ async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
                     r.n_out = ch["usage"].get("completion_tokens") or r.n_out
         r.latency = time.perf_counter() - r.start
         r.ok = r.ttft is not None
-    except Exception:
-        pass
+    except Exception as e:
+        # The reason, not just the fact. Every failure mode -- a 400 from an
+        # over-length generation, a dropped connection, a server that died --
+        # collapsed into ok=False with nothing to tell them apart, so a
+        # systematic refusal looked exactly like flaky networking.
+        r.error = f"{type(e).__name__}: {e}"[:200]
     return r
 
 
@@ -728,6 +734,14 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
     return out, t0, t1
 
 
+def _reasons(reqs: list[Req]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in reqs:
+        if not r.ok and r.error:
+            out[r.error] = out.get(r.error, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1])[:5])
+
+
 def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
     win = max(1e-9, t1 - t0)
     in_win = lambda tt: t0 <= tt < t1
@@ -756,7 +770,14 @@ def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
         "goodput_req_s": good_reqs / win,
         "throughput": all_tok / win,
         "throughput_req_s": len(done) / win,
-        "slo_attainment": (sum(r.meets(slo) for r in done) / len(done)) if done else 0.0,
+        # DENOMINATOR IS `started`, NOT `done`. Req.meets() returns False for a
+        # request that failed, so excluding failures from the denominator
+        # contradicts the very predicate this is a fraction of: a config where
+        # a fifth of requests error out but the rest are quick would report
+        # 100% attainment. Measured on the existing corpus this moved one trial
+        # by more than two points (14b-seqdag spec_decode_ngram, 0.774 -> 0.747),
+        # so it is small in practice and wrong in principle.
+        "slo_attainment": (sum(r.meets(slo) for r in started) / len(started)) if started else 0.0,
         "ttft_p99_ms": pct(ttfts, 0.99) * 1e3,
         "itl_p99_ms": pct(itls, 0.99) * 1e3,
         # p95 ALONGSIDE p99, and the sample count that both are computed over.
@@ -786,6 +807,10 @@ def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
         "itl_p95_ms": pct(itls, 0.95) * 1e3,
         "ttft_n": len(ttfts),
         "completed": len(done), "failed": len(started) - len(done), "window_s": win,
+        # The distinct reasons, most common first. A screen losing a quarter of
+        # its rows to one repeated HTTP 400 is a different problem from losing
+        # them to assorted timeouts, and "failed: 3" cannot tell them apart.
+        "failure_reasons": _reasons(started),
     }
 
 
@@ -885,6 +910,7 @@ class VllmEvaluator:
                 "n": r.n_out,
                 "w": sum(1 for tt in r.token_times if t0 <= tt < t1),
                 "k": bool(r.ok),
+                **({"e": r.error} if r.error else {}),
             })
         try:
             with gzip.open(path, "at") as fh:
@@ -1123,6 +1149,17 @@ class VllmEvaluator:
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
     # --- capacity ---
+    # KV utilisation is a GAUGE and preemptions is a COUNTER, and they must not
+    # be treated the same way. `vllm:num_preemptions_total` only ever increases,
+    # so keeping its maximum across a window returns the cumulative count since
+    # the server started -- including warmup and every earlier sweep level. The
+    # curve then shows a monotone staircase that reads as "preemptions rise with
+    # concurrency" when every preemption may have happened at L=4.
+    #
+    # So: peak for the gauge, last-minus-first for the counter.
+    _COUNTERS = ("preemptions",)
+    _GAUGES = ("kv_cache_util",)
+
     def _gauge_watch(self, stop, out: dict, period: float = 2.0) -> None:
         """Poll instantaneous metrics until `stop` is set, keeping the PEAK.
 
@@ -1131,12 +1168,21 @@ class VllmEvaluator:
         includes ramp-up hides exactly the moment that matters.
         """
         import time as _t
+        first: dict[str, float] = {}
         while not stop.is_set():
             g = self.sample_gauges()
-            for k in ("kv_cache_util", "preemptions"):
+            for k in self._GAUGES:
                 v = g.get(k)
                 if v is not None:
                     out[k] = max(out.get(k, 0.0), float(v))
+            for k in self._COUNTERS:
+                v = g.get(k)
+                if v is not None:
+                    first.setdefault(k, float(v))
+                    # Counters can reset if the server restarts mid-window; a
+                    # negative delta would be nonsense, so floor at the latest
+                    # reading rather than reporting it.
+                    out[k] = max(0.0, float(v) - first[k])
             stop.wait(period)
 
     def serving_metrics(self, model, concurrency: int, *, el=lambda: "",
@@ -1195,7 +1241,7 @@ class VllmEvaluator:
         return med, passes
 
     def _point(self, model, L: int, el, label: str = "",
-               cursor: list[int] | None = None) -> dict:
+               cursor: list[int] | None = None, node_id: str = "") -> dict:
         """One closed-loop measurement at concurrency L on a live server.
 
         Settle and window are a single continuous run so the window observes a
@@ -1221,12 +1267,20 @@ class VllmEvaluator:
         m = summarize(reqs, t0, t1, self.slo)
         m["concurrency"] = L
         m.update(peak)                 # kv_cache_util / preemptions, measured live
-        self.dump_requests(reqs, t0, t1, node_id=label or "sweep",
-                           concurrency=L, phase="closed_loop")
+        # node_id, not `label`. A run directory holds one requests.jsonl.gz for
+        # every node it measured -- 20 rows of a screen, 10 nodes of a walk --
+        # and writing "sweep" for all of them made the file unattributable: the
+        # points were there and nothing said which configuration produced them.
+        self.dump_requests(reqs, t0, t1, node_id=node_id or "unknown",
+                           concurrency=L, phase=f"closed_loop{'/' + label if label else ''}")
         self.log(f"        {el()} L={L:<4d} goodput {m['goodput']:7.1f} tok/s "
                  f"({m['goodput_req_s']:.2f} req/s)  thru {m['throughput']:7.1f}  "
                  f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  slo {m['slo_attainment']:.0%}  "
-                 f"({m['completed']} done){'  ' + label if label else ''}")
+                 f"({m['completed']} done"
+                 + (f", {m['failed']} FAILED: "
+                    + "; ".join(f"{k} x{v}" for k, v in m["failure_reasons"].items())
+                    if m["failed"] else "")
+                 + f"){'  ' + label if label else ''}")
         return m
 
     @staticmethod
@@ -1252,7 +1306,10 @@ class VllmEvaluator:
         t = self.measure(config, probes=["goodput"], benchmarks=[],
                          node_id=tag, levels=SWEEP_LEVELS)
         curve = t.curve or []
-        pk = max(curve, key=lambda m: m["goodput"]) if curve else {
+        # peak(), not a second copy of it. This function's own docstring warns
+        # that a duplicated operating-point selection is how two answers come to
+        # disagree, and it contained one.
+        pk = self.peak(curve) if curve else {
             "concurrency": t.concurrency, "goodput": t.goodput}
         return curve, pk
 
@@ -1355,6 +1412,7 @@ class VllmEvaluator:
                                      "ttft_p95_ms": round(med.get("ttft_p95_ms", float("nan")), 1),
                                      "itl_p95_ms": round(med.get("itl_p95_ms", float("nan")), 2),
                                      "ttft_n": med.get("ttft_n", 0),
+                                     "failure_reasons": passes[0].get("failure_reasons") or {},
                                      "mode": "fixed_concurrency_open_loop"},
                         slo_ok=med["goodput"] > 0)
 
@@ -1387,7 +1445,7 @@ class VllmEvaluator:
                     {max(2, base_L // 2), base_L, base_L * 2})
                 pts: list[dict] = []
                 for L in use:
-                    pts.append(self._point(model, L, el, cursor=cursor))
+                    pts.append(self._point(model, L, el, cursor=cursor, node_id=node_id))
 
                 # If the best sits at an endpoint the bracket did not contain the
                 # peak; walk outward rather than reporting a boundary as a
@@ -1400,11 +1458,11 @@ class VllmEvaluator:
                         if nxt > 1024:
                             break
                         self.log(f"        {el()} peak at the top of the bracket, extending to L={nxt}")
-                        pts.append(self._point(model, nxt, el, cursor=cursor))
+                        pts.append(self._point(model, nxt, el, cursor=cursor, node_id=node_id))
                     elif best_i == 0 and pts[0]["concurrency"] > 2:
                         nxt = max(2, pts[0]["concurrency"] // 2)
                         self.log(f"        {el()} peak at the bottom of the bracket, extending to L={nxt}")
-                        pts.insert(0, self._point(model, nxt, el, cursor=cursor))
+                        pts.insert(0, self._point(model, nxt, el, cursor=cursor, node_id=node_id))
                     else:
                         break
 
@@ -1415,11 +1473,8 @@ class VllmEvaluator:
                 # A second pass at the peak only. The bracket points establish
                 # WHERE the peak is; the repeat establishes how noisy it is, and
                 # only the peak's noise matters for the keep/revert gate.
-                passes = [peak, self._point(model, conc, el, label="repeat", cursor=cursor)]
-                cand = max(pts, key=lambda m: m["goodput"])
-                if cand["concurrency"] != conc:
-                    conc = cand["concurrency"]
-                    passes = [cand, self._point(model, conc, el, label="repeat", cursor=cursor)]
+                passes = [peak, self._point(model, conc, el, label="repeat", cursor=cursor,
+                                    node_id=node_id)]
 
                 # MIN across the peak's passes, not median and definitely not max.
                 #
@@ -1455,10 +1510,14 @@ class VllmEvaluator:
                 # across every level in the sweep -- the highest KV pressure any
                 # operating point reached is the number that matters.
                 diag = dict(self._metrics())
-                for k in ("kv_cache_util", "preemptions"):
+                for k in self._GAUGES:            # the highest pressure any level reached
                     vals = [p[k] for p in pts if p.get(k) is not None]
                     if vals:
                         diag[k] = max(vals)
+                for k in self._COUNTERS:          # per-level deltas, so they ADD
+                    vals = [p[k] for p in pts if p.get(k) is not None]
+                    if vals:
+                        diag[k] = sum(vals)
                 div = None
                 if "equivalence" in probes:
                     div = self._equivalence(model)
@@ -1514,7 +1573,8 @@ class VllmEvaluator:
                                   # here every record carried p95 nan and n=0.
                                   "ttft_p95_ms": round(med.get("ttft_p95_ms", float("nan")), 1),
                                   "itl_p95_ms": round(med.get("itl_p95_ms", float("nan")), 2),
-                                  "ttft_n": med.get("ttft_n", 0)},
+                                  "ttft_n": med.get("ttft_n", 0),
+                                  "failure_reasons": passes[0].get("failure_reasons") or {}},
                      slo_ok=med["goodput"] > 0)
 
     def _gpu_memory_gb(self) -> float:

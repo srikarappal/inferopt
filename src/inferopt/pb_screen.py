@@ -74,8 +74,8 @@ PB_GENERATORS = {
 }
 
 
-def pb_design(n_factors: int) -> tuple[list[list[bool]], int]:
-    """Rows of True/False, one row per run, one column per factor."""
+def _pb_full(n_factors: int) -> tuple[list[list[bool]], int]:
+    """The COMPLETE design: n runs, n-1 estimable columns."""
     n = next((k for k in sorted(PB_GENERATORS) if k > n_factors), None)
     if n is None:
         raise ValueError(
@@ -84,7 +84,73 @@ def pb_design(n_factors: int) -> tuple[list[list[bool]], int]:
     gen = PB_GENERATORS[n]
     rows = [[gen[(j - i) % (n - 1)] == "+" for j in range(n - 1)] for i in range(n - 1)]
     rows.append([False] * (n - 1))
+    return rows, n
+
+
+def pb_design(n_factors: int) -> tuple[list[list[bool]], int]:
+    """Rows of True/False, one row per run, one column per factor."""
+    rows, n = _pb_full(n_factors)
     return [r[:n_factors] for r in rows], n
+
+
+def spare_contrasts(n_factors: int, results: list) -> list[float]:
+    """Effect estimates for the design columns NO factor was assigned to.
+
+    A 12-run design estimates 11 contrasts. Six factors use six of them; the
+    other five are computed from the same runs, cost nothing extra, and measure
+    ONLY noise -- no factor was ever set by them, so any signal they show is
+    run-to-run variation. That is precisely the quantity Lenth's PSE is trying
+    to estimate, and these are a far better source for it than the main effects,
+    which are the things being tested.
+
+    Discarding them was not free. On the 1.7B screen, Lenth ran on six main
+    effects, so df = 6/3 = 2, t(0.975, 2) = 4.303, and the margin of error came
+    out 1275 tok/s. prefix_caching -- which DOUBLED goodput, +929.9 tok/s at
+    +99%, 3.1x the PSE -- was reported as not active. The test the module's own
+    docstring calls "the right one" could not detect a factor worth 2x, purely
+    because it was fed six numbers instead of eleven.
+
+    Returned as bare effect values; `lenth` takes main effects and these
+    together, which is the standard treatment of a saturated design.
+    """
+    rows, n = _pb_full(n_factors)
+    out = []
+    for c in range(n_factors, n - 1):
+        hi = [results[r] for r in range(len(rows))
+              if rows[r][c] and results[r] is not None]
+        lo = [results[r] for r in range(len(rows))
+              if not rows[r][c] and results[r] is not None]
+        if len(hi) >= 2 and len(lo) >= 2:
+            out.append(statistics.fmean(hi) - statistics.fmean(lo))
+    return out
+
+
+def balance_warning(design, results) -> str | None:
+    """Whether failed runs have broken the orthogonality the estimates rest on.
+
+    A Plackett-Burman estimate is only unconfounded while every column is
+    balanced. Lose a row and the surviving effects are confounded with EACH
+    OTHER, not merely with two-way interactions, and nothing about the arithmetic
+    notices -- `effects()` happily averages 5 against 4.
+
+    This shipped: the 1.7B screen ran 12 rows, 3 failed, and every effect in that
+    table was computed on n_on=5 / n_off=4 with no warning anywhere.
+    """
+    lost = [r + 1 for r, v in enumerate(results) if v is None]
+    if not lost:
+        return None
+    counts = []
+    for c in range(len(design[0])):
+        on = sum(1 for r in range(len(design)) if design[r][c] and results[r] is not None)
+        off = sum(1 for r in range(len(design))
+                  if not design[r][c] and results[r] is not None)
+        counts.append((on, off))
+    worst = max(abs(a - b) for a, b in counts)
+    return (f"{len(lost)} of {len(design)} rows produced no result (rows "
+            f"{', '.join(map(str, lost))}). The design is no longer balanced -- "
+            f"worst column is {max(counts, key=lambda ab: abs(ab[0]-ab[1]))} on/off, "
+            f"a gap of {worst}. Main effects are now confounded with each other, "
+            f"not only with interactions, and every number below inherits that.")
 
 
 def factors_from_dag(dag: dict, ctx) -> list[dict]:
@@ -385,10 +451,18 @@ def main() -> int:
     all_eff = response_effects(design, factors, per_row)
     alias = aliases(design, factors)
     eff = all_eff["goodput"]
-    len_gp = lenth([x["effect"] for x in eff if x.get("effect") is not None])
+    # Main effects AND the columns no factor was assigned to. The spare columns
+    # are pure noise by construction and are what makes the PSE an estimate of
+    # noise rather than of the effects being tested. See spare_contrasts.
+    spare = spare_contrasts(len(factors), results)
+    len_gp = lenth([x["effect"] for x in eff if x.get("effect") is not None] + spare)
+    len_gp["n_spare"] = len(spare)
+    warn = balance_warning(design, results)
     usable = [x for x in results if x is not None]
     noise = (statistics.stdev(usable) if len(usable) > 1 else 0.0)
     print(f"\n{'='*74}")
+    if warn:
+        print(f"\n  !! UNBALANCED DESIGN\n     {warn}\n")
     print(f"  EFFECTS  (mean goodput with the factor ON, minus with it off)\n")
     print(f"  {'factor':26s} {'effect':>9s} {'rel':>8s} {'+/- se':>8s}  verdict")
     print("  " + "-" * 70)
@@ -406,6 +480,10 @@ def main() -> int:
         print(f"\n  LENTH'S TEST  (the right one for {a.repeats} launch(es) per row)")
         print(f"    PSE {len_gp['pse']:.2f} tok/s, margin of error "
               f"{len_gp['me']:.2f} at 95% (df {len_gp['df']:.1f})")
+        print(f"    estimated from {len_gp['n_effects']} contrasts: "
+              f"{len_gp['n_effects'] - len_gp['n_spare']} main effects and "
+              f"{len_gp['n_spare']} unassigned design columns, which carry no "
+              f"factor and so measure only run-to-run noise")
         for x in eff:
             if x.get("effect") is None:
                 continue

@@ -2025,6 +2025,185 @@ def test_slo_explore():
 
 
 # ==========================================================================
+def test_review_fixes():
+    """Defects found by the line-by-line review of the measurement path."""
+    import inspect, statistics, tempfile
+    from pathlib import Path
+    from inferopt import evaluator as E
+    from inferopt.fingerprint import SLO
+
+    section("summarize: a request that FAILED is a miss, not an exclusion")
+    slo = SLO(ttft_p99_ms=500, itl_p99_ms=250)
+
+    def mk(n_fail, n=100):
+        out = []
+        for i in range(n):
+            r = E.Req()
+            r.start, r.ok = 100.0 + i * 0.1, i >= n_fail
+            if r.ok:
+                r.ttft, r.n_out = 0.05, 10
+                r.latency = r.ttft + 0.5
+                r.token_times = [r.start + r.ttft + j * 0.05 for j in range(10)]
+            else:
+                r.error = "HTTP 400"
+            out.append(r)
+        return E.summarize(out, 100.0, 145.0, slo)
+
+    clean, broken = mk(0), mk(20)
+    check("with no failures attainment is 1.0", abs(clean["slo_attainment"] - 1.0) < 1e-9)
+    check("20 failures of 100 make attainment 0.80",
+          abs(broken["slo_attainment"] - 0.80) < 1e-9,
+          f"{broken['slo_attainment']:.3f} -- dividing by `done` would report 1.000 "
+          f"while a fifth of requests errored")
+    check("the failure count is still reported", broken["failed"] == 20)
+    check("and WHY they failed", broken["failure_reasons"] == {"HTTP 400": 20},
+          broken["failure_reasons"])
+    section("_one records WHY, from the real exception path")
+    import asyncio, httpx
+    async def probe(url):
+        async with httpx.AsyncClient() as c:
+            return await E._one(c, url, "m", "hello", 4)
+    # Nothing listening: the request raises inside _one and used to be swallowed
+    # by a bare `except Exception: pass`, leaving ok=False and no reason.
+    r = asyncio.run(probe("http://127.0.0.1:1"))
+    check("a dead endpoint is not ok", not r.ok)
+    check("and says why", bool(r.error),
+          "a bare except left every failure mode identical: an HTTP 400 from an "
+          "over-length generation looked exactly like flaky networking")
+    check("the reason names the exception type", ":" in r.error, r.error)
+
+    class Resp:
+        status_code = 400
+        async def aiter_lines(self):
+            if False:
+                yield ""
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+    class Client:
+        def stream(self, *a, **k): return Resp()
+    r2 = asyncio.run(E._one(Client(), "http://x", "m", "p", 4))
+    check("a non-200 records its status", r2.error == "HTTP 400", r2.error)
+
+    section("gauges peak, counters delta")
+    check("the two are kept apart",
+          "kv_cache_util" in E.VllmEvaluator._GAUGES
+          and "preemptions" in E.VllmEvaluator._COUNTERS)
+
+    class G(E.VllmEvaluator):
+        def __init__(s, series):
+            s._series, s._i = series, 0
+        def sample_gauges(s):
+            v = s._series[min(s._i, len(s._series) - 1)]
+            s._i += 1
+            return v
+
+    import threading
+    # vllm:num_preemptions_total is CUMULATIVE. The server had already recorded
+    # 500 before this window opened; 3 happened during it.
+    ev = G([{"kv_cache_util": 0.1, "preemptions": 500.0},
+            {"kv_cache_util": 0.9, "preemptions": 501.0},
+            {"kv_cache_util": 0.4, "preemptions": 503.0}])
+    out, stop = {}, threading.Event()
+    t = threading.Thread(target=ev._gauge_watch, args=(stop, out, 0.001))
+    t.start(); time_waited = 0
+    while len(out) < 2 or ev._i < 3:
+        stop.wait(0.005)
+        time_waited += 1
+        if time_waited > 200:
+            break
+    stop.set(); t.join(timeout=5)
+    check("the gauge keeps its PEAK", abs(out.get("kv_cache_util", 0) - 0.9) < 1e-9, out)
+    check("the counter reports the DELTA, not 503",
+          out.get("preemptions") == 3.0,
+          f"{out.get('preemptions')} -- max() of a monotone counter is the count "
+          f"since the server booted, which made the curve a staircase that read "
+          f"as 'preemptions rise with L'")
+
+    src = inspect.getsource(E.VllmEvaluator.measure)
+    check("across levels the gauge is maxed", "for k in self._GAUGES" in src)
+    check("...and the counter is SUMMED", "diag[k] = sum(vals)" in src,
+          "per-level deltas add up; taking their max would under-report")
+
+    section("the per-request dump names the NODE")
+    psrc = inspect.getsource(E.VllmEvaluator._point)
+    check("_point takes a node_id", "node_id" in inspect.signature(E.VllmEvaluator._point).parameters)
+    check("and writes it, not the sweep label", 'node_id=node_id or "unknown"' in psrc)
+    check("never the label", 'node_id=label' not in psrc,
+          "one requests.jsonl.gz holds every node in the run; labelling them all "
+          "'sweep' makes the file unattributable")
+    check("every _point call site passes it", src.count("node_id=node_id") >= 4,
+          f"{src.count('node_id=node_id')} of 4 sweep/extend/repeat call sites")
+
+    section("one implementation of the operating point")
+    csrc = inspect.getsource(E.VllmEvaluator.capacity)
+    check("capacity delegates to peak()", "self.peak(curve)" in csrc)
+    check("and does not re-implement it", 'max(curve, key=' not in csrc,
+          "its own docstring warns that a duplicated selection is how two "
+          "answers come to disagree, and it contained one")
+
+    section("no dead re-selection after the bracket")
+    check("the always-false cand block is gone", "cand = max(pts" not in src,
+          "cand was max(pts,...) recomputed on an unchanged pts, so the branch "
+          "could never fire -- and if pts had ever gained the repeat point it "
+          "would have silently burned an extra launch")
+
+
+# ==========================================================================
+def test_pb_spare_contrasts():
+    """A 12-run design estimates 11 contrasts; six factors used six."""
+    section("spare_contrasts: the columns no factor was assigned to")
+    from inferopt.pb_screen import (_pb_full, balance_warning, effects, lenth,
+                                    pb_design, spare_contrasts)
+
+    rows, n = _pb_full(6)
+    check("six factors buy a 12-run design", n == 12 and len(rows) == 12)
+    check("which estimates 11 contrasts", len(rows[0]) == 11)
+    check("pb_design still hands back only the assigned six",
+          len(pb_design(6)[0][0]) == 6)
+
+    # One real effect on column 0, plus deterministic noise -- a noiseless
+    # design gives PSE 0 and the margin comparison below has nothing to compare.
+    import random
+    rnd = random.Random(3)
+    res = [1000.0 + (500 if r[0] else -500) + rnd.gauss(0, 40) for r in rows]
+    sp = spare_contrasts(6, res)
+    check("five columns are recovered", len(sp) == 5, len(sp))
+    check("a factor loaded on column 0 does not leak into them",
+          max(abs(x) for x in sp) < 400,
+          f"max spare {max(abs(x) for x in sp):.1f} against a 1000 main effect")
+
+    section("...and they are what makes Lenth usable")
+    main = [x["effect"] for x in
+            effects([r[:6] for r in rows], [{"id": f"f{i}"} for i in range(6)], res)
+            if x.get("effect") is not None]
+    six, eleven = lenth(main), lenth(main + sp)
+    check("six contrasts give df=2", abs(six["df"] - 2.0) < 1e-9)
+    check("eleven give df=3.67", abs(eleven["df"] - 11 / 3) < 1e-9)
+    check("which is a smaller t multiplier and a tighter margin",
+          eleven["me"] < six["me"],
+          f"ME {six['me']:.1f} -> {eleven['me']:.1f}. On the real 1.7B screen "
+          f"df=2 put t at 4.303 and the margin at 1275 tok/s, so prefix_caching "
+          f"-- +929.9 tok/s, +99%, 3.1x the PSE -- was reported NOT active")
+
+    section("balance_warning: failed rows break orthogonality silently")
+    check("a complete design is quiet", balance_warning([r[:6] for r in rows], res) is None)
+    holed = list(res)
+    for i in (0, 3, 5):
+        holed[i] = None
+    w = balance_warning([r[:6] for r in rows], holed)
+    check("a holed design is not", w is not None)
+    check("it names the rows", w and "1, 4, 6" in w, w)
+    check("and says what it costs",
+          w and "confounded with each other" in w,
+          "losing rows confounds main effects with EACH OTHER, not merely with "
+          "interactions -- the 1.7B screen shipped 5-vs-4 columns and said nothing")
+    e = effects([r[:6] for r in rows], [{"id": f"f{i}"} for i in range(6)], holed)
+    check("effects() still computes on the unbalanced design",
+          e[0].get("effect") is not None,
+          "which is why the warning has to exist -- the arithmetic does not object")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -2167,7 +2346,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
