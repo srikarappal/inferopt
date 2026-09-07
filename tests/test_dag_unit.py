@@ -1739,6 +1739,24 @@ def test_percentile_stability():
     check("itl gets the same treatment",
           "itl_p95_ms" in clean and "itl_p99_ms" in clean)
 
+    section("the percentiles survive aggregate() and the diagnostics whitelist")
+    import inspect
+    from inferopt.evaluator import LOWER_IS_BETTER, VllmEvaluator, aggregate
+    for k in ("ttft_p95_ms", "itl_p95_ms"):
+        check(f"{k} aggregates to the WORST pass", k in LOWER_IS_BETTER)
+    check("ttft_n aggregates to the FEWEST samples", "ttft_n" not in LOWER_IS_BETTER,
+          "more samples is the stronger claim, so the min is the honest one")
+    agg = aggregate([{"ttft_p95_ms": 10.0, "ttft_n": 400, "goodput": 100.0},
+                     {"ttft_p95_ms": 90.0, "ttft_n": 300, "goodput": 200.0}])
+    check("...and it does", agg["ttft_p95_ms"] == 90.0 and agg["ttft_n"] == 300, agg)
+    # Turn 4 recorded p95 nan / n=0 on all three launches: summarize() emitted
+    # them and the Trial's diagnostics dict is a whitelist that did not.
+    src = inspect.getsource(VllmEvaluator.measure)
+    for k in ("ttft_p95_ms", "itl_p95_ms", "ttft_n"):
+        check(f"{k} is in the diagnostics whitelist", src.count(f'"{k}"') >= 2,
+              f"counted {src.count(chr(34) + k + chr(34))} -- both the sweep and the "
+              f"fixed-concurrency path build their own dict")
+
 
 # ==========================================================================
 def test_closed_loop_stagger():

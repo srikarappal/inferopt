@@ -400,7 +400,12 @@ REPEATS = 2
 # min() is conservative for goodput and OPTIMISTIC for latency -- it reports the
 # better of two TTFT samples, which is exactly backwards for a gate that decides
 # whether an SLO was met.
-LOWER_IS_BETTER = {"ttft_p99_ms", "itl_p99_ms", "failed", "window_s"}
+LOWER_IS_BETTER = {"ttft_p99_ms", "itl_p99_ms", "ttft_p95_ms", "itl_p95_ms",
+                   "failed", "window_s"}
+# ttft_n is a SAMPLE COUNT, not a metric -- but aggregate() takes the least
+# flattering value of everything numeric, and fewer samples is the weaker
+# claim, so it belongs on the min side with goodput. That is where the
+# default already puts it; noted so nobody "fixes" it into the set above.
 
 
 def aggregate(passes: list[dict]) -> dict:
@@ -1229,6 +1234,9 @@ class VllmEvaluator:
                                      "goodput_req_s": round(med.get("goodput_req_s", 0.0), 3),
                                      "throughput_req_s": round(med.get("throughput_req_s", 0.0), 3),
                                      "completed": med["completed"], "failed": med["failed"],
+                                     "ttft_p95_ms": round(med.get("ttft_p95_ms", float("nan")), 1),
+                                     "itl_p95_ms": round(med.get("itl_p95_ms", float("nan")), 2),
+                                     "ttft_n": med.get("ttft_n", 0),
                                      "mode": "fixed_concurrency_open_loop"},
                         slo_ok=med["goodput"] > 0)
 
@@ -1382,7 +1390,13 @@ class VllmEvaluator:
                                   "throughput": round(med["throughput"], 1),
                                   "goodput_req_s": round(med.get("goodput_req_s", 0.0), 3),
                                   "throughput_req_s": round(med.get("throughput_req_s", 0.0), 3),
-                                  "completed": med["completed"], "failed": med["failed"]},
+                                  "completed": med["completed"], "failed": med["failed"],
+                                  # summarize() emits these; the whitelist below is
+                                  # what reaches the Trial, and until they were added
+                                  # here every record carried p95 nan and n=0.
+                                  "ttft_p95_ms": round(med.get("ttft_p95_ms", float("nan")), 1),
+                                  "itl_p95_ms": round(med.get("itl_p95_ms", float("nan")), 2),
+                                  "ttft_n": med.get("ttft_n", 0)},
                      slo_ok=med["goodput"] > 0)
 
     def _gpu_memory_gb(self) -> float:
