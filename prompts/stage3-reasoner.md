@@ -66,10 +66,18 @@ launch.
 scheduler step counts. `preemptions > 0` in the diagnostics is a direct signal here and
 nothing in stage 2 reads it.
 
-**Attention and kernel backends.** The backend is chosen by vLLM's own oracle from
-compute capability. GB10 is sm121 and has no FlashInfer kernels — which is why the MoE
-work there ran on triton and marlin — while H100 is sm90 and has the full set. A backend
-that is available on one host and not the other is a lever stage 2 never touches.
+**Attention and kernel backends — SELECTING among them, not writing one.** The backend
+is chosen by vLLM's own oracle from compute capability. GB10 is sm121 and has no
+FlashInfer kernels — which is why the MoE work there ran on triton and marlin — while
+H100 is sm90 and has the full set. A backend available on one host and not the other is a
+lever stage 2 never touches, and choosing between them is a flag.
+
+Writing a NEW kernel is out of scope for this loop, and the reason is the failure mode
+rather than the effort. Every experiment here fails loudly: a bad flag does not launch, an
+illegal combination is rejected. A wrong kernel returns plausible WRONG NUMBERS, and
+goodput improves because the arithmetic broke. It also dissolves the lossless/lossy
+distinction the whole system rests on — a custom kernel is neither. If you believe a
+kernel is the answer, say so as a finding and stop; do not write one.
 
 **The operating point as a first-class knob.** Concurrency is treated as an outcome
 (Little's Law), and the sweep reports a peak. But the `curve` in every trial shows the
