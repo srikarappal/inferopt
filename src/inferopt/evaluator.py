@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -1107,25 +1108,108 @@ class VllmEvaluator:
         except Exception:
             return {}
 
-    def _parse_metrics(self, text: str) -> dict:
-        raw: dict[str, float] = {}
+    # Which reduction each metric takes across label sets. A Prometheus name is
+    # not one number: vLLM exposes one series per (model, engine), and with
+    # tensor or pipeline parallelism, or more than one served model, there are
+    # several. The old parser added them all up, which is right for a counter
+    # and nonsense for a fraction -- two engines at 0.5 KV utilisation summed to
+    # 1.0, reporting a full cache on a half-empty server. Nothing caught it
+    # because every run so far has been single-engine, single-model.
+    _REDUCE = {
+        "vllm:kv_cache_usage_perc": "max",          # a fraction: worst pressure
+        "vllm:num_preemptions": "sum",
+        "vllm:num_preemptions_total": "sum",
+        "vllm:prefix_cache_hits": "sum",
+        "vllm:prefix_cache_hits_total": "sum",
+        "vllm:prefix_cache_queries": "sum",
+        "vllm:prefix_cache_queries_total": "sum",
+        "vllm:spec_decode_num_accepted_tokens": "sum",
+        "vllm:spec_decode_num_draft_tokens": "sum",
+    }
+
+    @staticmethod
+    def parse_prometheus(text: str) -> dict[str, list[tuple[dict, float]]]:
+        """Every series, labels intact, nothing collapsed.
+
+        Reducing at parse time destroys the only evidence that a reduction was
+        even needed. This keeps the granularity and leaves the choice to the
+        caller, which is the whole point: the caller knows whether it is holding
+        a counter or a gauge and the parser does not.
+        """
+        out: dict[str, list[tuple[dict, float]]] = {}
         for line in text.splitlines():
-            if line and not line.startswith("#"):
-                name = line.split("{")[0].split(" ")[0]
-                try:
-                    raw[name] = raw.get(name, 0.0) + float(line.rsplit(" ", 1)[1])
-                except (ValueError, IndexError):
-                    pass
-        g = lambda *ks: next((raw[k] for k in ks if k in raw), None)
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            head, _, val = line.rpartition(" ")
+            if not head:
+                continue
+            name, _, rest = head.partition("{")
+            labels: dict[str, str] = {}
+            if rest:
+                body = rest.rstrip("}")
+                # Split on commas that are not inside a quoted value. Label
+                # values may legitimately contain commas -- model paths do.
+                part, quoted = "", False
+                for ch in body:
+                    if ch == '"':
+                        quoted = not quoted
+                    if ch == "," and not quoted:
+                        k, _, v = part.partition("=")
+                        if k:
+                            labels[k.strip()] = v.strip().strip('"')
+                        part = ""
+                    else:
+                        part += ch
+                if part:
+                    k, _, v = part.partition("=")
+                    if k:
+                        labels[k.strip()] = v.strip().strip('"')
+            try:
+                out.setdefault(name.strip(), []).append((labels, float(val)))
+            except ValueError:
+                continue
+        return out
+
+    def _parse_metrics(self, text: str) -> dict:
+        """Derived scalars, each reduced the way ITS metric type requires.
+
+        `series` travels with them, so a reader can always see what was
+        collapsed and how many series there were. `multi_series` names any
+        metric that had more than one -- on a single-engine run it is empty,
+        and when it is not, a reduction was actually exercised and is worth
+        looking at rather than trusting.
+        """
+        series = self.parse_prometheus(text)
+
+        def red(name: str):
+            vals = [v for _, v in series.get(name, [])]
+            if not vals:
+                return None
+            return max(vals) if self._REDUCE.get(name) == "max" else sum(vals)
+
+        g = lambda *ks: next((red(k) for k in ks if k in series), None)
         hits, qs = g("vllm:prefix_cache_hits", "vllm:prefix_cache_hits_total"), \
                    g("vllm:prefix_cache_queries", "vllm:prefix_cache_queries_total")
         acc, drafts = g("vllm:spec_decode_num_accepted_tokens"), g("vllm:spec_decode_num_draft_tokens")
-        return {k: v for k, v in {
+        out = {k: v for k, v in {
             "kv_cache_util": g("vllm:kv_cache_usage_perc"),
             "preemptions": g("vllm:num_preemptions", "vllm:num_preemptions_total"),
             "prefix_hit_rate": (hits / qs) if hits is not None and qs else None,
             "spec_acceptance_rate": (acc / drafts) if acc is not None and drafts else None,
         }.items() if v is not None}
+        # Only the metrics the scalars above are built from -- the full scrape
+        # includes every histogram bucket vLLM exposes and would bloat each
+        # trial record by orders of magnitude for data nothing reads.
+        kept = {n: [{"labels": lb, "value": v} for lb, v in series[n]]
+                for n in self._REDUCE if n in series}
+        if kept:
+            out["series"] = kept
+        multi = sorted(n for n, vs in series.items()
+                       if n in self._REDUCE and len(vs) > 1)
+        if multi:
+            out["multi_series"] = multi
+        return out
 
     # --- probes ---
     def _equivalence(self, model: str) -> float | None:
@@ -1334,7 +1418,14 @@ class VllmEvaluator:
         decoding is the mirror. Neither needs a special case once the peak is
         what gets compared.
         """
-        tag = f"{node_id}-{abs(hash(json.dumps(config, sort_keys=True, default=str))) % 10**8:08d}"
+        # sha256, not hash(). Python randomises string hashing per process
+        # (PYTHONHASHSEED), so the same config produced a different launch
+        # directory on every invocation and the directories could not be
+        # correlated across runs. Same digest family as provenance.trial_stamp.
+        tag = (f"{node_id}-"
+               + hashlib.sha256(
+                   json.dumps(config, sort_keys=True, default=str).encode()
+               ).hexdigest()[:8])
         t_start = time.time()
         el = lambda: f"+{(time.time()-t_start)/60:4.1f}m"
         changed = {k: v for k, v in config.items() if k != "model"}

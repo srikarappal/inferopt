@@ -2204,6 +2204,79 @@ def test_pb_spare_contrasts():
 
 
 # ==========================================================================
+def test_parse_metrics_granularity():
+    """A Prometheus name is not one number."""
+    section("parse_prometheus: every series, labels intact")
+    import json as _json
+    from inferopt.evaluator import VllmEvaluator as V
+
+    TEXT = """
+# HELP vllm:kv_cache_usage_perc GPU KV-cache usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0",model_name="Qwen/Qwen3-1.7B"} 0.5
+vllm:kv_cache_usage_perc{engine="1",model_name="Qwen/Qwen3-1.7B"} 0.4
+vllm:num_preemptions_total{engine="0",model_name="Qwen/Qwen3-1.7B"} 7
+vllm:num_preemptions_total{engine="1",model_name="Qwen/Qwen3-1.7B"} 5
+vllm:prefix_cache_hits_total{engine="0"} 30
+vllm:prefix_cache_queries_total{engine="0"} 100
+vllm:time_to_first_token_seconds_bucket{le="0.1"} 12
+""".strip()
+
+    ser = V.parse_prometheus(TEXT)
+    check("both KV series survive parsing", len(ser["vllm:kv_cache_usage_perc"]) == 2)
+    check("labels are kept, not discarded",
+          ser["vllm:kv_cache_usage_perc"][0][0]["engine"] == "0",
+          ser["vllm:kv_cache_usage_perc"][0][0])
+    check("a label value containing a slash is intact",
+          ser["vllm:kv_cache_usage_perc"][0][0]["model_name"] == "Qwen/Qwen3-1.7B")
+    check("comments are skipped", "# HELP" not in "".join(ser))
+    check("nothing is summed at parse time",
+          [v for _, v in ser["vllm:kv_cache_usage_perc"]] == [0.5, 0.4],
+          "reducing here destroys the evidence that a reduction was needed")
+
+    section("_parse_metrics: reduced per METRIC TYPE, not blanket-summed")
+    m = V._parse_metrics(V, TEXT)
+    check("a fraction takes the MAX across engines",
+          abs(m["kv_cache_util"] - 0.5) < 1e-9,
+          f"{m['kv_cache_util']} -- summing gave 0.9, and two engines at 0.5 "
+          f"each used to report 1.0: a full cache on a half-empty server")
+    check("a counter still SUMS", m["preemptions"] == 12.0, m["preemptions"])
+    check("ratios are built from summed counters",
+          abs(m["prefix_hit_rate"] - 0.30) < 1e-9, m["prefix_hit_rate"])
+
+    section("...and says what it collapsed")
+    check("the granular series travel with the scalars", "series" in m)
+    check("each carries its labels and value",
+          m["series"]["vllm:kv_cache_usage_perc"][1] == {
+              "labels": {"engine": "1", "model_name": "Qwen/Qwen3-1.7B"}, "value": 0.4},
+          m["series"]["vllm:kv_cache_usage_perc"][1])
+    check("a metric with more than one series is FLAGGED",
+          "vllm:kv_cache_usage_perc" in m["multi_series"],
+          "on a single-engine run this is empty; when it is not, a reduction "
+          "was actually exercised and is worth looking at")
+    check("a single-series metric is not flagged",
+          "vllm:prefix_cache_hits_total" not in m.get("multi_series", []))
+    check("histogram buckets are NOT carried into the record",
+          "vllm:time_to_first_token_seconds_bucket" not in m.get("series", {}),
+          "the full scrape would bloat every trial by orders of magnitude for "
+          "data nothing reads")
+    check("the whole thing still serialises", bool(_json.dumps(m)))
+
+    section("single engine: unchanged from before")
+    one = V._parse_metrics(V, 'vllm:kv_cache_usage_perc{engine="0"} 0.42')
+    check("one series reduces to itself", abs(one["kv_cache_util"] - 0.42) < 1e-9)
+    check("and is not flagged", "multi_series" not in one)
+
+    section("the launch tag is deterministic")
+    import inspect
+    src = inspect.getsource(V.measure)
+    check("sha256, not hash()", "hashlib.sha256" in src)
+    check("hash() is gone", "abs(hash(" not in src,
+          "Python randomises string hashing per process, so the same config "
+          "produced a different launch directory on every invocation")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -2346,7 +2419,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
