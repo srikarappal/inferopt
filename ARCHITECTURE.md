@@ -431,22 +431,57 @@ the difference between sixteen useful turns and six.
 stamp needs the reasoner's model, the prompt, and the seed, or the runs cannot be
 compared to each other -- let alone to stage 2, which is the whole point of the gate.
 
-### Why this rather than GEPA proper
+### GEPA is not the first thing to try here
+
+Take the idea, not the algorithm. A home-grown harness comes first, and GEPA stays a
+later question rather than the starting point.
 
 GEPA's power is reflective mutation over a Pareto frontier of candidates, sampled across
-many cheap rollouts. That regime does not exist here: an evaluation is a model load, a
-concurrency sweep and a benchmark -- thirteen minutes and a GPU. With sixteen evaluations
+many cheap rollouts. That regime does not exist here. An evaluation is a model load, a
+concurrency sweep and a benchmark -- thirteen minutes and a GPU. At sixteen evaluations
 there is no population to maintain and no frontier to sample from, so the machinery that
-makes GEPA GEPA has nothing to work with.
+makes GEPA GEPA has nothing to work with; what would remain is its prompt, wrapped in
+scaffolding built for a cost regime we do not have.
 
 What transfers is the idea worth having: reflect on execution traces in natural language
 and propose a targeted experiment, rather than perturbing a number. That is a prompt and
-a loop, and it drops into the existing `Strategy` protocol as a fourth implementation --
-scored by the same `compare.py`, against the same baselines, on the same axes.
+a loop. Built here it drops into the existing `Strategy` protocol as a fourth
+implementation -- scored by the same `compare.py`, against the same baselines, on the
+same axes as the walk, the screen and yolo -- and every part of it is ours to inspect
+when it produces a result we do not believe, which on current evidence it will.
 
-So: borrow the reflection, skip the genetics. Revisit if evaluations ever become cheap
-enough for a population to mean something -- a tabular benchmark of measured cells would
-do it, since replaying against a table costs milliseconds rather than minutes.
+So: borrow the reflection, skip the genetics, and keep the gate. If the loop does not
+beat the stage-2 DAG at matched budget, stage 2 ships alone and this section records why.
+
+### Why there is no tabular benchmark
+
+The obvious way to compare optimizers cheaply is the NAS-Bench pattern: enumerate the
+configuration space once, measure every cell, then replay any optimizer against the table
+in milliseconds. `replay.py` implements the replay half already -- domination, regret
+against a known optimum, regret-vs-budget curves -- and runs today only against synthetic
+spaces, which is why none of its numbers are evidence about this system.
+
+The measured table is not coming, for a reason worth stating rather than leaving as an
+unfinished task.
+
+The real space is not enumerable. It is not six binary factors; it is those factors
+crossed with their values, the operating point, the quantization rungs, and any
+parallelism -- and the effect of each depends on what is already applied. That last part
+makes it **the compiler phase-ordering problem**: the gain from a technique is a function
+of the techniques already in place, so the space does not decompose. This project has
+measured that directly. Three identical traversals of Qwen3-30B-A3B kept different
+factors, and `chunked_prefill` was reverted at L=2 on runs that never learned what it
+does at L=8, where speculative decoding had moved the operating point.
+
+A table over six binary factors IS tractable -- sixty-four cells -- but it is tractable
+precisely because it is a toy subspace, and there is no reason performance on it predicts
+performance on the real one. The evidence already points the other way: screening beat
+the walk by 1.13x on Qwen3-1.7B and the three methods landed within 4% of each other on
+Qwen3-14B. A benchmark that gives exact regret on a space nobody deploys buys
+false confidence, not insight.
+
+So optimizers are compared the way everything else here is measured: on real hardware,
+against real baselines, with the cost in launches reported beside the result.
 
 ### Other stage-3 candidates
 
