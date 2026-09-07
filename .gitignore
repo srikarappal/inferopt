@@ -27,3 +27,12 @@ __pycache__/
 
 # Claude Code session transcripts, not project code.
 2026-*-local-command-*.txt
+
+# vLLM's compile cache, written by VLLM_CACHE_ROOT into each run directory.
+# Machine-specific (Inductor kernels for one exact GPU / torch / CUDA / vLLM
+# triple), regenerated on the next launch, and read by nothing in the analysis
+# path. 575 of these reached runs_h100/ because `runs/` was ignored and
+# `runs_h100/` was not: 440 MB, 83% of the tracked tree, against 87 MB for
+# everything else. Matched at any depth so a new runs_<host>/ cannot repeat it.
+.vllm_cache/
+.vllm-cache/
