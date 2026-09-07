@@ -1918,6 +1918,113 @@ def test_replay_lengths():
 
 
 # ==========================================================================
+def test_slo_explore():
+    """The SLO must be movable after the run, not only before it."""
+    section("dump_requests -> recompute reproduces summarize EXACTLY")
+    import random, tempfile
+    from pathlib import Path
+    from inferopt import evaluator as E
+    from inferopt.fingerprint import SLO
+    from inferopt.slo_explore import load, recompute
+
+    slo = SLO(ttft_p99_ms=500, itl_p99_ms=250)
+    rnd = random.Random(7)
+    t0, t1 = 100.0, 145.0
+    reqs = []
+    for i in range(300):
+        r = E.Req()
+        # Deliberately messy: some start BEFORE the window (summarize counts
+        # their tokens but not their percentiles), some fail outright, and the
+        # TTFTs straddle the bound so attainment is neither 0 nor 1.
+        r.start = t0 - 3.0 + i * 0.16
+        r.ok = i % 37 != 0
+        r.ttft = rnd.uniform(0.05, 1.2)
+        r.n_out = rnd.randint(2, 40)
+        r.latency = r.ttft + r.n_out * rnd.uniform(0.02, 0.4)
+        r.token_times = [r.start + r.ttft + j * 0.03 for j in range(r.n_out)]
+        if not r.ok:
+            # A request that failed produced no tokens. Leaving them attached
+            # made throughput count work that never happened, which is why the
+            # loose-bound check below could not hold.
+            r.ttft, r.n_out, r.token_times = None, 0, []
+        reqs.append(r)
+
+    want = E.summarize(reqs, t0, t1, slo)
+
+    class Fake(E.VllmEvaluator):
+        def __init__(self, d):
+            self.run_dir, self.slo, self.log = Path(d), slo, lambda *a: None
+
+    d = tempfile.mkdtemp()
+    f = Fake(d)
+    f.dump_requests(reqs, t0, t1, node_id="n", concurrency=64, phase="closed_loop")
+    pts = load(d)
+    check("one measurement point was written", len(pts) == 1, len(pts))
+    check("every request is kept, in-window or not",
+          len(pts[0][1]) == len(reqs), f"{len(pts[0][1])} of {len(reqs)}")
+
+    got = recompute(pts[0][0], pts[0][1], slo.ttft_p99_ms, slo.itl_p99_ms)
+    for k in ("goodput", "throughput", "goodput_req_s", "throughput_req_s",
+              "slo_attainment", "ttft_p99_ms", "ttft_p95_ms", "itl_p99_ms",
+              "itl_p95_ms", "ttft_n", "completed"):
+        a, b = want[k], got[k]
+        close = abs(a - b) <= max(1e-6, abs(a) * 1e-4)
+        check(f"{k} reproduced from disk", close, f"summarize {a!r} vs recompute {b!r}")
+
+    section("...and MOVES when the bound moves")
+    tight = recompute(pts[0][0], pts[0][1], 100.0, 250.0)
+    loose = recompute(pts[0][0], pts[0][1], 5000.0, 5000.0)
+    check("a tighter TTFT bound lowers attainment",
+          tight["slo_attainment"] < got["slo_attainment"],
+          f"{tight['slo_attainment']:.3f} vs {got['slo_attainment']:.3f}")
+    check("a tighter bound lowers goodput", tight["goodput"] < got["goodput"])
+    check("an unreachable-loose bound makes goodput == throughput",
+          abs(loose["goodput"] - loose["throughput"]) < 1e-6,
+          "every completion conforms, so nothing is discounted")
+    check("throughput is INVARIANT to the SLO",
+          abs(tight["throughput"] - loose["throughput"]) < 1e-6,
+          "the server did the same work; only what counts changed")
+
+    section("replicas and cost fall out of goodput_req_s")
+    r16 = recompute(pts[0][0], pts[0][1], 500.0, 250.0, demand_qps=16.0,
+                    gpu_hourly_usd=3.0)
+    check("a replica count is produced", r16["replicas"] >= 1, r16["replicas"])
+    check("it is a CEILING, not a rounding",
+          r16["replicas"] >= 16.0 / r16["goodput_req_s"], r16)
+    tighter = recompute(pts[0][0], pts[0][1], 100.0, 250.0, demand_qps=16.0,
+                        gpu_hourly_usd=3.0)
+    check("a tighter SLO needs at least as many replicas",
+          tighter["replicas"] >= r16["replicas"],
+          f"{tighter['replicas']} vs {r16['replicas']} -- this is the whole point "
+          f"of the slider: what does the promise cost")
+    check("price per hour follows the replica count",
+          tighter["usd_per_hour"] >= r16["usd_per_hour"])
+    check("no run supplies the GPU price", "gpu_hourly_usd" not in str(pts[0][0]),
+          "it is the operator's number, passed in, never measured")
+
+    section("_meets stays in step with Req.meets")
+    from inferopt.slo_explore import _meets
+    for r in reqs[:60]:
+        row = {"k": r.ok, "t": (r.ttft * 1e3 if r.ttft is not None else None),
+               "l": r.latency * 1e3, "n": r.n_out, "s": 0.0, "w": 0}
+        check_quiet = _meets(row, slo.ttft_p99_ms, slo.itl_p99_ms) == r.meets(slo)
+        if not check_quiet:
+            break
+    check("the two predicates agree request by request", check_quiet,
+          "meets() uses MEAN itl (latency-ttft)/(n_out-1); a reader using max "
+          "would silently disagree on exactly the borderline requests")
+
+    section("a run without the file says so")
+    empty = tempfile.mkdtemp()
+    try:
+        load(empty)
+        check("missing capture raises", False)
+    except FileNotFoundError as e:
+        check("missing capture raises, and explains why a p99 cannot substitute",
+              "p99" in str(e))
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -2060,7 +2167,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

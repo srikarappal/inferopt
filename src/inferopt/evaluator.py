@@ -66,6 +66,7 @@ HISTORY -- measurement bugs, which are the expensive kind
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
 import re
@@ -846,6 +847,51 @@ class VllmEvaluator:
         self.equiv_ref: list[str] | None = None
         self.base_url = f"http://{HOST}:{port}"
 
+    def dump_requests(self, reqs: list[Req], t0: float, t1: float, *,
+                      node_id: str, concurrency: int, phase: str) -> None:
+        """Persist the PER-REQUEST record every aggregate was collapsed from.
+
+        summarize() reduces a few hundred requests to a dozen numbers and the
+        requests are then dropped. That makes the SLO unchangeable after the
+        fact: goodput counts only requests that individually met the bound, so
+        re-asking "what if TTFT were 300ms instead of 500" needs the requests
+        back, and no p99 can supply them. Every run so far has to be repeated
+        in full to answer a question it already had the data for.
+
+        Six numbers per request are enough to reconstruct summarize() exactly at
+        ANY threshold -- start, ttft, latency, output tokens, tokens landing
+        inside the window, and ok. Not token_times: those are ~260 floats a
+        request and buy only sub-request timing, which no SLO here asks about.
+        meets() uses the MEAN inter-token latency, (latency-ttft)/(n_out-1), and
+        that is recoverable from what is stored.
+
+        Rows outside the window are kept, with a negative `s`. summarize()
+        counts their tokens toward throughput while excluding them from the
+        started set, and a reader that dropped them would not match.
+
+        Appended as gzip members, ~25KB per measurement point before
+        compression, so a 20-launch screen costs a couple of MB.
+        """
+        path = self.run_dir / "requests.jsonl.gz"
+        rows = [{"_": "meta", "node": node_id, "L": concurrency, "phase": phase,
+                 "win_s": round(t1 - t0, 4), "n": len(reqs),
+                 "slo": {"ttft_p99_ms": self.slo.ttft_p99_ms,
+                         "itl_p99_ms": self.slo.itl_p99_ms}}]
+        for r in reqs:
+            rows.append({
+                "s": round(r.start - t0, 4),
+                "t": round(r.ttft * 1e3, 3) if r.ttft is not None else None,
+                "l": round(r.latency * 1e3, 3),
+                "n": r.n_out,
+                "w": sum(1 for tt in r.token_times if t0 <= tt < t1),
+                "k": bool(r.ok),
+            })
+        try:
+            with gzip.open(path, "at") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in rows))
+        except Exception as e:                 # never lose a run over telemetry
+            self.log(f"        (could not write {path.name}: {type(e).__name__}: {e})")
+
     def replay_lengths(self) -> list[int]:
         """Per-request output lengths, clamped to the context actually served.
 
@@ -1126,6 +1172,8 @@ class VllmEvaluator:
             m["concurrency"] = concurrency
             m["offered"], m["started"] = offered, started
             passes.append(m)
+            self.dump_requests(reqs, t0, t1, node_id=f"pass{i+1}",
+                               concurrency=concurrency, phase="open_loop")
             self.log(f"        {el()} pass {i+1}/{REPEATS}  "
                      f"goodput {m['goodput']:7.1f} tok/s "
                      f"({m['goodput_req_s']:.2f} req/s)  "
@@ -1173,6 +1221,8 @@ class VllmEvaluator:
         m = summarize(reqs, t0, t1, self.slo)
         m["concurrency"] = L
         m.update(peak)                 # kv_cache_util / preemptions, measured live
+        self.dump_requests(reqs, t0, t1, node_id=label or "sweep",
+                           concurrency=L, phase="closed_loop")
         self.log(f"        {el()} L={L:<4d} goodput {m['goodput']:7.1f} tok/s "
                  f"({m['goodput_req_s']:.2f} req/s)  thru {m['throughput']:7.1f}  "
                  f"ttft_p99 {m['ttft_p99_ms']:6.0f}ms  slo {m['slo_attainment']:.0%}  "
