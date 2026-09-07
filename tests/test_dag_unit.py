@@ -1825,6 +1825,99 @@ def test_closed_loop_stagger():
 
 
 # ==========================================================================
+def test_replay_lengths():
+    """Every request carries the trace's OWN output length, not the mean."""
+    section("_mt: scalar for probes, per-request for load")
+    import asyncio, inspect, json, tempfile
+    from pathlib import Path
+    from inferopt import evaluator as E
+
+    check("a scalar still resolves", E._mt(259, 7) == 259)
+    check("a sequence indexes", E._mt([10, 20, 30], 1) == 20)
+    check("...and wraps with the prompt cursor", E._mt([10, 20, 30], 4) == 20)
+    check("an empty sequence cannot return 0 tokens", E._mt([], 0) == 1)
+
+    section("the driver pairs each prompt with ITS OWN length")
+    seen = []
+
+    async def fake_one(client, base_url, model, prompt, max_tokens, stream=True):
+        seen.append((prompt, max_tokens))
+        r = E.Req(start=asyncio.get_event_loop().time())
+        await asyncio.sleep(0.01 * max_tokens)
+        r.ttft, r.n_out, r.ok, r.latency = 0.005, max_tokens, True, 0.01 * max_tokens
+        r.token_times = [r.start + 0.005 * j for j in range(max_tokens)]
+        return r
+
+    prompts = [f"p{i}" for i in range(8)]
+    lengths = [3, 9, 3, 9, 3, 9, 3, 9]
+    orig = E._one
+    E._one = fake_one
+    try:
+        asyncio.run(E._closed_loop("http://x", "m", prompts, lengths, 4, 0.05, 0.15))
+    finally:
+        E._one = orig
+    check("something ran", len(seen) >= 4, f"{len(seen)} requests")
+    paired = {p: mt for p, mt in seen}
+    check("prompt p1 always got length 9", paired.get("p1") == 9, paired)
+    check("prompt p0 always got length 3", paired.get("p0") == 3, paired)
+    check("the served lengths VARY", len({mt for _, mt in seen}) > 1,
+          "a constant here is the original bug: trace_shared.jsonl has sd 167.7 "
+          "on output_tokens and all of it collapsed to int(mean)=259")
+
+    section("replay_lengths: clamped to the context actually served")
+
+    class Fake(E.VllmEvaluator):
+        def __init__(self):
+            self.prompts = ["a", "b", "c"]
+            self.out_tokens = [100, 1464, 200]
+            self.in_tokens = [10, 4431, 20]
+            self.max_tokens = 259
+
+    f = Fake()
+    check("unclamped when no server has been launched", f.replay_lengths() == [100, 1464, 200])
+    f._served_max_len = 6144
+    got = f.replay_lengths()
+    check("a length that fits is untouched", got[0] == 100 and got[2] == 200, got)
+    check("the 4431+1464 row is clamped under the context",
+          got[1] + 4431 + E.CONTEXT_MARGIN_TOKENS <= 6144, got)
+    f._served_max_len = 2048
+    got = f.replay_lengths()
+    check("a prompt that alone overflows still yields a legal request",
+          all(g >= 1 for g in got), got)
+    check("...and shrinks rather than 400s",
+          got[1] == 1, "_one swallows HTTP 400 into ok=False, so an over-length "
+                       "request would vanish from the window instead of failing")
+
+    section("a subclass that never set out_tokens still works")
+
+    class Bare(E.VllmEvaluator):
+        def __init__(self):
+            self.prompts, self.max_tokens = ["a", "b"], 8
+
+    check("falls back to the mean", Bare().replay_lengths() == [8, 8])
+
+    section("the load paths do NOT send the mean")
+    for name in ("serving_metrics", "_point", "measure"):
+        src = inspect.getsource(getattr(E.VllmEvaluator, name))
+        if "_load(" in src or "_closed_loop(" in src:
+            check(f"{name} passes replay_lengths()", "self.replay_lengths()" in src)
+            check(f"{name} no longer passes self.max_tokens as the load length",
+                  "self.prompts, self.max_tokens" not in src)
+
+    section("out_tokens stays aligned with prompts")
+    rows = [{"prompt": "keep", "output_tokens": 11, "input_tokens": 3},
+            {"output_tokens": 999, "input_tokens": 3},          # no prompt: DROPPED
+            {"prompt": "keep2", "output_tokens": 22, "input_tokens": 4}]
+    d = Path(tempfile.mkdtemp()) / "t.jsonl"
+    d.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    src = inspect.getsource(E.VllmEvaluator.__init__)
+    check("prompts and lengths are built from ONE filtered list",
+          src.count("for r in replay") >= 2 and "if r.get(\"prompt\")" in src,
+          "two independent comprehensions over `rows` would silently offset the "
+          "lengths by every prompt-less row")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1967,7 +2060,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

@@ -229,6 +229,12 @@ def main() -> int:
             self.trace_path = "data/trace.jsonl"
             self.prompts = ["prompt " + str(i) for i in range(64)]
             self.max_tokens, self.qps, self.conc = 8, 16.0, 16
+            # VARIED on purpose. A constant here would let measure() pass while
+            # the thing it is meant to exercise -- per-request replay lengths --
+            # was broken, which is exactly how the constant survived in the real
+            # evaluator from the initial commit to now.
+            self.out_tokens = [4 + (i % 13) for i in range(64)]
+            self.in_tokens = [8 + 7 * (i % 5) for i in range(64)]
             self.equiv_k, self.equiv_ref = 8, None
             self.base_url = "http://fake"
 

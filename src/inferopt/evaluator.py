@@ -390,6 +390,10 @@ def _last_line(path: Path) -> str:
 # steady state, which is also the state production runs in.
 WARMUP_S = 45.0
 SETTLE_S = 20.0        # floor; the real value is derived per model, see below
+# Slack left between prompt + generation and max_model_len. Tokenizer counts in
+# a trace are not always the server's counts (chat templates, added specials),
+# and being a few tokens over is a 400, not a truncation.
+CONTEXT_MARGIN_TOKENS = 32
 SETTLE_MAX_S = 75.0    # ceiling, so a slow model cannot make the sweep unbounded
 SWEEP_WINDOW_S = 45.0
 SWEEP_LEVELS = (4, 8, 16, 32, 64, 128, 256)
@@ -524,6 +528,18 @@ class Req:
         return True
 
 
+def _mt(max_tokens, idx: int) -> int:
+    """Resolve the output length for request `idx`.
+
+    Accepts a scalar for the callers that genuinely want one -- the equivalence
+    probe compares token-identical outputs and the accuracy benchmarks have
+    their own budgets -- and a per-request sequence for load replay.
+    """
+    if isinstance(max_tokens, (list, tuple)):
+        return int(max_tokens[idx % len(max_tokens)]) if max_tokens else 1
+    return int(max_tokens)
+
+
 async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
     r = Req(start=time.perf_counter())
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
@@ -592,10 +608,10 @@ async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds,
     live: set[asyncio.Task] = set()
     interval = 1.0 / qps if qps else 0.0
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=conc + 16)) as c:
-        async def go(p):
+        async def go(p, mt):
             async with sem:
                 live.add(asyncio.current_task())
-                out.append(await _one(c, base_url, model, p, max_tokens))
+                out.append(await _one(c, base_url, model, p, mt))
         # The prompt index ADVANCES ACROSS PHASES. It used to restart at 0 on
         # every call, so warmup, pass 1 and pass 2 all served prompts 0..59 --
         # identical full prompts, which a warm prefix cache hits completely.
@@ -608,7 +624,8 @@ async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds,
         tasks, i = [], 0
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < seconds:
-            tasks.append(asyncio.create_task(go(prompts[(base + i) % len(prompts)])))
+            j = (base + i) % len(prompts)
+            tasks.append(asyncio.create_task(go(prompts[j], _mt(max_tokens, j))))
             i += 1
             await asyncio.sleep(interval) if interval else await asyncio.sleep(0)
         t1 = time.perf_counter()
@@ -647,11 +664,12 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
     number is supposed to describe. Settling only helps if it flows into the
     measurement.
 
-    WORKERS ARE STAGGERED, and without that the driver does not measure a
-    pipeline at all. Starting all L workers at one instant with one max_tokens
-    makes them finish together and re-fire together, and nothing ever breaks the
-    lockstep: the load becomes a CONVOY of L requests arriving at once every
-    request-duration. Measured directly at L=128, arrivals peaked at 10.5-14.9x
+    WORKERS ARE STAGGERED AND EVERY REQUEST CARRIES ITS OWN LENGTH. Without
+    both, the driver does not measure a pipeline at all. Starting all L workers
+    at one instant is what created the lockstep; giving every request the same
+    max_tokens is what made it permanent, because identical durations mean the
+    workers that started together also finish together, forever. The load became
+    a CONVOY of L requests arriving at once every request-duration. Measured directly at L=128, arrivals peaked at 10.5-14.9x
     their mean rate, and goodput across two identical drives came out 205.1 and
     2181.6 tok/s -- a 10.6x spread from the alignment of the window against the
     convoy. Staggering the first request over one request-duration gave 1891.0
@@ -694,8 +712,13 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
                 # or a warm prefix cache scores full-prompt hits that no
                 # production workload would produce.
                 issued[0] += 1
-                out.append(await _one(c, base_url, model,
-                                      prompts[(base + i) % len(prompts)], max_tokens))
+                j = (base + i) % len(prompts)
+                # Prompt and length come from the SAME row. Pairing them is the
+                # point: a 4431-token prompt in this trace does not ask for a
+                # 102-token answer, and splitting them would replay a workload
+                # that never existed.
+                out.append(await _one(c, base_url, model, prompts[j],
+                                      _mt(max_tokens, j)))
                 i += conc
         await asyncio.gather(*[asyncio.create_task(worker(k)) for k in range(conc)],
                              return_exceptions=True)
@@ -777,13 +800,30 @@ class VllmEvaluator:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.trace_path = trace_path       # AWQ/NVFP4 calibrate on this workload
         rows = [json.loads(l) for l in open(trace_path) if l.strip()]
-        self.prompts = [r["prompt"] for r in rows if r.get("prompt")]
+        replay = [r for r in rows if r.get("prompt")]
+        self.prompts = [r["prompt"] for r in replay]
         if not self.prompts:
             raise ValueError(
                 f"{trace_path} has no 'prompt' field. The fingerprint can be built from "
                 f"token counts alone, but the benchmark needs the actual text to replay."
             )
+        # The MEAN is still the right number for sizing -- settle length, the
+        # equivalence probe, anything that needs one figure. It was the wrong
+        # number to serve, and serving it is what this replaces.
+        #
+        # trace_shared.jsonl carries output_tokens with mean 259.6 and sd 167.7,
+        # p10..p90 spanning 102..466. That entire distribution used to collapse
+        # to int(mean) = 259 for every request, one line after `replay` was built
+        # with the per-row lengths still in scope. Constant durations are what
+        # let the closed loop stay in lockstep -- see _closed_loop -- so the
+        # stagger there only holds the workers apart, while this is what stops
+        # them re-converging. It also means the tail is finally being measured:
+        # a 466-token request and a 102-token one behave differently, and at a
+        # single constant length neither was.
         self.max_tokens = int(fp.workload.mean_output_tokens)
+        self.out_tokens = [max(1, int(r.get("output_tokens") or self.max_tokens))
+                           for r in replay]
+        self.in_tokens = [max(0, int(r.get("input_tokens") or 0)) for r in replay]
 
         # Settle for at least ONE request duration. A closed-loop window opens
         # with all L workers firing simultaneously; until the first cohort has
@@ -805,6 +845,30 @@ class VllmEvaluator:
         self.equiv_k = cal.equivalence_prefix_tokens() if cal else 8
         self.equiv_ref: list[str] | None = None
         self.base_url = f"http://{HOST}:{port}"
+
+    def replay_lengths(self) -> list[int]:
+        """Per-request output lengths, clamped to the context actually served.
+
+        A constant 259 could never overflow; the real lengths can. The longest
+        output in this trace is 1464 tokens and the longest prompt 4431, and a
+        config serving max_model_len 2048 would take both and return HTTP 400 --
+        which `_one` swallows into ok=False, so the requests would silently
+        vanish from the window instead of failing loudly. Clamping keeps the
+        length distribution as close to the trace as the config permits and
+        never manufactures a request the server will refuse.
+        """
+        want_all = getattr(self, "out_tokens", None)
+        if not want_all:                      # a subclass that set prompts by hand
+            return [self.max_tokens] * len(self.prompts)
+        in_all = getattr(self, "in_tokens", None) or [0] * len(want_all)
+        cap = getattr(self, "_served_max_len", 0)
+        if not cap:
+            return list(want_all)
+        out = []
+        for want, inp in zip(want_all, in_all):
+            room = cap - inp - CONTEXT_MARGIN_TOKENS
+            out.append(max(1, min(want, room)) if room > 0 else 1)
+        return out
 
     # --- server lifecycle ---
     @contextmanager
@@ -865,6 +929,10 @@ class VllmEvaluator:
                 f"--disable-log-requests, --swap-space and --cuda-graph-sizes, "
                 f"and older builds take speculative decoding as flat flags "
                 f"rather than --speculative-config JSON.")
+
+        # What replay_lengths clamps against. Read from the finalized config,
+        # after reconciliation, so it is what the server was actually given.
+        self._served_max_len = int(config.get("max_model_len") or 0)
 
         d = self.run_dir / "launches" / tag
         d.mkdir(parents=True, exist_ok=True)
@@ -1047,12 +1115,12 @@ class VllmEvaluator:
         cursor = [0] if cursor is None else cursor
         if warmup:
             self.log(f"        {el()} warming up {WARMUP_S:.0f}s")
-            asyncio.run(_load(self.base_url, model, self.prompts, self.max_tokens,
+            asyncio.run(_load(self.base_url, model, self.prompts, self.replay_lengths(),
                               self.qps, self.conc, WARMUP_S, cursor=cursor))
         passes = []
         for i in range(REPEATS):
             reqs, t0, t1, offered, started = asyncio.run(
-                _load(self.base_url, model, self.prompts, self.max_tokens,
+                _load(self.base_url, model, self.prompts, self.replay_lengths(),
                       self.qps, concurrency, WINDOW_S, cursor=cursor))
             m = summarize(reqs, t0, t1, self.slo)
             m["concurrency"] = concurrency
@@ -1097,7 +1165,7 @@ class VllmEvaluator:
         w.start()
         try:
             reqs, t0, t1 = asyncio.run(_closed_loop(
-                self.base_url, model, self.prompts, self.max_tokens, L,
+                self.base_url, model, self.prompts, self.replay_lengths(), L,
                 getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S, cursor=cursor,
                 stagger_s=getattr(self, "one_request_s", 0.0)))
         finally:
@@ -1171,7 +1239,7 @@ class VllmEvaluator:
             with self._serve(config, tag) as model:
                 self.log(f"        {el()} healthy, warming up {WARMUP_S:.0f}s")
                 asyncio.run(_load(self.base_url, model, self.prompts,
-                                  self.max_tokens, self.qps, self.conc, WARMUP_S,
+                                  self.replay_lengths(), self.qps, self.conc, WARMUP_S,
                                   cursor=cursor))
 
                 if fixed_concurrency:
