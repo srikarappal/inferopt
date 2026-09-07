@@ -1,0 +1,264 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+    checkpoint stores 2.00 bytes/param (measured over 2 shard header(s)) -> 2.0
+    checkpoint holds 2.03B parameters exactly (2 shard header(s); BF16 4.1GB)
+  quant     no local producer (.quant-pkgs missing) -- int4_awq and nvfp4 will skip. Build it with: python quantize.py --setup
+  quant     can produce: fp8
+
+  model     Qwen/Qwen3-1.7B  (2.03B gqa, 4GB weights, 112KB KV/token)
+  hardware  NVIDIA H100 80GB HBM3 x8  cc9.0  81559GB  3350 GB/s
+  workload  800 reqs, in p99 2660, out mean 260, 16.0 qps [stated], prefix 31%
+  slo       ttft_p99 500.0ms  itl_p99 250.0ms  allow_loss None
+  headroom  one max-length sequence needs 4.7GB of KV
+
+  weights   pre-fetching Qwen/Qwen3-1.7B (outside the launch timeout) ...
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 2067.40it/s]
+  weights   ready, 4.1 GB in 0.0 min -> /srk-cmd2/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+
+  stage 1.2 skipped by --skip-predict
+
+  seed      {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_prefix_caching": false, "enable_chunked_prefill": false, "enforce_eager": true}
+
+  provenance -> runs/h100-1.7b-seqdag/run_meta.json  (commit 583c6080  DIRTY TREE, vllm 0.26.0, torch 2.11.0+cu126)
+  stage 1.3 measuring the seed config
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.7m healthy, warming up 45s
+        + 2.6m L=4    goodput   396.8 tok/s (1.51 req/s)  thru   396.8  ttft_p99     53ms  slo 100%  (68 done)
+        + 3.7m L=8    goodput   783.6 tok/s (3.02 req/s)  thru   783.6  ttft_p99     74ms  slo 100%  (136 done)
+        + 4.8m L=16   goodput  1539.1 tok/s (6.04 req/s)  thru  1539.1  ttft_p99    204ms  slo 100%  (272 done)
+        + 5.9m L=32   goodput  2972.8 tok/s (11.38 req/s)  thru  2972.8  ttft_p99    174ms  slo 100%  (512 done)
+        + 7.1m L=64   goodput  5674.4 tok/s (22.76 req/s)  thru  5674.4  ttft_p99    205ms  slo 100%  (1024 done)
+        + 8.2m L=128  goodput  9940.4 tok/s (39.80 req/s)  thru  9940.4  ttft_p99    320ms  slo 100%  (1791 done)
+        + 9.3m L=256  goodput 10162.2 tok/s (39.31 req/s)  thru 15545.2  ttft_p99    867ms  slo 66%  (2683 done)
+        + 9.3m peak at the top of the bracket, extending to L=512
+        +10.5m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 15974.4  ttft_p99   4336ms  slo 0%  (2816 done)
+        +10.5m peak goodput 10162.2 tok/s at L=256
+        +11.7m L=256  goodput 11004.8 tok/s (43.31 req/s)  thru 15528.0  ttft_p99    821ms  slo 73%  (2684 done)  repeat
+        +11.7m equivalence  0.0% of first-8-token prefixes differ from the reference
+        +12.4m math_500             0.5900  (+/- 1.0% resolution at this sample size)
+        +12.4m done, tearing down
+
+  --------------------------------------------------------------------
+  BASELINE  stage 1.3, the seed config
+            every percentage this run prints is against these numbers
+  --------------------------------------------------------------------
+    goodput            10162.2 tok/s   <- the objective
+                         39.31 req/s   same number, the unit vLLM's own benchmark reports
+    throughput         15528.0 tok/s   (goodput's ceiling)
+    ttft p99               867 ms  <- MISSES the 500 ms SLO
+    itl p99                 16 ms  (within SLO)
+    slo attainment         66%   of requests met both targets
+    memory                74.2 GB
+    config           {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_prefix_caching": false, "enable_chunked_prefill": false, "enforce_eager": true}
+    persisted to     runs/h100-1.7b-seqdag/trials.jsonl  (line 1)  and  runs/h100-1.7b-seqdag/result.json
+  --------------------------------------------------------------------
+
+  --------------------------------------------------------------------
+  CAPACITY  one replica, seed config
+  --------------------------------------------------------------------
+    L=4     goodput    396.8 tok/s  thru    396.8  ttft_p99      53ms  slo 100%
+    L=8     goodput    783.6 tok/s  thru    783.6  ttft_p99      74ms  slo 100%
+    L=16    goodput   1539.1 tok/s  thru   1539.1  ttft_p99     204ms  slo 100%
+    L=32    goodput   2972.8 tok/s  thru   2972.8  ttft_p99     174ms  slo 100%
+    L=64    goodput   5674.4 tok/s  thru   5674.4  ttft_p99     205ms  slo 100%
+    L=128   goodput   9940.4 tok/s  thru   9940.4  ttft_p99     320ms  slo 100%
+    L=256   goodput  10162.2 tok/s  thru  15545.2  ttft_p99     867ms  slo  66%  <- peak
+    L=512   goodput      0.0 tok/s  thru  15974.4  ttft_p99    4336ms  slo   0%
+
+    peak goodput       10162.2 tok/s  at concurrency 256
+    sustainable          39.31 req/s
+    demand              4154.0 tok/s  (16.0 req/s x 260 tokens)
+    replicas needed          1   = demand / capacity, to serve this workload at the SLO
+    nodes start bracketed around L=256; the bracket moves with the incumbent
+  --------------------------------------------------------------------
+
+accept_band 5.0%  [default (this model/hardware pair has never been measured)]
+budget      24 launches / 480 min  [default]
+
+incumbent   10162.2 goodput  [stage 1.3]
+  skip  lora_serve_strategy              fingerprint.lora.n_adapters > 1 and (fingerprint.lora.n_adapters * fin
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=128  goodput 10136.7 tok/s (39.51 req/s)  thru 10136.7  ttft_p99    304ms  slo 100%  (1778 done)
+        + 3.5m L=256  goodput 15850.5 tok/s (64.22 req/s)  thru 16791.0  ttft_p99    564ms  slo 95%  (3028 done)
+        + 4.7m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17832.4  ttft_p99   3934ms  slo 0%  (3072 done)
+        + 4.7m peak goodput 15850.5 tok/s at L=256
+        + 5.9m L=256  goodput 14557.2 tok/s (58.00 req/s)  thru 16592.2  ttft_p99    585ms  slo 89%  (2947 done)  repeat
+        + 5.9m equivalence  10.7% of first-8-token prefixes differ from the reference
+        + 5.9m done, tearing down
+   KEEP prefix_caching                    14557.2 goodput   +43.2%  (1 variant)
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=128  goodput  9972.0 tok/s (39.78 req/s)  thru  9972.0  ttft_p99    286ms  slo 100%  (1790 done)
+        + 3.6m L=256  goodput 15618.3 tok/s (61.11 req/s)  thru 16370.4  ttft_p99    532ms  slo 95%  (2883 done)
+        + 4.7m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17408.0  ttft_p99   4052ms  slo 0%  (2885 done)
+        + 4.7m peak goodput 15618.3 tok/s at L=256
+        + 5.9m L=256  goodput 14794.6 tok/s (58.07 req/s)  thru 16179.8  ttft_p99    565ms  slo 92%  (2854 done)  repeat
+        + 5.9m equivalence  9.5% of first-8-token prefixes differ from the reference
+        + 5.9m done, tearing down
+  revert max_model_len_rightsize           14794.6 goodput    +1.6%  (1 variant)
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=128  goodput 10221.0 tok/s (39.47 req/s)  thru 10221.0  ttft_p99    314ms  slo 100%  (1776 done)
+        + 3.6m L=256  goodput 15916.4 tok/s (62.67 req/s)  thru 16693.0  ttft_p99    550ms  slo 94%  (2985 done)
+        + 4.8m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17847.2  ttft_p99   3889ms  slo 0%  (3072 done)
+        + 4.8m peak goodput 15916.4 tok/s at L=256
+        + 5.9m L=256  goodput 15104.4 tok/s (59.02 req/s)  thru 16624.7  ttft_p99    559ms  slo 91%  (2919 done)  repeat
+        + 5.9m equivalence  6.0% of first-8-token prefixes differ from the reference
+        + 5.9m done, tearing down
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=128  goodput  9987.1 tok/s (39.60 req/s)  thru  9987.1  ttft_p99    243ms  slo 100%  (1782 done)
+        + 3.6m L=256  goodput 14364.4 tok/s (57.31 req/s)  thru 16250.4  ttft_p99    612ms  slo 89%  (2899 done)
+        + 4.7m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17439.4  ttft_p99   4010ms  slo 0%  (2964 done)
+        + 4.7m peak goodput 14364.4 tok/s at L=256
+        + 5.9m L=256  goodput 15764.9 tok/s (61.24 req/s)  thru 16331.7  ttft_p99    557ms  slo 97%  (2848 done)  repeat
+        + 5.9m equivalence  8.3% of first-8-token prefixes differ from the reference
+        + 5.9m done, tearing down
+  revert chunked_prefill                   15104.4 goodput    +3.8%  (2 variants)
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        launch failed: exited 1 during startup
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=128  goodput 10231.6 tok/s (39.71 req/s)  thru 10231.6  ttft_p99    288ms  slo 100%  (1787 done)
+        + 3.6m L=256  goodput 15802.2 tok/s (62.64 req/s)  thru 16729.0  ttft_p99    582ms  slo 95%  (2983 done)
+        + 4.8m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17791.7  ttft_p99   3929ms  slo 0%  (3072 done)
+        + 4.8m peak goodput 15802.2 tok/s at L=256
+        + 5.9m L=256  goodput 15427.2 tok/s (60.67 req/s)  thru 16570.8  ttft_p99    540ms  slo 93%  (2929 done)  repeat
+        + 5.9m equivalence  9.5% of first-8-token prefixes differ from the reference
+        + 5.9m done, tearing down
+   KEEP max_num_batched_tokens            15427.2 goodput    +6.0%  (2 variants)
+  skip  kv_block_size                    workload.p99_input_tokens > 4096
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.6m healthy, warming up 45s
+        + 2.5m L=128  goodput  9127.2 tok/s (53.47 req/s)  thru  9127.2  ttft_p99    109ms  slo 100%  (2406 done)
+        + 3.7m L=256  goodput 13347.6 tok/s (78.04 req/s)  thru 13347.6  ttft_p99    440ms  slo 100%  (3512 done)
+        + 4.9m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 13377.5  ttft_p99   3552ms  slo 0%  (3501 done)
+        + 4.9m peak goodput 13347.6 tok/s at L=256
+        + 6.0m L=256  goodput 13373.4 tok/s (78.04 req/s)  thru 13373.4  ttft_p99    435ms  slo 100%  (3512 done)  repeat
+        + 6.0m equivalence  6.0% of first-8-token prefixes differ from the reference
+        + 6.0m done, tearing down
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=128  goodput  9437.9 tok/s (54.36 req/s)  thru  9437.9  ttft_p99    121ms  slo 100%  (2446 done)
+        + 3.6m L=256  goodput 13704.1 tok/s (77.93 req/s)  thru 13704.1  ttft_p99    447ms  slo 100%  (3507 done)
+        + 4.8m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 13937.9  ttft_p99   3518ms  slo 0%  (3563 done)
+        + 4.8m peak goodput 13704.1 tok/s at L=256
+        + 5.9m L=256  goodput 13717.8 tok/s (77.96 req/s)  thru 13729.3  ttft_p99    443ms  slo 100%  (3512 done)  repeat
+        + 5.9m equivalence  3.6% of first-8-token prefixes differ from the reference
+        + 5.9m done, tearing down
+  revert spec_decode_ngram                 13704.1 goodput   -11.2%  (2 variants)
+  skip  spec_decode_draft                status=todo
+  skip  spec_decode_depth                measurements.spec_decode_ngram.kept or measurements.spec_decode_draft.
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.7m healthy, warming up 45s
+        + 2.6m L=128  goodput 19922.5 tok/s (76.38 req/s)  thru 19922.5  ttft_p99    390ms  slo 100%  (3437 done)
+        + 3.7m L=256  goodput  1327.4 tok/s (5.29 req/s)  thru 21374.8  ttft_p99   1397ms  slo 6%  (4106 done)
+        + 4.9m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 19008.9  ttft_p99   4573ms  slo 0%  (4075 done)
+        + 4.9m peak at the bottom of the bracket, extending to L=64
+        + 6.0m L=64   goodput 14104.1 tok/s (54.18 req/s)  thru 14104.1  ttft_p99    223ms  slo 100%  (2438 done)
+        + 6.0m peak goodput 19922.5 tok/s at L=128
+        + 7.1m L=128  goodput 19917.8 tok/s (77.18 req/s)  thru 19917.8  ttft_p99    387ms  slo 100%  (3473 done)  repeat
+        + 7.1m equivalence  8.3% of first-8-token prefixes differ from the reference
+        + 7.1m done, tearing down
+   KEEP graph_capture                     19917.8 goodput   +29.1%  (1 variant)
+         operating point 256 -> 128 (kept config sustains more)
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.6m healthy, warming up 45s
+        + 2.5m L=64   goodput 13908.6 tok/s (53.80 req/s)  thru 13908.6  ttft_p99    264ms  slo 100%  (2421 done)
+        + 3.6m L=128  goodput 19645.6 tok/s (75.53 req/s)  thru 19645.6  ttft_p99    412ms  slo 100%  (3399 done)
+        + 4.7m L=256  goodput    76.4 tok/s (0.00 req/s)  thru 21671.5  ttft_p99   1239ms  slo 0%  (4108 done)
+        + 4.7m peak goodput 19645.6 tok/s at L=128
+        + 5.8m L=128  goodput 19845.9 tok/s (76.44 req/s)  thru 19845.9  ttft_p99    389ms  slo 100%  (3440 done)  repeat
+        + 6.0m math_500             0.6000  (+/- 1.0% resolution at this sample size)
+        + 6.0m done, tearing down
+        measured quality tolerance: math_500=0.0100
+  revert lossless_complete                 19645.6 goodput    -1.4%  (1 variant)
+  skip  kv_cache_fp8                     lossless_only: the lossy branch is parked
+  skip  retune_batching_after_kv         measurements.kv_cache_fp8.kept
+  skip  lora_unmerge_for_weight_quant    lossless_only: the lossy branch is parked
+  skip  weight_autoquantize              lossless_only: the lossy branch is parked
+  skip  retune_batching_after_weight     measurements.weight_autoquantize.kept
+
+  sweeping 3 frontier finalist(s) for capacity
+
+    graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.6m healthy, warming up 45s
+        + 2.5m L=4    goodput  1556.9 tok/s (6.04 req/s)  thru  1556.9  ttft_p99     24ms  slo 100%  (272 done)
+        + 3.6m L=8    goodput  2934.2 tok/s (11.31 req/s)  thru  2934.2  ttft_p99     23ms  slo 100%  (509 done)
+        + 4.7m L=16   goodput  5203.4 tok/s (20.24 req/s)  thru  5203.4  ttft_p99     33ms  slo 100%  (911 done)
+        + 5.8m L=32   goodput  9036.4 tok/s (34.93 req/s)  thru  9036.4  ttft_p99     45ms  slo 100%  (1572 done)
+        + 6.9m L=64   goodput 14038.7 tok/s (53.87 req/s)  thru 14038.7  ttft_p99    241ms  slo 100%  (2424 done)
+        + 8.0m L=128  goodput 19569.4 tok/s (74.87 req/s)  thru 19569.4  ttft_p99    399ms  slo 100%  (3369 done)
+        + 9.1m L=256  goodput   487.1 tok/s (1.89 req/s)  thru 21296.5  ttft_p99   1294ms  slo 2%  (4101 done)
+        + 9.1m peak goodput 19569.4 tok/s at L=128
+        +10.2m L=128  goodput 19586.5 tok/s (75.49 req/s)  thru 19586.5  ttft_p99    411ms  slo 100%  (3397 done)  repeat
+        +10.2m done, tearing down
+    lossless_complete
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.6m healthy, warming up 45s
+        + 2.5m L=4    goodput  1556.0 tok/s (6.04 req/s)  thru  1556.0  ttft_p99     22ms  slo 100%  (272 done)
+        + 3.6m L=8    goodput  2929.4 tok/s (11.22 req/s)  thru  2929.4  ttft_p99     25ms  slo 100%  (505 done)
+        + 4.7m L=16   goodput  5197.2 tok/s (19.98 req/s)  thru  5197.2  ttft_p99     35ms  slo 100%  (899 done)
+        + 5.8m L=32   goodput  9016.6 tok/s (34.67 req/s)  thru  9016.6  ttft_p99     46ms  slo 100%  (1560 done)
+        + 6.9m L=64   goodput 14043.0 tok/s (54.16 req/s)  thru 14043.0  ttft_p99    274ms  slo 100%  (2437 done)
+        + 8.0m L=128  goodput 19699.3 tok/s (75.89 req/s)  thru 19699.3  ttft_p99    417ms  slo 100%  (3415 done)
+        + 9.1m L=256  goodput   182.9 tok/s (2.16 req/s)  thru 21993.5  ttft_p99   1159ms  slo 2%  (4153 done)
+        + 9.1m peak goodput 19699.3 tok/s at L=128
+        +10.2m L=128  goodput 19903.5 tok/s (76.58 req/s)  thru 19903.5  ttft_p99    366ms  slo 100%  (3446 done)  repeat
+        +10.2m done, tearing down
+    chunked_prefill
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=4    goodput   393.0 tok/s (1.51 req/s)  thru   393.0  ttft_p99     61ms  slo 100%  (68 done)
+        + 3.5m L=8    goodput   775.7 tok/s (3.04 req/s)  thru   775.7  ttft_p99     62ms  slo 100%  (137 done)
+        + 4.6m L=16   goodput  1523.7 tok/s (5.69 req/s)  thru  1523.7  ttft_p99    184ms  slo 100%  (256 done)
+        + 5.7m L=32   goodput  2930.7 tok/s (10.93 req/s)  thru  2930.7  ttft_p99    176ms  slo 100%  (492 done)
+        + 6.8m L=64   goodput  5529.0 tok/s (21.33 req/s)  thru  5529.0  ttft_p99    107ms  slo 100%  (960 done)
+        + 8.0m L=128  goodput  9971.9 tok/s (39.11 req/s)  thru  9971.9  ttft_p99    344ms  slo 100%  (1760 done)
+        + 9.1m L=256  goodput 15182.7 tok/s (60.27 req/s)  thru 16440.7  ttft_p99    583ms  slo 92%  (2935 done)
+        + 9.1m peak at the top of the bracket, extending to L=512
+        +10.3m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17615.9  ttft_p99   3974ms  slo 0%  (2961 done)
+        +10.3m peak goodput 15182.7 tok/s at L=256
+        +11.4m L=256  goodput 14781.4 tok/s (58.16 req/s)  thru 16476.5  ttft_p99    566ms  slo 90%  (2912 done)  repeat
+        +11.4m done, tearing down
+
+==========================================================================
+visited 18 nodes, skipped 9, 10 launches, 54.8 min
+
+BASELINE  (stage 1.3, the seed config -- every % below is against this)
+
+  goodput            10162.2 tok/s   (39.31 req/s)
+  throughput         15528.0 tok/s
+  ttft p99               867 ms
+  itl p99                 16 ms
+  slo attainment         66%
+  math_500            0.5900
+
+PARETO FRONTIER  (3 of 10 measurements)
+
+  measured at concurrency 128 (the stage 1.3 sweep's peak)
+
+  node                           goodput   vs base  quality  ttft p99     L  replicas
+  -----------------------------------------------------------------------------------
+  graph_capture                  19917.8    +96.0%  0.5900~      390ms   128         1
+  lossless_complete              19645.6    +93.3%   0.6000      412ms   128         1  (reverted)
+  chunked_prefill                15104.4    +48.6%  0.5900~      559ms   256         1  (reverted)
+
+  quality marked ~ was inherited from the baseline: a lossless node cannot move it,
+  and the equivalence probe is a stronger check than a 100-sample benchmark.
+
+  best measured   19917.8 tok/s at graph_capture (1.96x the baseline's 10162.2)
+  fleet           1 replicas -> 1 to serve 4154 tok/s at the SLO
+
+  CAPACITY OF THE CHOSEN CONFIG  (its own sweep, not the seed's)
+        L   goodput  ttft p99    slo
+        4    1556.9       24m   100%
+        8    2934.2       23m   100%
+       16    5203.4       33m   100%
+       32    9036.4       45m   100%
+       64   14038.7      241m   100%
+      128   19569.4      399m   100%   <- peak
+      256     487.1     1294m     2%
+
+  wrote runs/h100-1.7b-seqdag/result.json

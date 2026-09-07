@@ -1,0 +1,269 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+    checkpoint stores 2.00 bytes/param (measured over 2 shard header(s)) -> 2.0
+    checkpoint holds 2.03B parameters exactly (2 shard header(s); BF16 4.1GB)
+  quant     no local producer (.quant-pkgs missing) -- int4_awq and nvfp4 will skip. Build it with: python quantize.py --setup
+  quant     can produce: fp8
+
+  model     Qwen/Qwen3-1.7B  2.0B
+  design    Plackett-Burman N=12, 6 factors, 12 rows x 1 launch(es) = 12 launches
+  factors   prefix_caching, max_model_len_rightsize, chunked_prefill, max_num_batched_tokens, spec_decode_ngram, graph_capture
+
+  Each factor is ON in 6 of 12 rows. No row is 'everything on' -- each is a different
+  mix, which is what lets the difference of means isolate one factor.
+
+  provenance -> runs/h100-1.7b-pb/run_meta.json  (commit 583c6080  DIRTY TREE, vllm 0.26.0, torch 2.11.0+cu126)
+
+  row  1/12  +  0.0m  ON: prefix_caching, max_model_len_rightsize, max_num_batched_tokens, spec_decode_ngram, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+            launch 1 FAILED: exited 1 during startup
+  row  2/12  +  0.3m  ON: max_model_len_rightsize, chunked_prefill, spec_decode_ngram, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        + 0.8m healthy, warming up 45s
+        + 2.6m L=4    goodput   917.6 tok/s (5.27 req/s)  thru   917.6  ttft_p99     41ms  slo 100%  (237 done)
+        + 3.7m L=8    goodput  1718.4 tok/s (10.16 req/s)  thru  1718.4  ttft_p99     42ms  slo 100%  (457 done)
+        + 4.8m L=16   goodput  3057.9 tok/s (17.76 req/s)  thru  3057.9  ttft_p99     44ms  slo 100%  (799 done)
+        + 5.9m L=32   goodput  5069.1 tok/s (29.89 req/s)  thru  5069.1  ttft_p99     50ms  slo 100%  (1345 done)
+        + 7.1m L=64   goodput  7545.7 tok/s (44.64 req/s)  thru  7545.7  ttft_p99    124ms  slo 100%  (2009 done)
+        + 8.2m L=128  goodput  9933.7 tok/s (58.78 req/s)  thru  9933.7  ttft_p99    210ms  slo 100%  (2645 done)
+        + 9.3m L=256  goodput 11624.6 tok/s (68.67 req/s)  thru 11624.6  ttft_p99    440ms  slo 100%  (3090 done)
+        + 9.3m peak at the top of the bracket, extending to L=512
+        +10.5m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 11565.0  ttft_p99   4058ms  slo 0%  (3062 done)
+        +10.5m peak goodput 11624.6 tok/s at L=256
+        +11.6m L=256  goodput 11667.7 tok/s (68.87 req/s)  thru 11667.7  ttft_p99    429ms  slo 100%  (3099 done)  repeat
+        +11.8m math_500             0.6100  (+/- 1.0% resolution at this sample size)
+        +11.8m done, tearing down
+            launch 1: 11624.6 tok/s  ttft   440ms  L=256  math_500 0.6100
+  row  3/12  + 12.2m  ON: prefix_caching, chunked_prefill, max_num_batched_tokens, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.7m healthy, warming up 45s
+        + 2.6m L=4    goodput  1556.4 tok/s (6.04 req/s)  thru  1556.4  ttft_p99     22ms  slo 100%  (272 done)
+        + 3.7m L=8    goodput  2931.2 tok/s (11.24 req/s)  thru  2931.2  ttft_p99     24ms  slo 100%  (506 done)
+        + 4.8m L=16   goodput  5204.4 tok/s (20.20 req/s)  thru  5204.4  ttft_p99     28ms  slo 100%  (909 done)
+        + 5.9m L=32   goodput  9037.9 tok/s (34.93 req/s)  thru  9037.9  ttft_p99     46ms  slo 100%  (1572 done)
+        + 7.0m L=64   goodput 13820.9 tok/s (52.80 req/s)  thru 13820.9  ttft_p99    279ms  slo 100%  (2376 done)
+        + 8.1m L=128  goodput 19723.6 tok/s (75.40 req/s)  thru 19723.6  ttft_p99    425ms  slo 100%  (3393 done)
+        + 9.2m L=256  goodput  1319.9 tok/s (5.09 req/s)  thru 21398.9  ttft_p99   1264ms  slo 6%  (4140 done)
+        + 9.2m peak goodput 19723.6 tok/s at L=128
+        +10.3m L=128  goodput 19861.3 tok/s (76.67 req/s)  thru 19861.3  ttft_p99    397ms  slo 100%  (3450 done)  repeat
+        +10.5m math_500             0.5900  (+/- 1.0% resolution at this sample size)
+        +10.5m done, tearing down
+            launch 1: 19723.6 tok/s  ttft   425ms  L=128  math_500 0.5900
+  row  4/12  + 22.7m  ON: max_model_len_rightsize, max_num_batched_tokens, spec_decode_ngram
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+            launch 1 FAILED: exited 1 during startup
+  row  5/12  + 22.9m  ON: chunked_prefill, spec_decode_ngram, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.8m healthy, warming up 45s
+        + 2.6m L=4    goodput   920.2 tok/s (5.27 req/s)  thru   920.2  ttft_p99     41ms  slo 100%  (237 done)
+        + 3.7m L=8    goodput  1716.0 tok/s (10.09 req/s)  thru  1716.0  ttft_p99     41ms  slo 100%  (454 done)
+        + 4.8m L=16   goodput  3043.4 tok/s (17.89 req/s)  thru  3043.4  ttft_p99     44ms  slo 100%  (805 done)
+        + 5.9m L=32   goodput  5064.9 tok/s (29.78 req/s)  thru  5064.9  ttft_p99     52ms  slo 100%  (1340 done)
+        + 7.1m L=64   goodput  7544.8 tok/s (44.56 req/s)  thru  7544.8  ttft_p99    117ms  slo 100%  (2005 done)
+        + 8.2m L=128  goodput  9904.3 tok/s (58.47 req/s)  thru  9904.3  ttft_p99    207ms  slo 100%  (2631 done)
+        + 9.3m L=256  goodput 11506.7 tok/s (67.67 req/s)  thru 11649.4  ttft_p99    512ms  slo 99%  (3088 done)
+        + 9.3m peak at the top of the bracket, extending to L=512
+        +10.5m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 11757.4  ttft_p99   3955ms  slo 0%  (3107 done)
+        +10.5m peak goodput 11506.7 tok/s at L=256
+        +11.6m L=256  goodput 11822.2 tok/s (69.49 req/s)  thru 11822.2  ttft_p99    437ms  slo 100%  (3127 done)  repeat
+        +11.8m math_500             0.5900  (+/- 1.0% resolution at this sample size)
+        +11.8m done, tearing down
+            launch 1: 11506.7 tok/s  ttft   512ms  L=256  math_500 0.5900
+  row  6/12  + 34.7m  ON: max_num_batched_tokens, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        launch failed: exited 1 during startup
+            launch 1 FAILED: exited 1 during startup
+  row  7/12  + 34.8m  ON: prefix_caching, spec_decode_ngram
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=4    goodput   396.2 tok/s (2.38 req/s)  thru   396.2  ttft_p99     25ms  slo 100%  (107 done)
+        + 3.5m L=8    goodput   768.3 tok/s (4.44 req/s)  thru   768.3  ttft_p99     32ms  slo 100%  (200 done)
+        + 4.6m L=16   goodput  1485.8 tok/s (8.71 req/s)  thru  1485.8  ttft_p99     33ms  slo 100%  (392 done)
+        + 5.8m L=32   goodput  2825.6 tok/s (16.49 req/s)  thru  2825.6  ttft_p99     36ms  slo 100%  (742 done)
+        + 6.9m L=64   goodput  5313.2 tok/s (31.24 req/s)  thru  5313.2  ttft_p99     55ms  slo 100%  (1406 done)
+        + 8.0m L=128  goodput  9225.2 tok/s (54.07 req/s)  thru  9225.2  ttft_p99    106ms  slo 100%  (2433 done)
+        + 9.2m L=256  goodput 13489.2 tok/s (78.51 req/s)  thru 13489.2  ttft_p99    459ms  slo 100%  (3533 done)
+        + 9.2m peak at the top of the bracket, extending to L=512
+        +10.3m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 13703.5  ttft_p99   3455ms  slo 0%  (3591 done)
+        +10.3m peak goodput 13489.2 tok/s at L=256
+        +11.5m L=256  goodput 13534.7 tok/s (79.04 req/s)  thru 13614.3  ttft_p99    466ms  slo 99%  (3578 done)  repeat
+        +11.9m math_500             0.5900  (+/- 1.0% resolution at this sample size)
+        +11.9m done, tearing down
+            launch 1: 13489.2 tok/s  ttft   466ms  L=256  math_500 0.5900
+  row  8/12  + 46.8m  ON: prefix_caching, max_model_len_rightsize, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        + 0.7m healthy, warming up 45s
+        + 2.6m L=4    goodput  1552.0 tok/s (5.98 req/s)  thru  1552.0  ttft_p99     22ms  slo 100%  (269 done)
+        + 3.7m L=8    goodput  2937.6 tok/s (11.31 req/s)  thru  2937.6  ttft_p99     22ms  slo 100%  (509 done)
+        + 4.8m L=16   goodput  5215.5 tok/s (20.11 req/s)  thru  5215.5  ttft_p99     27ms  slo 100%  (905 done)
+        + 5.9m L=32   goodput  9002.9 tok/s (34.60 req/s)  thru  9002.9  ttft_p99     53ms  slo 100%  (1557 done)
+        + 7.0m L=64   goodput 14050.4 tok/s (53.98 req/s)  thru 14050.4  ttft_p99    221ms  slo 100%  (2429 done)
+        + 8.1m L=128  goodput 19822.6 tok/s (77.33 req/s)  thru 19822.6  ttft_p99    400ms  slo 100%  (3480 done)
+        + 9.2m L=256  goodput   498.5 tok/s (1.93 req/s)  thru 22176.3  ttft_p99   1173ms  slo 2%  (4179 done)
+        + 9.2m peak goodput 19822.6 tok/s at L=128
+        +10.3m L=128  goodput 19917.2 tok/s (77.11 req/s)  thru 19917.2  ttft_p99    407ms  slo 100%  (3470 done)  repeat
+        +10.5m math_500             0.6300  (+/- 1.0% resolution at this sample size)
+        +10.5m done, tearing down
+            launch 1: 19822.6 tok/s  ttft   407ms  L=128  math_500 0.6300
+  row  9/12  + 57.3m  ON: prefix_caching, max_model_len_rightsize, chunked_prefill
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=4    goodput   385.0 tok/s (1.51 req/s)  thru   385.0  ttft_p99     50ms  slo 100%  (68 done)
+        + 3.5m L=8    goodput   760.0 tok/s (2.84 req/s)  thru   760.0  ttft_p99     62ms  slo 100%  (128 done)
+        + 4.6m L=16   goodput  1492.8 tok/s (5.69 req/s)  thru  1492.8  ttft_p99     56ms  slo 100%  (256 done)
+        + 5.7m L=32   goodput  2871.0 tok/s (11.38 req/s)  thru  2871.0  ttft_p99     88ms  slo 100%  (512 done)
+        + 6.8m L=64   goodput  5500.3 tok/s (21.33 req/s)  thru  5500.3  ttft_p99    100ms  slo 100%  (960 done)
+        + 8.0m L=128  goodput 10039.5 tok/s (39.80 req/s)  thru 10039.5  ttft_p99    329ms  slo 100%  (1791 done)
+        + 9.1m L=256  goodput 15463.0 tok/s (60.00 req/s)  thru 16594.4  ttft_p99    570ms  slo 93%  (2897 done)
+        + 9.1m peak at the top of the bracket, extending to L=512
+        +10.3m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 17915.4  ttft_p99   3777ms  slo 0%  (3072 done)
+        +10.3m peak goodput 15463.0 tok/s at L=256
+        +11.4m L=256  goodput 15908.2 tok/s (62.64 req/s)  thru 17045.4  ttft_p99    569ms  slo 93%  (3015 done)  repeat
+        +12.2m math_500             0.5700  (+/- 1.0% resolution at this sample size)
+        +12.2m done, tearing down
+            launch 1: 15463.0 tok/s  ttft   570ms  L=256  math_500 0.5700
+  row 10/12  + 69.5m  ON: max_model_len_rightsize, chunked_prefill, max_num_batched_tokens
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=4    goodput   385.6 tok/s (1.51 req/s)  thru   385.6  ttft_p99     60ms  slo 100%  (68 done)
+        + 3.5m L=8    goodput   759.1 tok/s (2.84 req/s)  thru   759.1  ttft_p99     67ms  slo 100%  (128 done)
+        + 4.6m L=16   goodput  1504.0 tok/s (5.69 req/s)  thru  1504.0  ttft_p99     80ms  slo 100%  (256 done)
+        + 5.7m L=32   goodput  2893.2 tok/s (10.93 req/s)  thru  2893.2  ttft_p99    119ms  slo 100%  (492 done)
+        + 6.8m L=64   goodput  5586.0 tok/s (21.33 req/s)  thru  5586.0  ttft_p99    206ms  slo 100%  (960 done)
+        + 8.0m L=128  goodput 10231.4 tok/s (39.07 req/s)  thru 10231.4  ttft_p99    232ms  slo 100%  (1758 done)
+        + 9.1m L=256  goodput 14195.4 tok/s (55.89 req/s)  thru 16416.0  ttft_p99    636ms  slo 87%  (2900 done)
+        + 9.1m peak at the top of the bracket, extending to L=512
+        +10.3m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 16898.3  ttft_p99   4115ms  slo 0%  (3065 done)
+        +10.3m peak goodput 14195.4 tok/s at L=256
+        +11.4m L=256  goodput 14700.2 tok/s (58.00 req/s)  thru 16438.1  ttft_p99    619ms  slo 89%  (2919 done)  repeat
+        +12.1m math_500             0.5600  (+/- 1.0% resolution at this sample size)
+        +12.1m done, tearing down
+            launch 1: 14195.4 tok/s  ttft   636ms  L=256  math_500 0.5600
+  row 11/12  + 81.7m  ON: prefix_caching, chunked_prefill, max_num_batched_tokens, spec_decode_ngram
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=4    goodput   384.4 tok/s (2.36 req/s)  thru   384.4  ttft_p99     33ms  slo 100%  (106 done)
+        + 3.5m L=8    goodput   762.2 tok/s (4.44 req/s)  thru   762.2  ttft_p99     33ms  slo 100%  (200 done)
+        + 4.7m L=16   goodput  1460.3 tok/s (8.60 req/s)  thru  1460.3  ttft_p99     34ms  slo 100%  (387 done)
+        + 5.8m L=32   goodput  2804.6 tok/s (16.40 req/s)  thru  2804.6  ttft_p99     37ms  slo 100%  (738 done)
+        + 6.9m L=64   goodput  5236.4 tok/s (30.82 req/s)  thru  5236.4  ttft_p99     54ms  slo 100%  (1387 done)
+        + 8.0m L=128  goodput  9232.6 tok/s (54.27 req/s)  thru  9232.6  ttft_p99    112ms  slo 100%  (2442 done)
+        + 9.2m L=256  goodput 13329.7 tok/s (77.64 req/s)  thru 13358.5  ttft_p99    453ms  slo 100%  (3502 done)
+        + 9.2m peak at the top of the bracket, extending to L=512
+        +10.4m L=512  goodput     0.0 tok/s (0.00 req/s)  thru 13250.5  ttft_p99   3530ms  slo 0%  (3477 done)
+        +10.4m peak goodput 13329.7 tok/s at L=256
+        +11.5m L=256  goodput 13296.0 tok/s (77.67 req/s)  thru 13296.0  ttft_p99    453ms  slo 100%  (3495 done)  repeat
+        +12.0m math_500             0.5700  (+/- 1.0% resolution at this sample size)
+        +12.0m done, tearing down
+            launch 1: 13296.0 tok/s  ttft   453ms  L=256  math_500 0.5700
+  row 12/12  + 93.7m  ON: (none)
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        + 0.5m healthy, warming up 45s
+        + 2.4m L=4    goodput   394.8 tok/s (1.51 req/s)  thru   394.8  ttft_p99    180ms  slo 100%  (68 done)
+        + 3.5m L=8    goodput   790.7 tok/s (3.02 req/s)  thru   790.7  ttft_p99     79ms  slo 100%  (136 done)
+        + 4.6m L=16   goodput  1550.7 tok/s (6.04 req/s)  thru  1550.7  ttft_p99     67ms  slo 100%  (272 done)
+        + 5.7m L=32   goodput  2977.8 tok/s (11.38 req/s)  thru  2977.8  ttft_p99    103ms  slo 100%  (512 done)
+        + 6.8m L=64   goodput  5619.3 tok/s (21.60 req/s)  thru  5619.3  ttft_p99    254ms  slo 100%  (972 done)
+        + 8.0m L=128  goodput  9832.1 tok/s (39.80 req/s)  thru  9832.1  ttft_p99    374ms  slo 100%  (1791 done)
+        + 9.1m L=256  goodput  7233.5 tok/s (26.33 req/s)  thru 15354.0  ttft_p99   1011ms  slo 45%  (2617 done)
+        + 9.1m peak goodput 9832.1 tok/s at L=128
+        +10.2m L=128  goodput  9930.6 tok/s (39.80 req/s)  thru  9930.6  ttft_p99    322ms  slo 100%  (1791 done)  repeat
+        +11.0m math_500             0.5800  (+/- 1.0% resolution at this sample size)
+        +11.0m done, tearing down
+            launch 1:  9832.1 tok/s  ttft   374ms  L=128  math_500 0.5800
+
+==========================================================================
+  EFFECTS  (mean goodput with the factor ON, minus with it off)
+
+  factor                        effect      rel   +/- se  verdict
+  ----------------------------------------------------------------------
+  prefix_caching               +4569.2    +39%   1702.2  RESOLVED
+  spec_decode_ngram            -3328.2    -21%   1942.7  inside noise
+  graph_capture                +2414.2    +18%   2547.8  inside noise
+  max_num_batched_tokens       +2115.3    +16%   2488.8  inside noise
+  max_model_len_rightsize      +1706.9    +13%   2396.4  inside noise
+  chunked_prefill                -79.8     -1%   3174.1  inside noise
+
+  LENTH'S TEST  (the right one for 1 launch(es) per row)
+    PSE 3397.15 tok/s, margin of error 14617.94 at 95% (df 2.0)
+    prefix_caching               +4569.2    1.3x PSE  --
+    spec_decode_ngram            -3328.2    1.0x PSE  --
+    graph_capture                +2414.2    0.7x PSE  --
+    max_num_batched_tokens       +2115.3    0.6x PSE  --
+    max_model_len_rightsize      +1706.9    0.5x PSE  --
+    chunked_prefill                -79.8    0.0x PSE  --
+    Lenth estimates noise from the effects themselves, assuming
+    most are inert. With no replication that is sounder than 2*se,
+    which compares an effect to variation the design cancelled.
+
+  EFFECTS ON EVERY RESPONSE  (same launches, no extra cost)
+    factor                       ttft_p99_ms   itl_p99_ms slo_attainme  concurrency    memory_gb     math_500
+    --------------------------------------------------------------------------------------------------------
+    prefix_caching                    -26.20        -4.73        +0.02       -19.20        +0.06        +0.01
+    spec_decode_ngram                 -14.44        +8.07        +0.03       +76.80        -0.11        +0.00
+    graph_capture                     -53.90        -1.98        +0.04       -38.40        -0.96        +0.03
+    max_num_batched_tokens            +43.33        -2.49        -0.03        +0.00        -0.27        -0.02
+    max_model_len_rightsize           +67.19        -0.84        -0.05       +19.20        -0.83        +0.01
+    chunked_prefill                   +90.47        +3.56        -0.03       +64.00        -1.13        -0.02
+    A factor flat on goodput but heavy on ttft_p99_ms is not neutral.
+
+  ALIAS STRUCTURE  (what each effect may really be)
+    prefix_caching             max_model_len_rightsize*chunked_prefill (r=-0.33), max_model_len_rightsize*max_num_batched_tokens (r=-0.33), max_model_len_rightsize*spec_decode_ngram (r=-0.33)
+    spec_decode_ngram          prefix_caching*max_model_len_rightsize (r=-0.33), prefix_caching*chunked_prefill (r=-0.33), prefix_caching*max_num_batched_tokens (r=+0.33)
+    graph_capture              prefix_caching*max_model_len_rightsize (r=+0.33), prefix_caching*chunked_prefill (r=-0.33), prefix_caching*max_num_batched_tokens (r=+0.33)
+    max_num_batched_tokens     prefix_caching*max_model_len_rightsize (r=-0.33), prefix_caching*chunked_prefill (r=+0.33), prefix_caching*spec_decode_ngram (r=+0.33)
+    max_model_len_rightsize    prefix_caching*chunked_prefill (r=-0.33), prefix_caching*max_num_batched_tokens (r=-0.33), prefix_caching*spec_decode_ngram (r=-0.33)
+    Plackett-Burman aliases PARTIALLY -- these are correlations, not
+    a clean alias chain. Stage 2 should vary a factor together with
+    whatever it correlates most strongly against.
+
+  Nothing resolved above the noise, so stage 2 falls back to the 3
+  largest effects by magnitude. They may be noise; the factorial measures them
+  directly and does not inherit the screen's uncertainty.
+
+==========================================================================
+  STAGE 2: full factorial over 3 factor(s) = 8 configs
+    varying  prefix_caching, spec_decode_ngram, graph_capture
+    pinned   max_num_batched_tokens=on, max_model_len_rightsize=on, chunked_prefill=off
+    Interactions among the varied factors come out clean here; the
+    screen could not separate them from main effects.
+
+   1/8  (none of the varied)
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   2/8  prefix_caching
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   3/8  spec_decode_ngram
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   4/8  prefix_caching, spec_decode_ngram
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   5/8  graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   6/8  prefix_caching, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   7/8  spec_decode_ngram, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+   8/8  prefix_caching, spec_decode_ngram, graph_capture
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: exited 1 during startup
+        FAILED: exited 1 during startup
+
+==========================================================================
+  every stage 2 config failed to launch; PB ships nothing
+  wrote runs/h100-1.7b-pb/effects.json, runs/h100-1.7b-pb/rows.jsonl and runs/h100-1.7b-pb/result.json
+  total 106 min
+

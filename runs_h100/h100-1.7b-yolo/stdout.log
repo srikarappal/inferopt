@@ -1,0 +1,49 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+    checkpoint stores 2.00 bytes/param (measured over 2 shard header(s)) -> 2.0
+    checkpoint holds 2.03B parameters exactly (2 shard header(s); BF16 4.1GB)
+  quant     no local producer (.quant-pkgs missing) -- int4_awq and nvfp4 will skip. Build it with: python quantize.py --setup
+  quant     can produce: fp8
+
+  model     Qwen/Qwen3-1.7B  2.0B
+  factors   6: prefix_caching, max_model_len_rightsize, chunked_prefill, max_num_batched_tokens, spec_decode_ngram, graph_capture
+  budget    2 cells x 2 launch(es) = 4 launches
+  NOTE      yolo measures 2 configurations. It cannot attribute a result
+            to any single factor -- that is the trade it makes.
+
+  [yolo]  1. all_off-rep1
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        launch failed: could not read this vLLM's flag list, so no config can be validated before launching.
+`/srk-cmd2/venvs/inferopt/bin/vllm serve --help=all` produced nothing parseable -- older vLLM builds do not accept --help=all.
+Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let vLLM reject bad flags itself, at the cost of a failed launch per bad key instead of an instant error.
+        FAILED: FileNotFoundError: [Errno 2] No such file or directory: 'runs/h100-1.7b-yolo/launches/all_off-rep1-96887097/why.txt'
+  [yolo]  2. all_on-rep1
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: could not read this vLLM's flag list, so no config can be validated before launching.
+`/srk-cmd2/venvs/inferopt/bin/vllm serve --help=all` produced nothing parseable -- older vLLM builds do not accept --help=all.
+Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let vLLM reject bad flags itself, at the cost of a failed launch per bad key instead of an instant error.
+        FAILED: FileNotFoundError: [Errno 2] No such file or directory: 'runs/h100-1.7b-yolo/launches/all_on-rep1-12919801/why.txt'
+  [yolo]  3. all_off-rep2
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 7168, "enable_pref
+        launch failed: could not read this vLLM's flag list, so no config can be validated before launching.
+`/srk-cmd2/venvs/inferopt/bin/vllm serve --help=all` produced nothing parseable -- older vLLM builds do not accept --help=all.
+Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let vLLM reject bad flags itself, at the cost of a failed launch per bad key instead of an instant error.
+        FAILED: FileNotFoundError: [Errno 2] No such file or directory: 'runs/h100-1.7b-yolo/launches/all_off-rep2-96887097/why.txt'
+  [yolo]  4. all_on-rep2
+        + 0.0m launching  {"gpu_memory_utilization": 0.9, "max_num_seqs": 256, "max_model_len": 6144, "enable_pref
+        launch failed: could not read this vLLM's flag list, so no config can be validated before launching.
+`/srk-cmd2/venvs/inferopt/bin/vllm serve --help=all` produced nothing parseable -- older vLLM builds do not accept --help=all.
+Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let vLLM reject bad flags itself, at the cost of a failed launch per bad key instead of an instant error.
+        FAILED: FileNotFoundError: [Errno 2] No such file or directory: 'runs/h100-1.7b-yolo/launches/all_on-rep2-12919801/why.txt'
+
+========================================================================
+  cell        mean tok/s  launches  configs
+  all_off            0.0         2  0 factor(s) on
+  all_on             0.0         2  6 factor(s) on
+
+  all-off produced no usable measurement
+  yolo ships: all_off
+  -- switching everything on made it WORSE, and yolo can say nothing
+     about which of the 6 factors caused that.
+
+  [yolo] 4 launches, 0 min, 4 failed
+  [yolo] ships all_off-rep1: 0.0 tok/s at L=None

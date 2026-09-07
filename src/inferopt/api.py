@@ -171,11 +171,18 @@ def optimize(
     run_dir: str | None = None,
     gpu: str = "0",
     port: int = 8100,
-    repeats: int = 1,
+    repeats: int = 2,
     survivors: int = 3,
     log=print,
 ) -> Result:
-    """Search serving configurations and return measured operating points."""
+    """Search serving configurations and return measured operating points.
+
+    `repeats` is LAUNCHES per cell or design row, and defaults to 2 to match
+    yolo_run.py's CLI rather than to 1. Across-launch spread was measured at
+    1.69x on a single configuration, so a cell measured once is a coin flip
+    dressed as a measurement -- and a defaulted API must not be less careful
+    than the CLI it wraps.
+    """
     from inferopt.evaluator import hardware_defaults
     from inferopt.fingerprint import Context
     from inferopt.methods import MethodRunner

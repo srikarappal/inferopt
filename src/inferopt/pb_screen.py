@@ -55,6 +55,7 @@ whatever reasoning went into the nodes.
 from __future__ import annotations
 
 from inferopt._paths import default_dag
+from inferopt.legality import repair
 
 import argparse
 import json
@@ -315,6 +316,14 @@ def main() -> int:
         for c, f in enumerate(factors):
             if row[c]:
                 cfg.update(f["on"])
+        # A design puts factors together that vLLM refuses together, by
+        # construction rather than by accident: three of twelve rows pair
+        # max_num_batched_tokens with chunked prefill off. Losing them is not
+        # neutral -- it unbalances every column and leaves the surviving effects
+        # confounded with each other, not merely with interactions.
+        cfg, _fixes = repair(cfg, log=lambda *_: None)
+        if _fixes:
+            print(f"            legality: {'; '.join(_fixes)}")
         on = [factors[c]["id"] for c in range(len(factors)) if row[c]] or ["(none)"]
         print(f"  row {r+1:2d}/{len(design)}  +{(time.time()-t0)/60:5.1f}m  ON: "
               f"{', '.join(on)}")
@@ -507,6 +516,14 @@ def main() -> int:
         for fid, on in zip(top, bits):
             if on:
                 cfg.update(by_id[fid]["on"])
+        # THE PINNING IS THE DANGEROUS PART. Non-survivors are pinned by the
+        # sign of a confounded estimate, so ONE bad pin lands in every cell of
+        # the factorial. On an H100 screen that pinned max_num_batched_tokens on
+        # and chunked prefill off, and all eight cells died -- eight launches
+        # and no answer at all.
+        cfg, _fixes = repair(cfg, log=lambda *_: None)
+        if _fixes:
+            print(f"        legality: {'; '.join(_fixes)}")
         on_names = [fid for fid, b in zip(top, bits) if b] or ["(none of the varied)"]
         label = "s2-" + ("+".join(fid for fid, b in zip(top, bits) if b) or "pinned_only")
         print(f"  {i+1:2d}/{2**len(top)}  {', '.join(on_names)}")

@@ -1,0 +1,28 @@
+exited 1 during startup
+
+9019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/cli/serve.py", line 148, in cmd
+(APIServer pid=109019)     uvloop.run(run_server(args))
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/uvloop/__init__.py", line 69, in run
+(APIServer pid=109019)     return loop.run_until_complete(wrapper())
+(APIServer pid=109019)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/uvloop/__init__.py", line 48, in wrapper
+(APIServer pid=109019)     return await main
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 759, in run_server
+(APIServer pid=109019)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 773, in run_server_worker
+(APIServer pid=109019)     async with build_async_engine_client(
+(APIServer pid=109019)   File "/usr/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=109019)     return await anext(self.gen)
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 139, in build_async_engine_client
+(APIServer pid=109019)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=109019)   File "/usr/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=109019)     return await anext(self.gen)
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 163, in build_async_engine_client_from_engine_args
+(APIServer pid=109019)     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/engine/arg_utils.py", line 2181, in create_engine_config
+(APIServer pid=109019)     scheduler_config = SchedulerConfig(
+(APIServer pid=109019)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+(APIServer pid=109019)     s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+(APIServer pid=109019) pydantic_core._pydantic_core.ValidationError: 1 validation error for SchedulerConfig
+(APIServer pid=109019)   Value error, max_num_batched_tokens (2048) is smaller than max_model_len (6144). This effectively limits the maximum sequence length to max_num_batched_tokens and makes vLLM reject longer sequences. Please increase max_num_batched_tokens or decrease max_model_len. [type=value_error, input_value=ArgsKwargs((), {'runner_t..., 'stream_interval': 1}), input_type=ArgsKwargs]
+(APIServer pid=109019)     For further information visit https://errors.pydantic.dev/2.13/v/value_error

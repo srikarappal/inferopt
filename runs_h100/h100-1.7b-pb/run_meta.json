@@ -1,0 +1,292 @@
+{
+  "when": "2026-09-07T01:11:33+0000",
+  "command": "/srk-cmd2/blobfuse2_cache_cmd2/srikar/inferopt/src/inferopt/pb_screen.py --model Qwen/Qwen3-1.7B --trace data/trace_shared.jsonl --ttft-p99 500 --itl-p99 250 --qps 16 --survivors 3 --run-dir runs/h100-1.7b-pb",
+  "cwd": "/srk-cmd2/blobfuse2_cache_cmd2/srikar/inferopt",
+  "args": {
+    "benchmark": {
+      "value": "math_500",
+      "default": "math_500",
+      "explicit": false
+    },
+    "dag": {
+      "value": null,
+      "default": null,
+      "explicit": false
+    },
+    "gpu": {
+      "value": "0",
+      "default": "0",
+      "explicit": false
+    },
+    "itl_p99": {
+      "value": 250.0,
+      "default": 250,
+      "explicit": false
+    },
+    "model": {
+      "value": "Qwen/Qwen3-1.7B",
+      "default": null,
+      "explicit": true
+    },
+    "no_quality": {
+      "value": false,
+      "default": false,
+      "explicit": false
+    },
+    "no_stage2": {
+      "value": false,
+      "default": false,
+      "explicit": false
+    },
+    "port": {
+      "value": 8300,
+      "default": 8300,
+      "explicit": false
+    },
+    "qps": {
+      "value": 16.0,
+      "default": null,
+      "explicit": true
+    },
+    "repeats": {
+      "value": 1,
+      "default": 1,
+      "explicit": false
+    },
+    "run_dir": {
+      "value": "runs/h100-1.7b-pb",
+      "default": "runs/pb",
+      "explicit": true
+    },
+    "survivors": {
+      "value": 3,
+      "default": 3,
+      "explicit": false
+    },
+    "trace": {
+      "value": "data/trace_shared.jsonl",
+      "default": null,
+      "explicit": true
+    },
+    "ttft_p99": {
+      "value": 500.0,
+      "default": 500,
+      "explicit": false
+    }
+  },
+  "environment": {
+    "python": "3.10.12",
+    "executable": "/srk-cmd2/venvs/inferopt/bin/python",
+    "platform": "Linux-5.15.0-1074-azure-x86_64-with-glibc2.35",
+    "vllm": "0.26.0",
+    "torch": "2.11.0+cu126",
+    "transformers": "5.16.1",
+    "inferopt_commit": "583c60804fcddd85612235d26f6c749f13847ba1",
+    "inferopt_branch": "main",
+    "inferopt_dirty": true
+  },
+  "fingerprint": {
+    "model": {
+      "id": "Qwen/Qwen3-1.7B",
+      "architecture": "Qwen3ForCausalLM",
+      "is_dense": true,
+      "n_params_b": 2.03,
+      "n_layers": 28,
+      "hidden_size": 2048,
+      "n_heads": 16,
+      "n_kv_heads": 8,
+      "attention_type": "gqa",
+      "native_dtype": "bfloat16",
+      "n_experts": 0,
+      "n_active_experts": 0,
+      "active_params_b": null,
+      "supported_runtimes": [
+        "vllm",
+        "sglang",
+        "trtllm"
+      ],
+      "max_model_len": 40960,
+      "full_attention_layers": null,
+      "bytes_per_param": 2.0,
+      "checkpoint_bytes": 4063479808.0,
+      "kv_lora_rank": null,
+      "qk_rope_head_dim": null,
+      "explicit_head_dim": 128,
+      "is_multimodal": false,
+      "has_mtp": false,
+      "can_quantize_fp8": true,
+      "can_quantize_int4_awq": false,
+      "can_quantize_nvfp4": false,
+      "has_compatible_draft": false,
+      "draft_model": null,
+      "head_dim": 128,
+      "kv_layers": 28,
+      "weight_gb": 4.063479808,
+      "active_weight_gb": 4.06,
+      "kv_bytes_per_token": 114688
+    },
+    "hardware": {
+      "gpu_name": "NVIDIA H100 80GB HBM3",
+      "gpu_count": 8,
+      "compute_capability": "9.0",
+      "memory_gb": 81559.0,
+      "memory_bandwidth_gb_s": 3350.0,
+      "unified_memory": false,
+      "interconnect": "nvlink",
+      "system_ram_gb": 1870.2,
+      "cpu_cores": 96,
+      "sm_major": 9,
+      "supports_fp8": true,
+      "supports_fp4": false
+    },
+    "workload": {
+      "n_requests": 800,
+      "mean_input_tokens": 619.7375,
+      "p99_input_tokens": 2660,
+      "p999_input_tokens": 4380,
+      "mean_output_tokens": 259.625,
+      "p99_output_tokens": 804,
+      "request_rate_qps": 16.0,
+      "max_concurrency": 32,
+      "burstiness": 1.560646875,
+      "prefix_overlap": 0.31375,
+      "prefix_overlap_per_adapter": 0.31375,
+      "multi_turn": false,
+      "greedy": true,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "structured_generation": 0.0,
+      "trace_ref": "data/trace_shared.jsonl",
+      "decode_fraction": 0.2952422920013078
+    },
+    "lora": {
+      "n_adapters": 0,
+      "max_rank": 0,
+      "target_modules": [],
+      "adapter_retained": true,
+      "request_distribution": "unknown",
+      "adapter_switching_rate": 0.0,
+      "max_loras_gpu_resident": 8,
+      "merged_upstream": false,
+      "multi_lora_active": false
+    }
+  },
+  "resolved": {
+    "design": "plackett-burman",
+    "n": 12,
+    "factors": [
+      "prefix_caching",
+      "max_model_len_rightsize",
+      "chunked_prefill",
+      "max_num_batched_tokens",
+      "spec_decode_ngram",
+      "graph_capture"
+    ],
+    "rows": [
+      [
+        true,
+        true,
+        false,
+        true,
+        true,
+        true
+      ],
+      [
+        false,
+        true,
+        true,
+        false,
+        true,
+        true
+      ],
+      [
+        true,
+        false,
+        true,
+        true,
+        false,
+        true
+      ],
+      [
+        false,
+        true,
+        false,
+        true,
+        true,
+        false
+      ],
+      [
+        false,
+        false,
+        true,
+        false,
+        true,
+        true
+      ],
+      [
+        false,
+        false,
+        false,
+        true,
+        false,
+        true
+      ],
+      [
+        true,
+        false,
+        false,
+        false,
+        true,
+        false
+      ],
+      [
+        true,
+        true,
+        false,
+        false,
+        false,
+        true
+      ],
+      [
+        true,
+        true,
+        true,
+        false,
+        false,
+        false
+      ],
+      [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      [
+        true,
+        false,
+        true,
+        true,
+        true,
+        false
+      ],
+      [
+        false,
+        false,
+        false,
+        false,
+        false,
+        false
+      ]
+    ],
+    "base_config": {
+      "gpu_memory_utilization": 0.9,
+      "max_num_seqs": 256,
+      "max_model_len": 7168,
+      "enable_prefix_caching": false,
+      "enable_chunked_prefill": false,
+      "enforce_eager": true
+    }
+  }
+}

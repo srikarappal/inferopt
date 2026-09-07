@@ -1627,6 +1627,74 @@ def test_run_benchmark_guards():
 
 
 # ==========================================================================
+def test_legality():
+    """Combinations vLLM refuses, caught before a launch is spent on them."""
+    section("legality: the combination that cost 11 launches")
+    from inferopt.legality import illegal, repair
+
+    # Individually every flag here is accepted. Together vLLM raises at
+    # SchedulerConfig validation, and an automated generator produces this
+    # pairing constantly: it is in 3 of 12 PB design rows by construction.
+    bad = {"max_num_batched_tokens": 2048, "max_model_len": 6144,
+           "enable_chunked_prefill": False}
+    why = illegal(bad)
+    check("the pair is detected", len(why) == 1, f"{why}")
+    check("...and the reason names both values",
+          "2048" in why[0] and "6144" in why[0], why[0])
+
+    ok = {**bad, "enable_chunked_prefill": True}
+    check("chunked prefill makes it legal", not illegal(ok),
+          "a long prompt is split across batches, so it need not fit one")
+    check("equal is legal, not just greater",
+          not illegal({**bad, "max_num_batched_tokens": 6144}))
+    check("a config missing either field is not judged",
+          not illegal({"enable_chunked_prefill": False}),
+          "absent is not the same as violating")
+
+    section("legality: repair is minimal and always reported")
+    fixed, notes = repair(bad, log=lambda *_: None)
+    check("the repaired config is legal", not illegal(fixed), f"{fixed}")
+    check("it raises the token budget", fixed["max_num_batched_tokens"] == 6144)
+    # THE IMPORTANT CHOICE. Switching chunked prefill on would also make it
+    # legal and would silently add a SECOND technique to the configuration --
+    # which in a screening design means the row stops measuring what the design
+    # says it measures.
+    check("it does NOT switch chunked prefill on",
+          fixed["enable_chunked_prefill"] is False,
+          "that would add a second technique and void the row")
+    check("the change is reported, never silent", notes and "6144" in notes[0], notes)
+    check("a legal config is returned unchanged with no notes",
+          repair(ok, log=lambda *_: None) == (ok, []))
+
+    section("legality: the pinning path, which poisoned all 8 stage-2 cells")
+    # Stage 2 pins non-survivors by the sign of a confounded estimate, so one
+    # bad pin lands in EVERY cell of the factorial.
+    pinned = {"max_num_batched_tokens": 2048, "max_model_len": 6144,
+              "enable_chunked_prefill": False, "enable_prefix_caching": False}
+    cells = []
+    for bits in range(8):
+        c = dict(pinned)
+        for i, k in enumerate(("enable_prefix_caching", "enforce_eager", "x")):
+            if bits >> i & 1:
+                c[k] = True
+        cells.append(repair(c, log=lambda *_: None)[0])
+    check("every factorial cell is legal after repair",
+          not any(illegal(c) for c in cells),
+          "one bad pin previously killed all eight launches")
+    check("...and the varied factors are untouched by the repair",
+          sum(1 for c in cells if c.get("enable_prefix_caching")) == 4,
+          "repair must fix the background, never the thing under test")
+
+    section("legality: TP divisibility")
+    check("a TP that does not divide the heads is flagged",
+          illegal({"tensor_parallel_size": 3, "_n_attention_heads": 40}))
+    check("...and one that does is not",
+          not illegal({"tensor_parallel_size": 8, "_n_attention_heads": 40}))
+    check("TP=1 is never flagged",
+          not illegal({"tensor_parallel_size": 1, "_n_attention_heads": 40}))
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1769,7 +1837,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

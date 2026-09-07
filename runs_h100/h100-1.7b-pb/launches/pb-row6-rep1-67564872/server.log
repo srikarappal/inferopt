@@ -1,0 +1,42 @@
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:345] 
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:345]        █     █     █▄   ▄█
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:345]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.26.0
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:345]   █▄█▀ █     █     █     █  model   Qwen/Qwen3-1.7B
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:345]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:345] 
+(APIServer pid=116730) INFO 09-07 01:46:35 [api_utils.py:273] non-default args: {'model_tag': 'Qwen/Qwen3-1.7B', 'host': '127.0.0.1', 'port': 8300, 'model': 'Qwen/Qwen3-1.7B', 'max_model_len': 7168, 'gpu_memory_utilization': 0.9, 'enable_prefix_caching': False, 'max_num_batched_tokens': 2048, 'max_num_seqs': 256, 'enable_chunked_prefill': False}
+(APIServer pid=116730) Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+(APIServer pid=116730) INFO 09-07 01:46:35 [model.py:623] Resolved architecture: Qwen3ForCausalLM
+(APIServer pid=116730) INFO 09-07 01:46:35 [model.py:1788] Using max model len 7168
+(APIServer pid=116730) WARNING 09-07 01:46:35 [arg_utils.py:2536] This model does not officially support disabling chunked prefill. Disabling this manually may cause the engine to crash or produce incorrect outputs.
+(APIServer pid=116730) Traceback (most recent call last):
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/bin/vllm", line 10, in <module>
+(APIServer pid=116730)     sys.exit(main())
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/cli/main.py", line 95, in main
+(APIServer pid=116730)     args.dispatch_function(args)
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/cli/serve.py", line 148, in cmd
+(APIServer pid=116730)     uvloop.run(run_server(args))
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/uvloop/__init__.py", line 69, in run
+(APIServer pid=116730)     return loop.run_until_complete(wrapper())
+(APIServer pid=116730)   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/uvloop/__init__.py", line 48, in wrapper
+(APIServer pid=116730)     return await main
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 759, in run_server
+(APIServer pid=116730)     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 773, in run_server_worker
+(APIServer pid=116730)     async with build_async_engine_client(
+(APIServer pid=116730)   File "/usr/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=116730)     return await anext(self.gen)
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 139, in build_async_engine_client
+(APIServer pid=116730)     async with build_async_engine_client_from_engine_args(
+(APIServer pid=116730)   File "/usr/lib/python3.10/contextlib.py", line 199, in __aenter__
+(APIServer pid=116730)     return await anext(self.gen)
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/entrypoints/openai/api_server.py", line 163, in build_async_engine_client_from_engine_args
+(APIServer pid=116730)     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/vllm/engine/arg_utils.py", line 2181, in create_engine_config
+(APIServer pid=116730)     scheduler_config = SchedulerConfig(
+(APIServer pid=116730)   File "/srk-cmd2/venvs/inferopt/lib/python3.10/site-packages/pydantic/_internal/_dataclasses.py", line 121, in __init__
+(APIServer pid=116730)     s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)
+(APIServer pid=116730) pydantic_core._pydantic_core.ValidationError: 1 validation error for SchedulerConfig
+(APIServer pid=116730)   Value error, max_num_batched_tokens (2048) is smaller than max_model_len (7168). This effectively limits the maximum sequence length to max_num_batched_tokens and makes vLLM reject longer sequences. Please increase max_num_batched_tokens or decrease max_model_len. [type=value_error, input_value=ArgsKwargs((), {'runner_t..., 'stream_interval': 1}), input_type=ArgsKwargs]
+(APIServer pid=116730)     For further information visit https://errors.pydantic.dev/2.13/v/value_error

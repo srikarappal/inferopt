@@ -1,0 +1,67 @@
+
+  METHODS  (math_500 for accuracy)
+    method             ships    L  TTFT p99  ITL p99   SLO     acc  launch  fail   min  best seen
+    ---------------------------------------------------------------------------------------------
+    seqDAG           19569.4  128     399ms    6.7ms  100%  0.5900      10     1    55    19917.8
+    yolo                 0.0    -     infms    infms     -       -       4     4     0          -
+    pb                     -    -         -        -     -       -      20    11   106    19822.6
+
+    seqDAG ships the highest goodput. Margins:
+
+  BASELINE (eval_repro, concurrency PINNED -- not ranked above)
+    stock        4069.3   30      25ms    3.3ms  100%  0.5487
+    A pinned point and a swept peak measure different things;
+    this row says what stock does at ONE operating point.
+
+  EVERY CONFIG MEASURED
+    method         label                             tok/s    L     TTFT     ITL   SLO     acc
+    ------------------------------------------------------------------------------------------
+    seqDAG         stage_1_3 (seed)                10162.2  256    867ms  16.0ms   66% 0.5900 
+    seqDAG         prefix_caching                  14557.2  256    585ms  14.8ms   89% 0.5900~
+    seqDAG         max_model_len_rightsize         14794.6  256    565ms  15.3ms   92% 0.5900~
+    seqDAG         chunked_prefill                 15104.4  256    559ms  14.9ms   91% 0.5900~
+    seqDAG         chunked_prefill                 14364.4  256    612ms  15.3ms   89% 0.5900~
+    seqDAG         max_num_batched_tokens           FAILED    -        -       -     - 0.5900~
+    seqDAG         max_num_batched_tokens          15427.2  256    582ms  14.9ms   93% 0.5900~
+    seqDAG         spec_decode_ngram               13347.6  256    440ms  17.9ms  100% 0.5900~
+    seqDAG         spec_decode_ngram               13704.1  256    447ms  17.7ms  100% 0.5900~
+    seqDAG         graph_capture                   19917.8  128    390ms   6.6ms  100% 0.5900~
+    seqDAG         lossless_complete               19645.6  128    412ms   6.7ms  100% 0.6000 
+    yolo           all_off-rep1                     FAILED    -        -       -     -       -
+    yolo           all_on-rep1                      FAILED    -        -       -     -       -
+    yolo           all_off-rep2                     FAILED    -        -       -     -       -
+    yolo           all_on-rep2                      FAILED    -        -       -     -       -
+    pb             pb-row1-rep1                     FAILED    -        -       -     -       -
+    pb             pb-row2-rep1                    11624.6  256    440ms  21.0ms  100% 0.6100 
+    pb             pb-row3-rep1                    19723.6  128    425ms   6.7ms  100% 0.5900 
+    pb             pb-row4-rep1                     FAILED    -        -       -     -       -
+    pb             pb-row5-rep1                    11506.7  256    512ms  20.9ms   99% 0.5900 
+    pb             pb-row6-rep1                     FAILED    -        -       -     -       -
+    pb             pb-row7-rep1                    13489.2  256    466ms  17.8ms   99% 0.5900 
+    pb             pb-row8-rep1                    19822.6  128    407ms   6.7ms  100% 0.6300 
+    pb             pb-row9-rep1                    15463.0  256    570ms  15.0ms   93% 0.5700 
+    pb             pb-row10-rep1                   14195.4  256    636ms  15.1ms   87% 0.5600 
+    pb             pb-row11-rep1                   13296.0  256    453ms  17.9ms  100% 0.5700 
+    pb             pb-row12-rep1                    9832.1  128    374ms  13.2ms  100% 0.5800 
+    pb             s2-pinned_only                   FAILED    -        -       -     -       -
+    pb             s2-prefix_caching                FAILED    -        -       -     -       -
+    pb             s2-spec_decode_ngram             FAILED    -        -       -     -       -
+    pb             s2-prefix_caching+spec_decode_   FAILED    -        -       -     -       -
+    pb             s2-graph_capture                 FAILED    -        -       -     -       -
+    pb             s2-prefix_caching+graph_captur   FAILED    -        -       -     -       -
+    pb             s2-spec_decode_ngram+graph_cap   FAILED    -        -       -     -       -
+    pb             s2-prefix_caching+spec_decode_   FAILED    -        -       -     -       -
+
+    ~ = accuracy INHERITED from the baseline, not measured on that
+        config. Run the walk with --quality-every-node to remove these.
+
+  JOINT PARETO FRONTIER  (goodput max, math_500 max, TTFT p99 min)
+    pb              2 of 4 non-dominated points
+    seqDAG          1 of 4 non-dominated points
+    baseline        1 of 4 non-dominated points
+    Owning points is not the same as shipping the best one: a
+    method can find trades the others missed and still ship a
+    worse config than a rival's.
+
+  wrote runs/h100-1.7b-frontier.png
+

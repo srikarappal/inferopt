@@ -29,6 +29,8 @@ the sequential walk only.
 from __future__ import annotations
 
 import time
+
+from inferopt.legality import repair as _repair
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -168,6 +170,9 @@ class YoloStrategy:
         all_on = dict(seed)
         for f in self.factors:
             all_on.update(f["on"])
+        # yolo's all-on cell unions EVERY factor, which is the most likely
+        # configuration in the whole system to contain an illegal pair.
+        all_on, _ = _repair(all_on, log=lambda *_: None)
         cells = {"all_off": dict(seed), "all_on": all_on}
 
         trials: list[Any] = []
@@ -241,6 +246,7 @@ class ScreenStrategy:
             for c, f in enumerate(self.factors):
                 if row[c]:
                     cfg.update(f["on"])
+            cfg, _ = _repair(cfg, log=lambda *_: None)
             vals = []
             for rep in range(self.repeats):
                 if budget_launches and len(trials) >= budget_launches:
@@ -289,6 +295,7 @@ class ScreenStrategy:
                 for fid, on in zip(top, bits):
                     if on:
                         cfg.update(by_id[fid]["on"])
+                cfg, _ = _repair(cfg, log=lambda *_: None)
                 label = "s2-" + ("+".join(f for f, b in zip(top, bits) if b)
                                  or "pinned_only")
                 trials.append(runner.measure(cfg, label))
