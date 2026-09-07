@@ -55,6 +55,19 @@ run_step() {
     wait_for_gpu
 }
 
+# SUPERSEDED. This queue produced the runs now in runs/pre-driver-fix/, all of
+# them measured through a load driver that convoyed its workers and served a
+# constant output length. Its skip-markers point at directories that have moved,
+# so running it would re-do six hours of experiments whose numbers are void.
+#
+# Use ./rerun_all.sh instead. Kept because the exact invocations are the record
+# of what was run.
+if [ -z "${OVERNIGHT_I_KNOW_THIS_IS_SUPERSEDED:-}" ]; then
+    echo "overnight.sh is superseded by ./rerun_all.sh -- see runs/pre-driver-fix/README.md"
+    echo "set OVERNIGHT_I_KNOW_THIS_IS_SUPERSEDED=1 to run it anyway"
+    exit 1
+fi
+
 say "overnight queue starting"
 wait_for_gpu
 

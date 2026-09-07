@@ -1,7 +1,7 @@
 """Draw a Plackett-Burman run: the design matrix, the response, the effects.
 
-    python plot_pb.py runs/1.7b-pb
-    python plot_pb.py runs/1.7b-pb --response ttft_p99_ms -o /tmp/x.png
+    python plot_pb.py runs/rerun-1.7b-pb
+    python plot_pb.py runs/rerun-1.7b-pb --response ttft_p99_ms -o /tmp/x.png
 
 A screen's output is a table of numbers whose STRUCTURE is the argument, and the
 table hides it. The design is what makes the arithmetic valid -- every factor on
