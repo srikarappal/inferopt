@@ -436,12 +436,18 @@ compared to each other -- let alone to stage 2, which is the whole point of the 
 Take the idea, not the algorithm. A home-grown harness comes first, and GEPA stays a
 later question rather than the starting point.
 
-GEPA's power is reflective mutation over a Pareto frontier of candidates, sampled across
-many cheap rollouts. That regime does not exist here. An evaluation is a model load, a
-concurrency sweep and a benchmark -- thirteen minutes and a GPU. At sixteen evaluations
-there is no population to maintain and no frontier to sample from, so the machinery that
-makes GEPA GEPA has nothing to work with; what would remain is its prompt, wrapped in
-scaffolding built for a cost regime we do not have.
+There IS a population, and it is worth being accurate about this. Stage 2 leaves ten to
+twenty-seven measured configurations -- the reverted ones as much as the kept ones, since
+a technique that lost is evidence about the space -- and each stage-3 turn adds another.
+`Result.frontier()` already computes the non-dominated set over all of them.
+
+The constraint is not the population's existence but the rate it can grow. GEPA's power
+is reflective mutation over a frontier sampled across many CHEAP rollouts; here an
+evaluation is a model load, a concurrency sweep and a benchmark -- thirteen minutes and a
+GPU. Sixteen turns adds sixteen members. Selection pressure over a population that grows
+by one per quarter-hour is a different algorithm from selection pressure over thousands
+of rollouts, and the parts of GEPA that assume the latter would be carried without doing
+any work.
 
 What transfers is the idea worth having: reflect on execution traces in natural language
 and propose a targeted experiment, rather than perturbing a number. That is a prompt and
