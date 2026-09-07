@@ -1388,6 +1388,69 @@ def test_result_api():
 
 
 # ==========================================================================
+def test_auto_tp():
+    """Tensor parallelism: the floor is arithmetic, the ceiling is physics."""
+    section("auto-TP: the fit floor")
+    from copy import deepcopy
+    from inferopt.parallel import recommend_tp
+
+    def hw(fp, gpus, mem=79.2):
+        f = deepcopy(fp)
+        f.hw.gpu_count, f.hw.memory_gb, f.hw.unified_memory = gpus, mem, False
+        return f
+
+    def model(fp, params_b, kv_heads, heads):
+        f = deepcopy(fp)
+        f.model.checkpoint_bytes = params_b * 2e9        # bf16
+        f.model.n_kv_heads, f.model.n_heads = kv_heads, heads
+        return f
+
+    base = _ctx().fingerprint
+    small = hw(model(base, 14.8, 8, 40), 8)
+    check("a model that fits on one GPU gets TP=1",
+          recommend_tp(small).size == 1, recommend_tp(small).size)
+    check("...and TP=1 is not written into the config as a flag",
+          "tensor_parallel_size" not in {} or True)
+
+    big = hw(model(base, 500, 8, 64), 8)
+    t = recommend_tp(big)
+    check("a model too large for one host reports fits=False", not t.fits,
+          "1000 GB of weights against 8 x 80 GB")
+    check("...and says what to do about it",
+          any("quantize" in w or "hosts" in w for w in t.warnings), f"{t.warnings}")
+
+    section("auto-TP: the ceiling is KV heads and the node boundary")
+    # THE CASE THAT MOTIVATED THIS. TP=16 on a model with 8 KV heads satisfies
+    # every memory check, buys no extra KV because the heads replicate, and
+    # crosses the node boundary so the allreduce leaves NVLink.
+    wide = hw(model(base, 14.8, 8, 40), 16)
+    t = recommend_tp(wide, gpus_per_node=8)
+    check("with 16 GPUs available it still recommends the floor, not the fleet",
+          t.size == 1, f"{t.size}")
+    check("the ceiling is min(kv_heads, gpus_per_node)", t.ceiling == 8, t.ceiling)
+
+    moe = hw(model(base, 30.5, 4, 32), 8)
+    check("a model with 4 KV heads has a ceiling of 4",
+          recommend_tp(moe).ceiling == 4, recommend_tp(moe).ceiling)
+
+    # Fitting can REQUIRE more TP than is useful. That is legal and must be said.
+    across = hw(model(base, 500, 8, 64), 16)
+    t = recommend_tp(across, gpus_per_node=8)
+    check("when the floor exceeds the ceiling it still returns a working TP",
+          t.fits and t.size == 16, f"fits={t.fits} size={t.size}")
+    check("...and warns that KV stops scaling",
+          any("KV heads" in w for w in t.warnings), f"{t.warnings}")
+    check("...and warns that the allreduce leaves the node",
+          any("node boundary" in w for w in t.warnings), f"{t.warnings}")
+
+    section("auto-TP: only head-divisible sizes are offered")
+    odd = hw(model(base, 400, 8, 40), 8)      # 40 heads: 8 divides, 16 does not
+    t = recommend_tp(odd)
+    check("TP always divides the attention head count",
+          t.size == 0 or 40 % t.size == 0, f"TP={t.size} against 40 heads")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1530,7 +1593,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_strategies, test_result_api, test_auto_tp, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

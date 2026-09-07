@@ -137,6 +137,16 @@ def seed_config(fp) -> dict:
     # anything set above wins.
     from inferopt.evaluator import hardware_defaults
     cfg = {**hardware_defaults(fp), **cfg}
+
+    # TENSOR PARALLELISM, when the model does not fit on one device. This is a
+    # precondition rather than a tuning choice -- a model that cannot load has
+    # no incumbent for the search to improve on -- so the minimum that fits is
+    # computed rather than left to the caller. Anything ABOVE that floor is a
+    # real trade the fingerprint cannot rank, and stays the caller's.
+    from inferopt.parallel import recommend_tp
+    tp = recommend_tp(fp)
+    if tp.size > 1:
+        cfg["tensor_parallel_size"] = tp.size
     return cfg
 
 
