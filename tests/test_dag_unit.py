@@ -1741,6 +1741,72 @@ def test_percentile_stability():
 
 
 # ==========================================================================
+def test_closed_loop_stagger():
+    """The load driver must pipeline, not convoy."""
+    section("_closed_loop: workers are dephased")
+    import asyncio, inspect
+    from inferopt import evaluator as E
+
+    src = inspect.getsource(E._closed_loop)
+    check("stagger is a parameter", "stagger_s" in inspect.signature(E._closed_loop).parameters)
+    check("it defaults to OFF so callers opt in",
+          inspect.signature(E._closed_loop).parameters["stagger_s"].default == 0.0)
+    check("the offset is per-worker, not global", "slot" in src.split("stagger_s > 0")[1][:220])
+    check("and capped at settle so no worker starts inside the window",
+          "min(stagger_s, settle_s)" in src)
+
+    # MEASURED, turn 3: locked L=128 gave goodput 205.1 and 2181.6 across two
+    # identical drives (10.6x); dephased gave 1891.0 and 1893.8 (1.00x), with
+    # arrivals peaking at 10.5-14.9x the mean rate locked vs 1.52x dephased.
+    started = []
+
+    async def fake_one(client, base_url, model, prompt, max_tokens):
+        r = E.Req()
+        r.start = asyncio.get_event_loop().time()
+        started.append(r.start)
+        await asyncio.sleep(0.20)          # every request the same length --
+        r.ttft, r.n_out, r.ok = 0.01, 4, True   # which is what locks the convoy
+        r.latency = 0.20
+        r.token_times = [r.start + 0.05 * j for j in range(4)]
+        return r
+
+    def spread(stagger):
+        started.clear()
+        orig = E._one
+        E._one = fake_one
+        try:
+            asyncio.run(E._closed_loop("http://x", "m", ["p"] * 64, 4, 16,
+                                       0.30, 0.40, stagger_s=stagger))
+        finally:
+            E._one = orig
+        base = min(started)
+        bins = {}
+        for t in started:
+            bins[round((t - base) * 20)] = bins.get(round((t - base) * 20), 0) + 1
+        return max(bins.values()), len(started)
+
+    locked_peak, locked_n = spread(0.0)
+    deph_peak, deph_n = spread(0.20)
+    check("locked, every worker fires in the same instant",
+          locked_peak >= 16, f"peak {locked_peak} arrivals in one 50ms bin of {locked_n}")
+    check("staggered, arrivals spread out",
+          deph_peak < locked_peak,
+          f"peak {deph_peak} vs {locked_peak} -- the convoy is what made goodput "
+          f"swing 10.6x across identical drives")
+    check("the stagger does not starve the loop",
+          deph_n >= locked_n * 0.5, f"{deph_n} vs {locked_n} requests issued")
+
+    section("VllmEvaluator: the estimate survives the settle clamp")
+    src = inspect.getsource(E.VllmEvaluator.__init__)
+    check("one_request_s is stored, not recovered from settle_s",
+          "self.one_request_s = one_request_s" in src,
+          "settle_s is clamped at both ends; dividing by 1.2 recovers the floor, "
+          "not the estimate")
+    check("and the sweep path passes it",
+          "stagger_s=getattr(self, \"one_request_s\"" in inspect.getsource(E.VllmEvaluator._point))
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1883,7 +1949,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

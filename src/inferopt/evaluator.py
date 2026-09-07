@@ -618,7 +618,7 @@ async def _load(base_url, model, prompts, max_tokens, qps, conc, seconds,
 
 async def _closed_loop(base_url, model, prompts, max_tokens, conc,
                        settle_s: float, window_s: float,
-                       cursor: list[int] | None = None):
+                       cursor: list[int] | None = None, stagger_s: float = 0.0):
     """Hold exactly `conc` requests in flight, replacing each as it completes.
 
     The open-loop driver above fixes the ARRIVAL RATE and lets concurrency
@@ -642,6 +642,29 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
     number is supposed to describe. Settling only helps if it flows into the
     measurement.
 
+    WORKERS ARE STAGGERED, and without that the driver does not measure a
+    pipeline at all. Starting all L workers at one instant with one max_tokens
+    makes them finish together and re-fire together, and nothing ever breaks the
+    lockstep: the load becomes a CONVOY of L requests arriving at once every
+    request-duration. Measured directly at L=128, arrivals peaked at 10.5-14.9x
+    their mean rate, and goodput across two identical drives came out 205.1 and
+    2181.6 tok/s -- a 10.6x spread from the alignment of the window against the
+    convoy. Staggering the first request over one request-duration gave 1891.0
+    and 1893.8, a 1.00x spread, with TTFT p99 248 vs 258ms and 100% attainment
+    both times. At L=256 the spread went 1.42x -> 1.01x.
+
+    That convoy is also why L=32 measured WORSE than L=64 (673-987ms vs
+    149-165ms) -- no capacity argument permits that, but phase alignment does.
+
+    The stagger is capped at the settle interval so every worker is in flight
+    before the window opens; the offsets then persist on their own, because a
+    worker re-fires only when its own request returns.
+
+    Note the convoy is not purely an artifact: batching L prefills at once uses
+    the GPU harder, so locked measured ~8.5 starts/s against dephased ~7.2. It
+    is a real throughput/latency trade -- but it is one no production arrival
+    process produces, so optimising against it optimised for the wrong workload.
+
     Returning `time.perf_counter()` after the gather puts the DRAIN inside the
     window: workers stop launching at the deadline, but the last in-flight
     requests keep running, and at 45s windows with ~22s requests that is a third
@@ -658,6 +681,8 @@ async def _closed_loop(base_url, model, prompts, max_tokens, conc,
     t1 = t0 + window_s                    # and closes
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=conc + 16)) as c:
         async def worker(slot: int):
+            if stagger_s > 0:
+                await asyncio.sleep(min(stagger_s, settle_s) * slot / max(1, conc))
             i = slot
             while time.perf_counter() < t1:
                 # Same reason as _load: phases must not replay the same prompts,
@@ -766,6 +791,9 @@ class VllmEvaluator:
         itl_floor_s = fp.model.active_weight_gb / max(1e-9, fp.hw.memory_bandwidth_gb_s)
         one_request_s = fp.workload.mean_output_tokens * itl_floor_s
         self.settle_s = min(SETTLE_MAX_S, max(SETTLE_S, one_request_s * 1.2))
+        # Kept separately: settle_s is clamped at both ends, so it cannot be
+        # divided back out to recover the estimate the stagger needs.
+        self.one_request_s = one_request_s
         self.qps = fp.workload.request_rate_qps
         self.conc = fp.workload.max_concurrency
         cal = STORE.get(fp)
@@ -1065,7 +1093,8 @@ class VllmEvaluator:
         try:
             reqs, t0, t1 = asyncio.run(_closed_loop(
                 self.base_url, model, self.prompts, self.max_tokens, L,
-                getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S, cursor=cursor))
+                getattr(self, "settle_s", SETTLE_S), SWEEP_WINDOW_S, cursor=cursor,
+                stagger_s=getattr(self, "one_request_s", 0.0)))
         finally:
             stop.set(); w.join(timeout=5)
         m = summarize(reqs, t0, t1, self.slo)
