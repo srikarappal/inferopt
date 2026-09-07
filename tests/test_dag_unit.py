@@ -1388,6 +1388,61 @@ def test_result_api():
 
 
 # ==========================================================================
+def test_judges():
+    """Judges return one Verdict per sample, and never confuse their own
+    failure with the model's."""
+    section("RuleJudge")
+    from inferopt.api_types import Sample, Verdict
+    from inferopt.judges import LLMJudge, RuleJudge
+
+    j = RuleJudge(lambda s: "42" in s.text)
+    vs = j([Sample(row={}, text="it is 42"), Sample(row={}, text="no")])
+    check("one verdict per sample, in order", [v.ok for v in vs] == [True, False])
+    check("a bool is wrapped into a Verdict", isinstance(vs[0], Verdict))
+
+    boom = RuleJudge(lambda s: 1 / 0)
+    got = boom([Sample(row={}, text="a"), Sample(row={}, text="b")])
+    check("a judge that raises loses ONE sample, not the run",
+          len(got) == 2 and not got[0].ok,
+          "one bad row must not discard the other 499")
+    check("...and the exception is kept as the reason",
+          "ZeroDivisionError" in got[0].reason, got[0].reason)
+
+    section("LLMJudge: parsing a verdict")
+    p = LLMJudge._parse
+    check("JSON verdict is read", p('{"pass": true, "reason": "ok"}').ok)
+    check("...with its reason", p('{"pass": false, "reason": "rude"}').reason == "rude")
+    check("a bare affirmative is accepted, and flagged as such",
+          p("yes").ok and "not JSON" in p("yes").reason)
+    # THE IMPORTANT ONE. Prose is not a False vote -- it is a failure to vote,
+    # and scoring it as False reports the model under test got worse when the
+    # JUDGE did. That is the shape of the RULER failure.
+    check("unparseable prose RAISES rather than voting False",
+          raises(lambda: p("Well, it depends on context.")),
+          "a judge that failed to answer has not answered 'no'")
+
+    section("LLMJudge: an outage is not a regression")
+    import os
+    os.environ.pop("INFEROPT_JUDGE_URL", None)
+    check("no endpoint refuses to score rather than returning zeros",
+          raises(lambda: LLMJudge(model="m", rubric="r")([Sample(row={}, text="x")])),
+          "silently scoring 0.0 is indistinguishable from total model failure")
+    check("the error says the judge must not be the model under test",
+          "under test" in str(_err(
+              lambda: LLMJudge(model="m", rubric="r")([Sample(row={}, text="x")]))))
+
+    section("LLMJudge: the cap is reported, never silent")
+    j = LLMJudge(model="m", rubric="r", max_samples=2)
+    check("nothing skipped reads as complete", "all samples judged" in j.report())
+    j.skipped = 5
+    check("a truncated benchmark says so",
+          "NOT judged" in j.report() and "subset" in j.report(),
+          "a truncated score that looks complete makes the quality axis decorative")
+    check("temperature is pinned to 0", j.temperature == 0.0,
+          "a judge with its own sampling noise adds resolution the caller cannot see")
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -1530,7 +1585,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
