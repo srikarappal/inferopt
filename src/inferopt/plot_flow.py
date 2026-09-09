@@ -79,11 +79,22 @@ def decompose(run_dir: Path) -> dict:
                                          last["node_id"].replace("_", " ").capitalize()), d))
                 prev = t["goodput"]
 
-    def att(t):
-        a = ((t.get("diagnostics") or {}).get("slo_attainment"))
-        if a is None:
-            raise SystemExit(f"{t['node_id']}: no slo_attainment")
-        return a
+    def thr(t):
+        v = ((t.get("diagnostics") or {}).get("throughput"))
+        if v is None:
+            raise SystemExit(f"{t['node_id']}: no throughput")
+        return v
+
+    # THE SLO FILTER IS APPLIED ONCE, NOT TWICE. goodput ALREADY counts only
+    # tokens from requests that met the target; multiplying it by
+    # slo_attainment filters the same thing again. It produced a "too slow"
+    # band of 52% at the tuned config when the measured figure is 28%, and it
+    # inverted the trend -- the chart showed late delivery getting WORSE with
+    # tuning (41% -> 52%) when it actually improves (53% -> 28%).
+    #
+    #     tokens produced   = throughput
+    #     inside the target = goodput
+    #     too slow          = throughput - goodput
 
     cap = best["goodput"]
     resid = cap - seed["goodput"] - sum(v for _, v in gains)
@@ -96,10 +107,12 @@ def decompose(run_dir: Path) -> dict:
     return {
         "capacity": cap,
         "b_goodput": seed["goodput"],
-        "b_useful": seed["goodput"] * att(seed),
-        "b_late": seed["goodput"] * (1 - att(seed)),
-        "a_useful": cap * att(best),
-        "a_late": cap * (1 - att(best)),
+        "b_thr": thr(seed),
+        "a_thr": thr(best),
+        "b_useful": seed["goodput"],
+        "b_late": thr(seed) - seed["goodput"],
+        "a_useful": best["goodput"],
+        "a_late": thr(best) - best["goodput"],
         "gains": gains,
         "diag_b": seed.get("diagnostics") or {},
         "diag_a": best.get("diagnostics") or {},
