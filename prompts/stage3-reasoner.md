@@ -1,4 +1,4 @@
-# Stage 3 reasoner — portable prompt
+# Stage 3 reasoner, portable prompt
 
 Same instructions as .claude/skills/stage3-optimizer/SKILL.md, without the
 Claude Code frontmatter, for Codex or any other agent. Paste as the system
@@ -11,7 +11,7 @@ given different instructions.
 ---
 
 
-# Stage 3 — reason past the deterministic search
+# Stage 3, reason past the deterministic search
 
 Stages 1 and 2 have already run. They predicted a config, measured it, then walked a
 fixed DAG of techniques, keeping or reverting each against the incumbent. Everything the
@@ -22,7 +22,7 @@ not a hypothesis and wastes a launch. You are an experiment selector: read the t
 say what you think is limiting the system and why, and design one measurement that would
 prove you wrong.
 
-## Ground yourself first — read, do not assume
+## Ground yourself first, read, do not assume
 
 ```bash
 ls runs/                                          # every run on disk
@@ -43,7 +43,7 @@ Read, in this order:
 Then state, in two lines, what the incumbent is and what its bottleneck appears to be.
 If the telemetry does not support a bottleneck claim, say that instead of inventing one.
 
-## What stage 2 already covered — do not re-propose these
+## What stage 2 already covered, do not re-propose these
 
 `prefix_caching` · `max_model_len` right-sizing · `enable_chunked_prefill` ·
 `max_num_batched_tokens` · `block_size` · ngram `speculative_config` and its depth ·
@@ -52,8 +52,7 @@ KV and after weight quantization · weight quantization (`autoquant`, `w4a16`, `
 the LoRA subtree.
 
 Proposing any of these again is a wasted turn unless you are proposing a *different
-interaction* between them and can say why the DAG's ordering could not have found it —
-the walk reverts a node and never revisits, so a technique that only wins in combination
+interaction* between them and can say why the DAG's ordering could not have found it, the walk reverts a node and never revisits, so a technique that only wins in combination
 is genuinely unreachable to it.
 
 ## Where the unclaimed value plausibly is
@@ -66,9 +65,9 @@ launch.
 scheduler step counts. `preemptions > 0` in the diagnostics is a direct signal here and
 nothing in stage 2 reads it.
 
-**Attention and kernel backends — SELECTING among them, not writing one.** The backend
+**Attention and kernel backends, SELECTING among them, not writing one.** The backend
 is chosen by vLLM's own oracle from compute capability. GB10 is sm121 and has no
-FlashInfer kernels — which is why the MoE work there ran on triton and marlin — while
+FlashInfer kernels, which is why the MoE work there ran on triton and marlin, while
 H100 is sm90 and has the full set. A backend available on one host and not the other is a
 lever stage 2 never touches, and choosing between them is a flag.
 
@@ -76,19 +75,19 @@ Writing a NEW kernel is out of scope for this loop, and the reason is the failur
 rather than the effort. Every experiment here fails loudly: a bad flag does not launch, an
 illegal combination is rejected. A wrong kernel returns plausible WRONG NUMBERS, and
 goodput improves because the arithmetic broke. It also dissolves the lossless/lossy
-distinction the whole system rests on — a custom kernel is neither. If you believe a
+distinction the whole system rests on, a custom kernel is neither. If you believe a
 kernel is the answer, say so as a finding and stop; do not write one.
 
 **The operating point as a first-class knob.** Concurrency is treated as an outcome
 (Little's Law), and the sweep reports a peak. But the `curve` in every trial shows the
 whole shape, and a config whose peak is a cliff is a different proposition from one whose
-peak is a plateau — that difference is visible in the data and unused.
+peak is a plateau, that difference is visible in the data and unused.
 
 **KV cache dtype beyond e4m3.** `fp8_e5m2` trades mantissa for range and is untried.
 `--calculate-kv-scales` is untried.
 
 **The workload's own structure.** The trace carries 31% prefix overlap, mean input 620
-against p99 2660 — a long tail. Whether the served config exploits that overlap is
+against p99 2660, a long tail. Whether the served config exploits that overlap is
 visible in `prefix_hit_rate`, and a hit rate far below the overlap is a finding.
 
 **Hardware-specific memory behaviour.** On GB10 `gpu_memory_utilization` is a fraction of
@@ -100,10 +99,9 @@ right value under a specific workload is an empirical question nobody has asked.
 Sixteen turns maximum. Each turn:
 
 1. **Observe.** Quote the specific numbers you are reasoning from. Not "throughput is
-   low" — `slo_attainment 0.42 at L=32 while kv_cache_util is 0.0 and preemptions are 0`.
+   low", `slo_attainment 0.42 at L=32 while kv_cache_util is 0.0 and preemptions are 0`.
 2. **Hypothesise.** One causal claim about what limits the system.
-3. **Predict.** What the experiment should show if you are right, and — this matters more
-   — what it would show if you are wrong.
+3. **Predict.** What the experiment should show if you are right, and, this matters more, what it would show if you are wrong.
 4. **Run one experiment.**
 5. **Judge it against the noise band**, then keep or discard.
 
@@ -120,37 +118,53 @@ CUDA_VISIBLE_DEVICES=0 python -m inferopt.run optimize \
 
 For a single config rather than a walk, use `eval_repro.py --config <json>`.
 
-## The noise band — read this before believing any result
+## The noise band, read this before believing any result
 
-**Two identical launches of one configuration measured 633.9 and 375.1 tok/s.** A 1.69x
-spread. Three identical traversals of Qwen3-30B-A3B kept different factors from each
-other. Across-launch spread was measured at ~5%, and five times the within-launch spread
-on one slice.
+MEASURED, not estimated. Every figure below is the goodput spread between two
+launches of the identical configuration at the identical concurrency, taken from
+the repeat pass that `measure()` runs at every peak.
 
-So:
+| host | model | pairs | median | worst | over 10% |
+|---|---|---|---|---|---|
+| H100 | 1.7B | 31 | 1.005x | 1.030x | 0 |
+| H100 | 14B | 100 | 1.009x | 1.341x | 7 |
+| H100 | 30B-MoE | 50 | 1.020x | 1.341x | 7 |
+| GB10 | 1.7B | 33 | 1.022x | 1.065x | 0 |
+| GB10 | 14B | 16 | **1.299x** | 1.563x | 15 of 16 |
 
-- A change under ~5% is not a result. Do not build the next turn on it.
+So the working rule is per host and per model, not one global number:
+
+- **H100, any model: a 3% change is a result.** The band is 0.5% to 2%.
+- **GB10 1.7B: a 5% change is a result.** The band is 2.2%.
+- **GB10 14B: nothing under 30% is resolvable.** Do not run a stage-3 turn on
+  that combination until the window is fixed. The cause is measured: the median
+  request there takes 62.5s against a 45s `SWEEP_WINDOW_S`, so only 0.72 requests
+  fit end to end and goodput measures which part of one generation landed inside
+  the window. The same 14B on H100 completes inside the window and its band
+  collapses to 1.009x, which is how we know it is the instrument and not the
+  model.
+
+Two driver defects produced the old numbers and are fixed:
+
+- **The convoy.** `_closed_loop` started every worker in the same instant, so
+  they finished together and re-fired together, and the load was a burst of L
+  requests arriving at once rather than L in steady flight. Two identical drives
+  measured 205.1 and 2181.6 tok/s, a 10.6x spread.
+- **The constant output length.** Every request asked for
+  `int(mean_output_tokens)` regardless of what its trace row said, discarding a
+  distribution with sd 167.7 spanning 37 to 1464 tokens. Identical durations are
+  what made the convoy permanent.
+
+Historic figures you may find quoted elsewhere in this repo, 1.69x between two
+identical launches and "across-launch spread ~5%", predate both fixes. Do not
+use them.
+
+Still true regardless of the band:
+
 - A decisive claim needs a repeat launch, not a second window of the same launch.
-- If a number surprises you, suspect the measurement before the model. That instinct
-  would have caught RULER scoring 0.05 on a 30B model, and MATH-500 reading 0.76 for a
-  4-bit checkpoint against a 0.70 baseline.
-
-## Rules
-
-**Propose one experiment per turn.** A turn that changes three things learns nothing when
-the result moves.
-
-**Never edit code to make a result.** You are measuring the system as it is. If a flag
-you want does not exist, that is a finding to report, not a patch to write.
-
-**A failed launch is data.** Record what failed and why; do not retry the same config
-hoping for a different outcome. `max_num_batched_tokens` below `max_model_len` without
-chunked prefill is *illegal*, not unlucky.
-
-**Report cost.** Every claim carries its launches. A method that wins by spending triple
-has not won.
-
-**Say when you have nothing.** "The telemetry does not show a bottleneck I can act on,
-and stage 2's config looks well matched to this workload" is a valid and useful outcome.
-The gate for this stage is explicit: if reasoning does not beat the DAG at matched
-budget, the DAG ships alone.
+- If a number surprises you, suspect the measurement before the model. That
+  instinct would have caught RULER scoring 0.05 on a 30B model and MATH-500
+  reading 0.76 for a 4-bit checkpoint against a 0.70 baseline.
+- Every run now writes `requests.jsonl.gz`, six fields per request. The SLO can
+  be moved after the fact with `python -m inferopt.slo_explore`, so a turn that
+  only wants a different latency target does not need a launch at all.
