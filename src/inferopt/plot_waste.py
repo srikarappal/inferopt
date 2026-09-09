@@ -34,15 +34,34 @@ import argparse
 import json
 from pathlib import Path
 
-# Palette. Deliberately not the reference chart's: grey for loss and one strong
-# colour for useful work is the grammar worth borrowing, the exact hues are not.
-INK = "#14181d"
-MUTED = "#6b737d"
-WASTE = "#c9ccd1"
-WASTE_EDGE = "#b3b7bd"
-USEFUL = "#1f6feb"
-SOURCE = "#8c2f2f"
-RECOVERED = "#2f7d5c"
+# PALETTE -- computed against the validator's checks, not chosen by eye.
+#
+# Two encoding jobs, so two gates. "Delivered" and "lost" are CATEGORICAL
+# identities and take the categorical floors. The three loss causes are one hue
+# separated by lightness, which is an ORDINAL ramp and takes the ordinal gate.
+# Holding a same-hue ramp to the categorical normal-vision floor of 15 is
+# impossible by construction -- steps of one hue differ by delta L alone, so
+# their delta E is ~8 -- and trying to was why the first two palette searches
+# returned nothing at all.
+#
+# Measured on the light surface #fcfcfb (OKLab delta E x100, Machado CVD):
+#   delivered vs each loss step, ALL pairs : CVD 16.4  (target >= 8)
+#                                            normal 19.5 (floor >= 15)
+#   loss ramp, ordinal                     : delta L 0.081 (>= 0.06)
+#                                            lightest step 2.15:1 (>= 2.0)
+#   lightness band 0.43-0.77 and chroma >= 0.10: all four inside
+#
+# The two palest loss steps sit below 3:1 against the surface. That is the
+# documented relief case, not a pass: it obliges visible direct labels, which
+# every band carries.
+INK = "#0b0b0b"          # text-primary
+MUTED = "#52514e"        # text-secondary
+FAINT = "#7a7975"        # text-muted
+SURFACE = "#fcfcfb"      # the surface the palette was validated against
+USEFUL = "#8483e6"       # delivered -- periwinkle
+LOSS = ["#ee9799", "#d67a7e", "#bf5e63"]   # dusty-rose ordinal ramp, light -> dark
+SOURCE = "#b8b5cf"
+GRID = "#e6e5e1"
 
 
 def _decompose(run_dir: Path) -> dict:
@@ -129,68 +148,75 @@ def _ribbon(ax, x0, x1, y0a, y0b, y1a, y1b, color, alpha=1.0):
 
 def _panel(ax, title, capacity, flows, note):
     """One Sankey: a single source on the left, named sinks on the right."""
+    from matplotlib.patches import FancyBboxPatch, Rectangle
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.text(0.0, 1.14, title, fontsize=12.5, fontweight="bold", color=INK,
+    ax.text(0.0, 1.15, title, fontsize=12.5, fontweight="bold", color=INK,
             transform=ax.transAxes)
     if note:
-        ax.text(0.0, 1.055, note, fontsize=8.7, color=MUTED, transform=ax.transAxes)
+        ax.text(0.0, 1.06, note, fontsize=8.7, color=MUTED, transform=ax.transAxes)
 
     xs, xe = 0.045, 0.80
-    bar_w = 0.014
-    # Source bar, full height.
-    ax.add_patch(__import__("matplotlib").patches.Rectangle(
-        (xs - bar_w, 0.0), bar_w, 1.0, color=SOURCE, zorder=3, linewidth=0))
-    ax.text(xs - bar_w - 0.012, 0.5, f"{capacity:,.0f} tok/s\nserving capacity",
-            fontsize=9.4, color=INK, ha="right", va="center", linespacing=1.5)
+    bar_w = 0.013
 
-    # Destinations are separated by a gap so the ribbons taper between a
-    # contiguous source and a split sink. Without it the bands are parallel and
-    # the picture reads as a stacked bar, which hides the one thing a Sankey is
-    # for: that a single quantity is being divided.
-    from matplotlib.patches import Rectangle
-    gap = 0.045
-    span = 1.0 - gap * (len(flows) - 1)
+    # A 2px surface gap between adjacent fills, on BOTH sides. Without it the
+    # ribbons abut and read as one mass, which is the thing a flow diagram is
+    # supposed to take apart.
+    src_gap, gap = 0.006, 0.045
+    n = len(flows)
+    src_span = 1.0 - src_gap * (n - 1)
+    dst_span = 1.0 - gap * (n - 1)
 
-    # Geometry first, labels second. A 1% band is three pixels tall, so a label
-    # centred on it lands on top of its neighbour's -- which is how the first
-    # draft rendered "delivered too late" straight through the band below it.
     bands, y_src, y_dst = [], 1.0, 1.0
     for label, value, kind in flows:
         f = value / capacity
-        h_src, h_dst = f, f * span
-        bands.append((label, value, kind, y_src, h_src, y_dst, h_dst))
-        y_src -= h_src
-        y_dst -= h_dst + gap
+        bands.append((label, value, kind, y_src, f * src_span, y_dst, f * dst_span))
+        y_src -= f * src_span + src_gap
+        y_dst -= f * dst_span + gap
 
-    for label, value, kind, ys, hs, yd, hd in bands:
-        col = USEFUL if kind == "useful" else WASTE
+    ax.add_patch(Rectangle((xs - bar_w, 0.0), bar_w, 1.0, color=SOURCE,
+                           zorder=3, linewidth=0))
+    ax.text(xs - bar_w - 0.014, 0.5, f"{capacity:,.0f} tok/s\nserving capacity",
+            fontsize=9.4, color=INK, ha="right", va="center", linespacing=1.55)
+
+    for idx, (label, value, kind, ys, hs, yd, hd) in enumerate(bands):
+        col = USEFUL if kind == "useful" else LOSS[min(idx - 1, len(LOSS) - 1)]
         _ribbon(ax, xs, xe, ys, ys - hs, yd, yd - hd, col,
-                alpha=1.0 if kind == "useful" else 0.92)
-        ax.add_patch(Rectangle((xe, yd - hd), bar_w, hd, color=col,
-                               zorder=3, linewidth=0))
+                alpha=1.0 if kind == "useful" else 0.95)
+        # 4px rounded data-end on the sink, flat where it meets the ribbon.
+        ax.add_patch(FancyBboxPatch(
+            (xe, yd - hd + 0.004), bar_w, max(hd - 0.008, 0.001),
+            boxstyle="round,pad=0.004,rounding_size=0.004",
+            facecolor=col, edgecolor=SURFACE, linewidth=1.0, zorder=3))
 
-    # Push labels apart top-down, and draw a leader to the band when a label has
-    # been moved off its own centre.
-    # In AXES units, and the axes is only 0.20 of the figure: a two-line label at
-    # 8.9pt needs about a fifth of the panel height, not the 0.135 the first
-    # attempt used, which still let two labels overlap.
-    MIN_SEP = 0.215
+    # Labels wear TEXT tokens, never the series colour; a swatch beside them
+    # carries identity. Pushed apart top-down, with a leader back to the band
+    # when one has been moved off its own centre -- a 1% band is three pixels
+    # tall and a label centred on it lands on its neighbour's.
+    MIN_SEP = 0.265
     placed = []
-    for label, value, kind, ys, hs, yd, hd in bands:
+    for idx, (label, value, kind, ys, hs, yd, hd) in enumerate(bands):
         want = yd - hd / 2
         if placed and placed[-1] - want < MIN_SEP:
             want = placed[-1] - MIN_SEP
         placed.append(want)
         if abs(want - (yd - hd / 2)) > 0.012:
-            ax.plot([xe + bar_w, xe + bar_w + 0.011],
-                    [yd - hd / 2, want], color=WASTE_EDGE, lw=0.8, zorder=2)
-        ax.text(xe + bar_w + 0.016, want,
-                f"{value:,.0f} tok/s   {value / capacity:.0%}\n{label}",
-                fontsize=8.9, color=INK if kind == "useful" else MUTED,
-                va="center", linespacing=1.5,
+            ax.plot([xe + bar_w + 0.003, xe + bar_w + 0.014],
+                    [yd - hd / 2, want], color=GRID, lw=0.9, zorder=2, clip_on=False)
+        col = USEFUL if kind == "useful" else LOSS[min(idx - 1, len(LOSS) - 1)]
+        # clip_on=False: a label pushed past the panel edge keeps its swatch,
+        # and identity must never be carried by position alone.
+        sw = Rectangle((xe + bar_w + 0.020, want + 0.040), 0.011, 0.032,
+                       color=col, zorder=4, linewidth=0)
+        sw.set_clip_on(False)
+        ax.add_patch(sw)
+        ax.text(xe + bar_w + 0.040, want + 0.056,
+                f"{value:,.0f} tok/s   {value / capacity:.0%}",
+                fontsize=9.0, color=INK, va="center",
                 fontweight="bold" if kind == "useful" else "normal")
+        ax.text(xe + bar_w + 0.040, want - 0.050, label,
+                fontsize=8.7, color=MUTED if kind == "useful" else FAINT, va="center")
 
 
 def build(run_dir: Path, out: Path, subtitle: str = "") -> Path:
@@ -219,8 +245,8 @@ def build(run_dir: Path, out: Path, subtitle: str = "") -> Path:
     if resid_a > cap * 0.005:
         after_flows.append(("Unattributed", resid_a, "waste"))
 
-    fig = plt.figure(figsize=(13.8, 8.4), dpi=200)
-    fig.patch.set_facecolor("white")
+    fig = plt.figure(figsize=(13.8, 8.9), dpi=200)
+    fig.patch.set_facecolor(SURFACE)
 
     fig.text(0.045, 0.963, "Serving Capacity Today is Mostly Unrealised",
              fontsize=20.5, fontweight="bold", color=INK)
@@ -247,22 +273,53 @@ def build(run_dir: Path, out: Path, subtitle: str = "") -> Path:
     fig.text(0.045, 0.905, body, fontsize=10.0, color=INK, linespacing=1.62,
              va="top")
 
-    ax1 = fig.add_axes([0.155, 0.395, 0.545, 0.20])
-    ax2 = fig.add_axes([0.155, 0.095, 0.545, 0.20])
+    ax1 = fig.add_axes([0.155, 0.415, 0.545, 0.195])
+    ax2 = fig.add_axes([0.155, 0.135, 0.545, 0.195])
     _panel(ax1, "As deployed, at defaults", cap, before_flows,
            f"{eff_b:.0%} of capacity does useful work")
     _panel(ax2, "After reconfiguration", cap, after_flows,
            f"{eff_a:.0%} of capacity does useful work")
 
+    # A legend is present for >= 2 series, and with <= 4 the marks are ALSO direct
+    # labelled -- identity never rests on colour alone. It doubles as the relief
+    # for the two loss steps that sit below 3:1 against the surface.
+    from matplotlib.patches import Rectangle as _R
+    lx = 0.155
+    for name, col in [("Delivered within the latency target", USEFUL)] + [
+            (lab, LOSS[min(i, len(LOSS) - 1)])
+            for i, (lab, _, _) in enumerate(before_flows[1:])]:
+        fig.patches.append(_R((lx, 0.072), 0.0105, 0.016, color=col,
+                              transform=fig.transFigure, figure=fig, linewidth=0))
+        fig.text(lx + 0.016, 0.080, name, fontsize=8.4, color=MUTED, va="center")
+        lx += 0.017 + 0.0068 * len(name)
+
     fig.text(0.045, 0.028,
              "Flows conserve: every band is a measured quantity and they sum to the"
-             " capacity bar. Grey is capacity lost, blue is capacity delivered."
+             " capacity bar. Periwinkle is capacity delivered inside the target;"
+             " the rose bands are capacity lost, ordered light to dark by size."
              + (f"  {subtitle}" if subtitle else ""),
              fontsize=8.5, color=MUTED, style="italic")
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, facecolor="white", bbox_inches="tight")
+    fig.savefig(out, facecolor=SURFACE, bbox_inches="tight")
     plt.close(fig)
+
+    # THE TABLE TWIN. A static image cannot carry a tooltip or a toggle, and two
+    # of the loss steps sit below 3:1 against the surface, so the values have to
+    # be reachable without reading colour at all. Direct labels do most of that
+    # work; this is the WCAG-clean equivalent, and it is also what anyone
+    # re-checking the arithmetic will actually open.
+    tbl = out.with_suffix(".txt")
+    lines = [f"{'':44s} {'tok/s':>9s} {'share':>7s}", "-" * 62]
+    for name, flows in (("AS DEPLOYED, AT DEFAULTS", before_flows),
+                        ("AFTER RECONFIGURATION", after_flows)):
+        lines += ["", name]
+        for label, value, _ in flows:
+            lines.append(f"  {label:42s} {value:9,.1f} {value / cap:7.1%}")
+        lines.append(f"  {'total (= serving capacity)':42s} "
+                     f"{sum(v for _, v, _ in flows):9,.1f} "
+                     f"{sum(v for _, v, _ in flows) / cap:7.1%}")
+    tbl.write_text("\n".join(lines) + "\n")
     return out
 
 
