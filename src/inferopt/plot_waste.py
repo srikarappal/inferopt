@@ -59,7 +59,42 @@ MUTED = "#52514e"        # text-secondary
 FAINT = "#7a7975"        # text-muted
 SURFACE = "#fcfcfb"      # the surface the palette was validated against
 USEFUL = "#8483e6"       # delivered -- periwinkle
-LOSS = ["#ee9799", "#d67a7e", "#bf5e63"]   # dusty-rose ordinal ramp, light -> dark
+def loss_ramp(n: int) -> list:
+    """n ordinal steps of the loss hue, light -> dark, spaced by the gate.
+
+    Generated rather than listed because the number of loss causes is a property
+    of the run: the small model had two, the larger one has five. Spacing is
+    delta L >= 0.06 (the ordinal floor) and the top step sits at L 0.765 -- the
+    palest that stays inside the 0.43-0.77 band, which an earlier candidate
+    missed by five thousandths. Chroma rises slightly as the steps darken so
+    every step clears the 0.10 floor.
+    """
+    import math
+    TOP, FLOOR, HUE = 0.765, 0.435, 18
+    step = min(0.085, (TOP - FLOOR) / max(1, n - 1)) if n > 1 else 0.0
+    if step < 0.06 and n > 1:                    # cannot space them legally
+        raise SystemExit(f"{n} loss causes cannot be spaced at delta L >= 0.06; "
+                         f"fold the smallest into 'Other'")
+    out = []
+    for i in range(n):
+        L = TOP - step * i
+        C = 0.105 + 0.02 * (i / max(1, n - 1))
+        a, b = C * math.cos(math.radians(HUE)), C * math.sin(math.radians(HUE))
+        l_ = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+        m_ = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+        s_ = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+        r = 4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_
+        g = -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_
+        bb = -0.0041960863 * l_ - 0.7034186147 * m_ + 1.7076147010 * s_
+        def enc(c):
+            c = max(0.0, min(1.0, c))
+            c = 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+            return round(max(0.0, min(1.0, c)) * 255)
+        out.append("#%02x%02x%02x" % (enc(r), enc(g), enc(bb)))
+    return out
+
+
+LOSS = loss_ramp(3)                        # default; rebuilt per chart below
 SOURCE = "#b8b5cf"
 GRID = "#e6e5e1"
 
@@ -239,11 +274,29 @@ def build(run_dir: Path, out: Path, subtitle: str = "") -> Path:
     if resid > cap * 0.005:
         before_flows.append(("Unattributed", resid, "waste"))
 
+    # MAX_LOSS bands, then fold. Past five the ordinal ramp cannot space its
+    # steps at delta L >= 0.06 inside the lightness band, and the answer to
+    # "more series than the palette has slots" is never a generated hue -- it is
+    # to fold the tail into "Other". Folded by SIZE, so what survives as its own
+    # band is what actually moves the number, and the fold is named on the chart
+    # rather than quietly dropped.
+    MAX_LOSS = 5
+    losses = [f for f in before_flows if f[2] == "waste"]
+    if len(losses) > MAX_LOSS:
+        losses.sort(key=lambda f: -f[1])
+        keep, fold = losses[:MAX_LOSS - 1], losses[MAX_LOSS - 1:]
+        before_flows = ([f for f in before_flows if f[2] == "useful"] + keep
+                        + [(f"Other ({len(fold)} smaller causes)",
+                            sum(v for _, v, _ in fold), "waste")])
+
     after_flows = [("Delivered within the latency target", a["delivered"], "useful"),
                    ("Delivered too late to count", a["late"], "waste")]
     resid_a = cap - sum(v for _, v, _ in after_flows)
     if resid_a > cap * 0.005:
         after_flows.append(("Unattributed", resid_a, "waste"))
+
+    global LOSS
+    LOSS = loss_ramp(max(len(before_flows), len(after_flows)) - 1)
 
     fig = plt.figure(figsize=(13.8, 8.9), dpi=200)
     fig.patch.set_facecolor(SURFACE)
@@ -257,24 +310,48 @@ def build(run_dir: Path, out: Path, subtitle: str = "") -> Path:
     hit_a = (d["diag_after"].get("prefix_hit_rate") or 0.0)
     kv_a = (d["diag_after"].get("kv_cache_util") or 0.0)
 
-    body = (
-        f"Measured on one accelerator against a fixed workload and a fixed latency target. The"
-        f" capacity figure is the highest\nsustained throughput this hardware was observed to"
-        f" reach, so every loss below is one we have watched it recover — the true\ninefficiency"
-        f" is larger. A server left at its defaults delivers {eff_b:.0%} of that capacity inside"
-        f" the deadline. Most of what is missing is\nnot work discarded but work never done:"
-        f" prompt prefixes recomputed rather than reused ({hit_b:.0%} of prefill was served from"
-        f" cache,\nagainst {hit_a:.0%} after), and key-value cache reserved far beyond what the"
-        f" workload touches (only {kv_a:.0%} of the pool is ever used).\nA further"
-        f" {b['late'] / cap:.1%} is produced but arrives after the deadline, so it is paid for and"
-        f" thrown away. Reconfiguring the same hardware,\nwith no change to the model or its"
-        f" outputs, raises the share doing useful work from {eff_b:.0%} to {eff_a:.0%}."
-    )
+    # THE PROSE IS DERIVED, NOT WRITTEN. The first version asserted "most of
+    # what is missing is not work discarded but work never done" and named
+    # recomputed prefixes as the culprit -- both true of the run it was written
+    # against and both false of the next one, where speculative decode dominates
+    # and over half the output arrives late. A caption that keeps its claims
+    # while the chart under it changes is worse than no caption.
+    losses = sorted([f for f in before_flows if f[2] == "waste"], key=lambda f: -f[1])
+    top_name, top_val, _ = losses[0]
+    late_b = b["late"] / cap
+    late_a = a["late"] / cap
+    never = sum(v for n, v, _ in losses if not n.startswith("Delivered too late")) / cap
+    dominant = ("work the accelerator never did rather than work it discarded"
+                if never > late_b else
+                "work that was done and then missed its deadline")
+    tail = (" Tuning recovers most of it. " if eff_a > 0.9 else
+            f" Tuning recovers much of it, and {1 - eff_a:.0%} remains unrealised even"
+            f" then — {late_a:.0%} of capacity is now spent on output that arrives too"
+            f" late to count, which no configuration in this search removed. ")
+
+    # Wrapped by textwrap, not by hand-placed newlines. The generated sentences
+    # change length with the data -- naming a different dominant cause, adding a
+    # clause when tuning leaves a lot on the table -- and hand-placed breaks
+    # blew the canvas out to twice its width the first time the text got longer.
+    import textwrap
+    body = textwrap.fill(
+        f"Measured on one accelerator against a fixed workload and a fixed latency"
+        f" target. The capacity figure is the highest sustained throughput this"
+        f" hardware was observed to reach, so every loss below is one we have watched"
+        f" it recover \u2014 the true inefficiency is larger. A server left at its"
+        f" defaults delivers {eff_b:.0%} of that capacity inside the deadline. Most of"
+        f" what is missing is {dominant}: the largest single cause is"
+        f" {top_name.lower()}, at {top_val / cap:.0%} of capacity, and {late_b:.0%} is"
+        f" produced but arrives after the deadline, so it is paid for and thrown"
+        f" away.{tail}Reconfiguring the same hardware, with no change to the model or"
+        f" its outputs, raises the share doing useful work from {eff_b:.0%} to"
+        f" {eff_a:.0%}.",
+        width=104)
     fig.text(0.045, 0.905, body, fontsize=10.0, color=INK, linespacing=1.62,
              va="top")
 
     ax1 = fig.add_axes([0.155, 0.415, 0.545, 0.195])
-    ax2 = fig.add_axes([0.155, 0.135, 0.545, 0.195])
+    ax2 = fig.add_axes([0.155, 0.150, 0.545, 0.195])
     _panel(ax1, "As deployed, at defaults", cap, before_flows,
            f"{eff_b:.0%} of capacity does useful work")
     _panel(ax2, "After reconfiguration", cap, after_flows,
@@ -284,16 +361,22 @@ def build(run_dir: Path, out: Path, subtitle: str = "") -> Path:
     # labelled -- identity never rests on colour alone. It doubles as the relief
     # for the two loss steps that sit below 3:1 against the surface.
     from matplotlib.patches import Rectangle as _R
-    lx = 0.155
+    # Wraps to a second row rather than running off the canvas -- with six loss
+    # causes a single row overflowed, and bbox_inches="tight" then widened the
+    # whole figure by half to accommodate it.
+    lx, ly = 0.155, 0.088
     for name, col in [("Delivered within the latency target", USEFUL)] + [
             (lab, LOSS[min(i, len(LOSS) - 1)])
             for i, (lab, _, _) in enumerate(before_flows[1:])]:
-        fig.patches.append(_R((lx, 0.072), 0.0105, 0.016, color=col,
+        w = 0.017 + 0.0062 * len(name)
+        if lx + w > 0.97:
+            lx, ly = 0.155, ly - 0.030
+        fig.patches.append(_R((lx, ly), 0.0105, 0.016, color=col,
                               transform=fig.transFigure, figure=fig, linewidth=0))
-        fig.text(lx + 0.016, 0.080, name, fontsize=8.4, color=MUTED, va="center")
-        lx += 0.017 + 0.0068 * len(name)
+        fig.text(lx + 0.016, ly + 0.008, name, fontsize=8.4, color=MUTED, va="center")
+        lx += w
 
-    fig.text(0.045, 0.028,
+    fig.text(0.045, 0.016,
              "Flows conserve: every band is a measured quantity and they sum to the"
              " capacity bar. Periwinkle is capacity delivered inside the target;"
              " the rose bands are capacity lost, ordered light to dark by size."
