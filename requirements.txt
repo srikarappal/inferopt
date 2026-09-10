@@ -53,9 +53,13 @@ python-docx==1.2.0
 #                   not use -- we generate with vLLM. setup.sh installs it into
 #                   .evalplus-pkgs/ and mbpp_score.py reaches it via sys.path.
 #
-#   nvidia-modelopt Quantization producer. Pulls setuptools 81, and vLLM
-#                   requires <81. quantize.py installs it into .quant-pkgs/ and
-#                   runs it as a subprocess.
+#   nvidia-modelopt Quantization producer, and the exception to the rule below.
+#                   It has no pin conflicts with vLLM so it goes INTO the serving
+#                   env, but it pulls setuptools 81 where vLLM requires <81, so
+#                   the pin has to be reinstalled after it. setup.sh does both,
+#                   in that order. Left out of this file because pip resolves a
+#                   requirements file in one pass and cannot express "install
+#                   this, then undo what it did to setuptools".
 #
 # This project has been broken twice by a dependency installed for a side
 # feature. Both stay isolated.

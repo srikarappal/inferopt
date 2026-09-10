@@ -97,6 +97,34 @@ import evalplus.evaluate, evalplus.sanitize
 print('  ok')" || echo "  STILL not importable -- MBPP+ will not score"
 fi
 
+note "weight-quantization producer (int4_awq, nvfp4)"
+# Not in requirements.txt, and not isolated either. nvidia-modelopt installs
+# straight into the serving env because it has no pin conflicts with vLLM, which
+# is why it replaced llmcompressor. The one thing it does break is setuptools:
+# it pulls 81.0.0 and vLLM requires <81, so the pin is reinstalled last.
+#
+# Without this step a host silently loses the entire lossy branch. The H100 ran
+# a full 14-arm sweep with "int4_awq and nvfp4 will skip" in its log, so the
+# technique worth 23x on the other box was never tried there.
+if $PY -c "import modelopt.torch.quantization" 2>/dev/null; then
+    echo "  already installed"
+else
+    echo "  installing nvidia-modelopt, accelerate, then pinning setuptools back ..."
+    $PY -m pip install -q nvidia-modelopt accelerate && \
+    $PY -m pip install -q "setuptools<81.0.0" || echo "  pip failed"
+    $PY -c "import modelopt.torch.quantization; print('  ok')" 2>/dev/null || \
+        echo "  STILL not importable, int4_awq and nvfp4 will skip"
+fi
+$PY - <<'CHECK'
+import importlib.metadata as md
+try:
+    v = md.version("setuptools")
+    major = int(v.split(".")[0])
+    print(f"  setuptools {v}" + ("" if major < 81 else "  <-- BREAKS vLLM, needs <81"))
+except Exception:
+    pass
+CHECK
+
 note "datasets"
 if [ -f data/mbpp_plus_full.jsonl ] && [ -f data/math_500.jsonl ]; then
     echo "  data/ already materialized"

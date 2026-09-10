@@ -23,15 +23,18 @@ channels are protected. The stock choice (pileval, wikitext) is generic web
 text; this workload's prompts are what the model will actually see. Calibrating
 on the real trace is both more faithful and free -- the trace is already loaded.
 
-TOOLCHAIN ISOLATION. llmcompressor pins compressed-tensors==0.18.0 while vLLM
-0.26 pins ==0.17.0, so it can never share the serving environment -- the same
-constraint that put aiconfigurator in its own directory. It installs to
-.quant-pkgs and runs as a subprocess.
+TOOLCHAIN. nvidia-modelopt installs straight into the serving environment. It
+has no pin conflicts with vLLM, which is most of why it replaced llmcompressor,
+whose compressed-tensors==0.18.0 could never share a venv with vLLM 0.26's
+==0.17.0. The subprocess survives from that design but earns its keep for a
+different reason: it keeps a multi-GB model load out of the parent process.
 
-That isolation fixes the INSTALL. It does not prove vLLM can READ what the
-producer WRITES: compressed-tensors is both writer and reader, and the two
-sides are a minor version apart. `--smoke` settles that on a small model in a
-few minutes rather than discovering it 40 minutes into a 14B conversion.
+The one thing modelopt does break is setuptools. It pulls 81.0.0 and vLLM
+requires <81, so PRODUCER_PKGS reinstalls the pin last. A quantizer that
+silently disables the server it is quantizing for is worse than no quantizer.
+
+Installing does not prove vLLM can READ what the producer WRITES. `--smoke`
+settles that on a 0.6B model in minutes rather than 40 minutes into a 14B.
 
 HISTORY
 
@@ -40,9 +43,12 @@ HISTORY
   fine-tune has no such repo. The pipeline has to do its own conversion or the
   result does not transfer to a real deployment.
 
-  compressed-tensors is both the writer and the reader. llmcompressor 0.13.0
-  pins ==0.18.0; vLLM 0.26 pins ==0.17.0. Isolation into .quant-pkgs solves the
-  INSTALL. It does not prove vLLM can read what the producer writes -- hence
+  UNDER LLMCOMPRESSOR, now replaced: compressed-tensors is both the writer and
+  the reader, llmcompressor 0.13.0 pinned ==0.18.0 against vLLM 0.26's ==0.17.0,
+  so it was installed into a .quant-pkgs directory that shadowed the env for one
+  subprocess. modelopt needs none of that. What survived the swap is --smoke,
+  because isolation only ever solved the INSTALL and never proved vLLM could
+  read what the producer writes, hence
   --smoke, which settles it on a 0.6B model in minutes rather than after a
   40-minute conversion of the real one. (First evidence is good: vLLM logged
   `quantization=compressed-tensors`, so it recognised the format.)
@@ -77,7 +83,6 @@ from inferopt._paths import home as _home, workspace as _workspace
 # The workspace, not the package. Artifacts are 10-60 GB each and must never
 # be written into site-packages.
 HERE = _home()
-QUANT_PKGS = _workspace(".quant-pkgs")
 ARTIFACTS = _workspace("artifacts")
 
 # NVIDIA's own quantizer, replacing llmcompressor. Two reasons beyond provenance:
@@ -129,13 +134,12 @@ def producer_available() -> bool:
 
 
 def setup(log=print) -> bool:
-    """Install the producer into .quant-pkgs, isolated from the serving env.
+    """Install the producer into the serving env, then repair setuptools.
 
-    --no-deps on purpose: llmcompressor 0.13.0's ranges for torch, transformers,
-    datasets, numpy and accelerate are ALL satisfied by what the serving env
-    already has, so those are reused from site-packages. Only compressed-tensors
-    is installed here, where it shadows the env's 0.17.0 for this subprocess
-    only. Installing full deps would pull a second ~2.5GB torch for no benefit.
+    Not isolated, and not --target: modelopt has no pin conflicts with vLLM, so
+    a shadow directory would buy nothing. Order matters though. modelopt pulls
+    setuptools 81.0.0 and vLLM requires <81, so the pin is reinstalled last and
+    the sequence is not reorderable.
     """
     for pkg in PRODUCER_PKGS:
         log(f"  installing {pkg}")

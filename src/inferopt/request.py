@@ -663,8 +663,8 @@ def detect_quantization_capability(sm_major: int, *, log=print) -> dict[str, boo
         "nvfp4": sm_major >= 10 and have_producer,
     }
     if not have_producer:
-        log(f"  quant     no local producer (.quant-pkgs missing) -- int4_awq and "
-            f"nvfp4 will skip. Build it with: python quantize.py --setup")
+        log(f"  quant     nvidia-modelopt not importable, int4_awq and nvfp4 "
+            f"will skip. Install it with ./setup.sh or python -m inferopt.quantize --setup")
     log(f"  quant     can produce: {', '.join(k for k, v in caps.items() if v) or 'nothing'}")
     return caps
 
