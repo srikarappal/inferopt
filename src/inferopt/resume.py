@@ -55,6 +55,8 @@ class Plan:
     reason: str = ""
     n_trials: int = 0
     n_duplicates: int = 0
+    soft_diff: list[str] = field(default_factory=list)
+    """Fields that differ but do not block: the code version. Reported, not enforced."""
 
     @property
     def conflict(self) -> bool:
@@ -65,9 +67,44 @@ class Plan:
         return self.mode == "resume"
 
 
-def _stamp_diff(a: dict, b: dict) -> list[str]:
-    """Which stamp fields disagree. Empty means the two runs are the same job."""
-    return sorted({k for k in set(a) | set(b) if a.get(k) != b.get(k)})
+# WHICH STAMP FIELDS DECIDE COMPATIBILITY, and which only deserve a warning.
+#
+# Comparing every field makes resume useless: `commit` and `dirty` change on any
+# edit to this repo, and an interruption is usually followed by a fix, so the
+# first version of this refused to resume a run it had itself just crashed. That
+# is the opposite of the feature.
+#
+# These are the fields that change what a measurement MEANS. Two trials that
+# agree on all of them are measuring the same thing and pool safely.
+COMPARE = ("model", "gpu", "gpu_count", "vllm", "trace", "trace_sha",
+           "trace_rows", "slo", "seed_sha", "seed_from")
+
+# These do not decide, they warn. A code change CAN change what a measurement
+# means, and twice in this project it did: the worker stagger and the
+# per-request replay lengths both moved every number for the same config. But most
+# commits do not, and only the person who made the commit can tell which kind it
+# was. `key` is deliberately absent from both: it is a digest of the others, so
+# including it would re-introduce the every-field comparison through the back
+# door.
+WARN_ONLY = ("commit", "dirty")
+
+
+def _stamp_diff(a: dict, b: dict, fields=COMPARE) -> list[str]:
+    """Which decisive stamp fields disagree, among those BOTH sides recorded.
+
+    A field present on one side and absent on the other is not a disagreement,
+    it is a stamp written before that field existed. seed_sha was added after
+    every journal on disk was written, and counting its absence as a difference
+    made every existing run unresumable the moment it shipped. Unverifiable is
+    reported through Plan.soft_diff instead, because the honest statement is
+    'this run predates the check', not 'these are different jobs'.
+    """
+    return sorted({k for k in fields if k in a and k in b if a[k] != b[k]})
+
+
+def _stamp_unverifiable(a: dict, b: dict, fields=COMPARE) -> list[str]:
+    """Decisive fields only one side recorded, so the check cannot run."""
+    return sorted({k for k in fields if (k in a) != (k in b)})
 
 
 def plan(run_dir: str | Path, stamp: dict | None) -> Plan:
@@ -104,6 +141,17 @@ def plan(run_dir: str | Path, stamp: dict | None) -> Plan:
                     f"--restart to discard {len(rows)} recorded trials."),
                     n_trials=len(rows))
 
+    soft = sorted({k for k in WARN_ONLY for row in rows
+                   if (row.get("provenance") or {}).get(k) != (stamp or {}).get(k)})
+    if stamp:
+        for row in rows:
+            got = row.get("provenance") or {}
+            if got:
+                soft += [f"{k} (not recorded by the earlier run)"
+                         for k in _stamp_unverifiable(got, stamp)]
+                break
+    soft = sorted(set(soft))
+
     cache: dict[tuple[str, str], dict] = {}
     dupes = 0
     for row in rows:
@@ -113,6 +161,7 @@ def plan(run_dir: str | Path, stamp: dict | None) -> Plan:
             continue
         cache[k] = row
     return Plan("resume", cache=cache, n_trials=len(rows), n_duplicates=dupes,
+                soft_diff=soft,
                 reason=f"resuming from {len(cache)} recorded measurements in {path}")
 
 
@@ -143,5 +192,11 @@ def describe(p: Plan) -> str:
     if p.conflict:
         return f"  resume    CONFLICT: {p.reason}"
     extra = f", {p.n_duplicates} duplicate rows ignored" if p.n_duplicates else ""
-    return (f"  resume    {len(p.cache)} measurements already on disk will be "
+    line = (f"  resume    {len(p.cache)} measurements already on disk will be "
             f"replayed, not relaunched{extra}")
+    if p.soft_diff:
+        line += (f"\n            NOTE: {', '.join(p.soft_diff)} differ from the "
+                 f"recorded run. A code change can move every number for the same "
+                 f"config, as the worker stagger and the replay lengths both did. "
+                 f"Pass --restart if this commit was one of those.")
+    return line

@@ -2323,6 +2323,27 @@ def test_resume():
     check("nor silently truncate: the caller decides",
           "--restart" in q.reason and "--run-dir" in q.reason)
 
+    section("resume.plan: a code change warns, it does not block")
+    # The first version compared every stamp field, so `commit` and `dirty`
+    # differing meant a run could not be resumed after any edit to this repo.
+    # An interruption is usually followed by a fix, so it refused to resume runs
+    # it had itself just crashed, which is the opposite of the feature.
+    coded = [{**r, "provenance": {**stamp, "commit": "deadbeef", "dirty": True}}
+             for r in rows]
+    (d / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in coded))
+    c = resume.plan(d, {**stamp, "commit": "cafef00d", "dirty": False})
+    check("a different commit still resumes", c.resuming, c.mode)
+    check("but it is reported", "commit" in c.soft_diff and "dirty" in c.soft_diff,
+          c.soft_diff)
+    check("and the note says why it might matter",
+          "worker stagger" in resume.describe(c),
+          "two code changes in this project moved every number for the same config")
+    check("`key` is not compared at all", "key" not in resume.COMPARE
+          and "key" not in resume.WARN_ONLY,
+          "it is a digest of the other fields, so comparing it would re-introduce "
+          "the every-field comparison through the back door")
+    (d / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
     section("resume.plan: a torn last line is what a kill leaves behind")
     (d / "trials.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in rows) + '{"node_id": "half')
