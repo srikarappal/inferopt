@@ -46,6 +46,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from inferopt import resume
 from inferopt.traverse import Trial
 
 
@@ -57,6 +58,7 @@ class MethodRunner:
                  benchmarks: list[str] | None = None,
                  quality_every: bool = True,
                  sweep: bool = True,
+                 restart: bool = False,
                  log=print):
         from inferopt.evaluator import VllmEvaluator
         from inferopt.provenance import trial_stamp
@@ -75,7 +77,21 @@ class MethodRunner:
                                 gpu=gpu, port=free_port(port))
         self.trials: list[Trial] = []
         self.journal = self.run_dir / "trials.jsonl"
-        self.journal.write_text("")
+        self.plan = resume.plan(self.run_dir, self.stamp)
+        if restart:
+            self.plan = resume.Plan("fresh")
+            self.log("  resume    --restart given, discarding any recorded trials")
+        elif self.plan.conflict:
+            raise SystemExit(f"  {self.plan.reason}")
+        self.log(resume.describe(self.plan))
+        if self.plan.resuming:
+            # Replayed trials are already IN the journal. Truncating here is what
+            # made a restart cost the launches it had already paid for.
+            self.ev.replay = self.plan.cache
+            for row in self.plan.cache.values():
+                self.trials.append(resume.to_trial(row))
+        else:
+            self.journal.write_text("")
         self.t0 = time.time()
 
     # -------------------------------------------------------------- measure
@@ -118,6 +134,8 @@ class MethodRunner:
                      f"slo {d.get('slo_attainment', 0):.0%}"
                      + (f"  math_500 {t.quality.get('math_500'):.4f}"
                         if t.quality.get("math_500") is not None else ""))
+        if (t.diagnostics or {}).get("replayed"):
+            return t                    # already counted, already on disk
         self.trials.append(t)
         with open(self.journal, "a") as fh:
             fh.write(json.dumps(t.__dict__, default=str) + "\n")

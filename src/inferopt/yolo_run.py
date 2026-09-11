@@ -53,6 +53,8 @@ def main() -> int:
     ap.add_argument("--dag", default=None,
                     help="DAG to screen against; defaults to the shipped one")
     ap.add_argument("--run-dir", default="runs/yolo")
+    ap.add_argument("--restart", action="store_true",
+        help="discard any trials already in --run-dir instead of resuming from them")
     ap.add_argument("--repeats", type=int, default=2,
                     help="LAUNCHES per cell. Separate launches, because "
                          "across-launch spread is what a single-contrast method "
@@ -94,7 +96,8 @@ def main() -> int:
     runner = MethodRunner("yolo", fp, slo, a.trace, a.run_dir,
                           gpu=a.gpu, port=a.port,
                           benchmarks=[] if a.no_quality else [a.benchmark],
-                          quality_every=not a.no_quality)
+                          quality_every=not a.no_quality,
+                          restart=a.restart)
 
     cells = {"all_off": base, "all_on": all_on}
     got: dict[str, list] = {k: [] for k in cells}

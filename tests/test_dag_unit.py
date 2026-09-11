@@ -2277,6 +2277,98 @@ vllm:time_to_first_token_seconds_bucket{le="0.1"} 12
 
 
 # ==========================================================================
+def test_resume():
+    """Resume a run from its own journal, or refuse to."""
+    import json, tempfile
+    from pathlib import Path
+    from inferopt import resume
+
+    section("resume.plan: fresh, resume, conflict")
+    d = Path(tempfile.mkdtemp())
+    check("no journal is a fresh run", resume.plan(d, {"a": 1}).mode == "fresh")
+    (d / "trials.jsonl").write_text("")
+    check("an empty journal is a fresh run", resume.plan(d, {"a": 1}).mode == "fresh")
+
+    stamp = {"model": "m", "gpu": "g", "trace_sha": "abc", "slo": "500/250"}
+    rows = [
+        {"node_id": "prefix_caching", "config": {"x": 1}, "goodput": 100.0,
+         "provenance": stamp},
+        {"node_id": "chunked_prefill", "config": {"x": 1}, "goodput": 110.0,
+         "provenance": stamp},
+        # SAME node, DIFFERENT value: a sweep records both under one id, so a
+        # key of node_id alone would replay the first in place of the second.
+        {"node_id": "chunked_prefill", "config": {"x": 2}, "goodput": 120.0,
+         "provenance": stamp},
+    ]
+    (d / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    p = resume.plan(d, stamp)
+    check("a matching stamp resumes", p.resuming, p.mode)
+    check("the config is part of the key", len(p.cache) == 3, len(p.cache))
+    check("and the two sweep values are distinct entries",
+          resume.key("chunked_prefill", {"x": 1}) in p.cache
+          and resume.key("chunked_prefill", {"x": 2}) in p.cache)
+    check("key is order independent",
+          resume.key("n", {"a": 1, "b": 2}) == resume.key("n", {"b": 2, "a": 1}))
+
+    section("resume.plan: a different job is not a run to resume")
+    other = {**stamp, "slo": "200/100"}
+    q = resume.plan(d, other)
+    check("a differing stamp is a CONFLICT, not a resume", q.conflict, q.mode)
+    check("and the reason names the field that differs", "slo" in q.reason, q.reason)
+    check("it does not silently replay", not q.cache)
+    # Goodput counts only requests that met the SLO, so the same config against
+    # two targets gives numbers that neither compare nor average. Replaying
+    # across that boundary is the exact failure trial_stamp exists to stop.
+    check("nor silently truncate: the caller decides",
+          "--restart" in q.reason and "--run-dir" in q.reason)
+
+    section("resume.plan: a torn last line is what a kill leaves behind")
+    (d / "trials.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows) + '{"node_id": "half')
+    r2 = resume.plan(d, stamp)
+    check("the torn line is skipped, the rest still resumes",
+          r2.resuming and len(r2.cache) == 3, len(r2.cache))
+
+    section("duplicates keep the FIRST, so a replay is deterministic")
+    (d / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows + [
+        {"node_id": "prefix_caching", "config": {"x": 1}, "goodput": 999.0,
+         "provenance": stamp}]))
+    r3 = resume.plan(d, stamp)
+    check("the duplicate is counted", r3.n_duplicates == 1, r3.n_duplicates)
+    check("and the first value wins",
+          r3.cache[resume.key("prefix_caching", {"x": 1})]["goodput"] == 100.0)
+
+    section("the evaluator replays instead of launching")
+    from inferopt import evaluator as E
+
+    class Fake(E.VllmEvaluator):
+        def __init__(self):
+            self.replay = p.cache
+            self.log = lambda *a: None
+        def _serve(self, *a, **k):
+            raise AssertionError("a replayed measurement must not launch a server")
+
+    t = Fake().measure({"x": 2}, probes=["goodput"], benchmarks=[],
+                       node_id="chunked_prefill")
+    check("the cached trial comes back", t.goodput == 120.0, t.goodput)
+    check("marked replayed, so callers do not re-append it",
+          (t.diagnostics or {}).get("replayed") is True)
+
+    section("launches already spent are credited, not forgotten")
+    import inspect
+    from inferopt.methods import MethodRunner
+    src = inspect.getsource(MethodRunner.__init__)
+    check("a resumed runner seeds its trial list from the journal",
+          "self.trials.append(resume.to_trial(" in src,
+          "otherwise 'pb took 16 launches' stops being true across a restart")
+    check("and does not truncate what it is about to replay",
+          "if self.plan.resuming" in src and "else:" in src)
+    check("measure skips re-appending a replayed trial",
+          '"replayed"' in inspect.getsource(MethodRunner.measure))
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -2419,7 +2511,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

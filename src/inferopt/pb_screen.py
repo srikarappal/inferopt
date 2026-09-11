@@ -314,6 +314,8 @@ def main() -> int:
     ap.add_argument("--dag", default=None,
                     help="DAG to screen against; defaults to the shipped one")
     ap.add_argument("--run-dir", default="runs/pb")
+    ap.add_argument("--restart", action="store_true",
+        help="discard any trials already in --run-dir instead of resuming from them")
     ap.add_argument("--repeats", type=int, default=1,
                     help="LAUNCHES per design row. Repeats must be separate "
                          "launches: across-launch spread measured 5x "
@@ -371,7 +373,8 @@ def main() -> int:
     runner = MethodRunner("pb", fp, slo, a.trace, run_dir,
                           gpu=a.gpu, port=a.port,
                           benchmarks=[] if a.no_quality else [a.benchmark],
-                          quality_every=not a.no_quality, log=lambda *_: None)
+                          quality_every=not a.no_quality, log=lambda *_: None,
+                          restart=a.restart)
     journal = run_dir / "rows.jsonl"
     journal.write_text("")
     results, t0 = [], time.time()

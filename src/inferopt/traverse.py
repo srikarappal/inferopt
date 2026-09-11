@@ -315,6 +315,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # write means the journal and the returned trials agree.
         if provenance and not t.provenance:
             t.provenance = dict(provenance)
+        if (t.diagnostics or {}).get("replayed"):
+            return                  # came out of the journal, do not write it twice
         if not jpath:
             return
         try:

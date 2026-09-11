@@ -872,6 +872,10 @@ class VllmEvaluator:
         self.equiv_k = cal.equivalence_prefix_tokens() if cal else 8
         self.equiv_ref: list[str] | None = None
         self.base_url = f"http://{HOST}:{port}"
+        # Set by a caller that wants to resume. Every method funnels through
+        # measure(), so this one hook covers the DAG walk, the screen and yolo
+        # rather than each growing its own resume logic.
+        self.replay: dict | None = None
 
     def dump_requests(self, reqs: list[Req], t0: float, t1: float, *,
                       node_id: str, concurrency: int, phase: str) -> None:
@@ -1422,6 +1426,21 @@ class VllmEvaluator:
         # (PYTHONHASHSEED), so the same config produced a different launch
         # directory on every invocation and the directories could not be
         # correlated across runs. Same digest family as provenance.trial_stamp.
+        # getattr, not self.replay: subclasses that bypass __init__ to fake a
+        # server are a normal thing here, and one of them has done so since
+        # before this hook existed. Same defensive read as settle_s below.
+        replay = getattr(self, "replay", None)
+        if replay is not None:
+            from inferopt.resume import key
+            hit = replay.get(key(node_id, config))
+            if hit is not None:
+                from inferopt.resume import to_trial
+                t = to_trial(hit)
+                t.diagnostics = {**(t.diagnostics or {}), "replayed": True}
+                self.log(f"        replayed from journal, no launch spent "
+                         f"({t.goodput:.1f} tok/s)")
+                return t
+
         tag = (f"{node_id}-"
                + hashlib.sha256(
                    json.dumps(config, sort_keys=True, default=str).encode()

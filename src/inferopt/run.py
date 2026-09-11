@@ -314,11 +314,25 @@ def cmd_optimize(args) -> int:
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     journal = run_dir / "trials.jsonl"
-    journal.write_text("")          # truncate once, here; traverse only appends
 
     port = free_port(args.port)
     from inferopt.provenance import banner, provenance, trial_stamp
     stamp = trial_stamp(fp, args.trace, slo)
+
+    # Decide before truncating. Unconditional truncation is what made pointing
+    # at an occupied run directory destroy its record, and what made a restart
+    # re-pay for every launch it had already spent.
+    from inferopt import resume as _resume
+    plan = _resume.plan(run_dir, stamp)
+    if plan.conflict and not getattr(args, "restart", False):
+        raise SystemExit(f"\n  {plan.reason}\n")
+    if getattr(args, "restart", False):
+        plan = _resume.Plan("fresh")
+        print("  resume    --restart given, discarding any recorded trials")
+    else:
+        print(_resume.describe(plan))
+    if not plan.resuming:
+        journal.write_text("")      # truncate once, here; traverse only appends
     meta = provenance(ap_ref[0], args, fp, extra={
         "port": port,
         "seed_config": cfg,
@@ -331,6 +345,8 @@ def cmd_optimize(args) -> int:
     if port != args.port:
         print(f"  port      {args.port} is taken; using {port}")
     ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
+    if plan.resuming:
+        ev.replay = plan.cache
 
     ctx = Context(fingerprint=fp, slo=slo, incumbent=cfg)
     baseline, curve, operating_L = None, [], None
@@ -600,6 +616,8 @@ def main() -> int:
     o.add_argument("--port", type=int, default=8100,
                    help="first port to try; the next free one is used if taken")
     o.add_argument("--run-dir", default="runs/latest")
+    o.add_argument("--restart", action="store_true",
+        help="discard any trials already in --run-dir instead of resuming from them")
     o.add_argument("--budget-minutes", type=int, default=180)
     o.add_argument("--seed-from-run", default=None, metavar="RUNDIR",
                    help="start from a previous run's incumbent config instead "
