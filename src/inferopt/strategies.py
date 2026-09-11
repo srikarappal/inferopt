@@ -22,8 +22,20 @@ and chaining PB would destroy the property the method exists for. So the
 protocol exposes `chains_incumbent` and lets callers reason about it, rather
 than forcing one behaviour on all three.
 
-The practical consequence, which cost a night of GPU: --seed-from-run applies to
-the sequential walk only.
+WHAT --seed-from-run DOES, ACCURATELY
+
+This paragraph used to say the flag applies to the sequential walk only. It
+never did. search() takes the seed for every strategy, yolo builds both cells
+from dict(seed), and the screen builds all twelve rows from it, so replacing the
+seed relocates all three.
+
+That is not wrong behaviour. The screen's arithmetic needs every row to share A
+background, not the DEFAULT background, so a relocated centre is still a valid
+design. What it changes is what the effects are local to: the same twelve rows
+around a tuned answer measure different effects than around the stock config,
+and both are legitimate. The bug was that two comments denied it happened and
+the stamp did not record it, so the two cases were indistinguishable on disk.
+provenance.seed_fingerprint now puts seed_sha and seed_from on every trial.
 """
 
 from __future__ import annotations

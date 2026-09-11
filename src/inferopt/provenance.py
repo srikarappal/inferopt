@@ -24,6 +24,8 @@ was built in two places, they disagreed, and it crashed a run nine launches in.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import platform
 import subprocess
 import sys
@@ -107,6 +109,30 @@ def banner(meta: dict[str, Any], path: Path) -> str:
             f"vllm {env.get('vllm')}, torch {env.get('torch')})")
 
 
+def seed_fingerprint(seed: dict | None, seed_from: str | None = None) -> dict:
+    """What the search STARTED from, so a head start is never invisible.
+
+    --seed-from-run replaces the default starting flags with a previous run's
+    final answer. That relocates the whole search, and for the screen it
+    relocates the design centre every effect is measured relative to, so two
+    screens with identical output can mean different things. Nothing about it
+    reached the stamp, which is the same defect class that already cost this
+    project a night of GPU when the sequential walk silently got a different
+    seed from yolo and PB.
+
+    The hash, not the config: the seed is a dozen flags and the stamp has to
+    stay small enough to sit on every trial. Divergence is what matters, and a
+    digest answers that.
+    """
+    rec: dict[str, Any] = {}
+    if seed:
+        rec["seed_sha"] = hashlib.sha256(
+            json.dumps(seed, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    if seed_from:
+        rec["seed_from"] = str(seed_from)
+    return rec
+
+
 def trial_stamp(fp, trace: str | Path | None = None, slo=None) -> dict[str, Any]:
     """The compact identity a single MEASUREMENT must carry to be poolable.
 
@@ -125,8 +151,6 @@ def trial_stamp(fp, trace: str | Path | None = None, slo=None) -> dict[str, Any]
     `key` is a hash of everything above, so a reader can group by one value
     instead of comparing seven fields and getting it subtly wrong.
     """
-    import hashlib
-    import json as _json
 
     rec: dict[str, Any] = {}
     if fp is not None:
@@ -154,5 +178,5 @@ def trial_stamp(fp, trace: str | Path | None = None, slo=None) -> dict[str, Any]
         rec["slo"] = {"ttft_p99_ms": getattr(slo, "ttft_p99_ms", None),
                       "itl_p99_ms": getattr(slo, "itl_p99_ms", None)}
     rec["key"] = hashlib.sha256(
-        _json.dumps(rec, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        json.dumps(rec, sort_keys=True, default=str).encode()).hexdigest()[:12]
     return rec

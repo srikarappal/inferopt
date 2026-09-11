@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from inferopt._paths import default_dag, runs as _runs
+from inferopt.provenance import seed_fingerprint
 
 
 @dataclass
@@ -153,6 +154,35 @@ def _gp(t) -> str:
     return f"{g:8.1f} tok/s" + (f" at L={L}" if L else "")
 
 
+def _warn_if_stale_seed(seed_from_run, stamp: dict, log) -> None:
+    """Say so when the warm start comes from a different environment.
+
+    resume refuses across a vLLM change, because replaying measurements taken
+    under another engine pools numbers that do not compare. A SEED is not a
+    measurement, so the same strictness would be wrong: after an upgrade is
+    exactly when you re-optimize, and refusing would block the case the flag
+    exists for. But an upgrade is also when a better region may have opened up
+    elsewhere, and a warm start deliberately searches the old answer's
+    neighbourhood. So this warns and names what changed, and leaves the call to
+    whoever is reading.
+    """
+    try:
+        prev = json.loads((Path(seed_from_run) / "run_meta.json").read_text())
+    except Exception:
+        return
+    old = ((prev.get("environment") or {}) | (prev.get("resolved") or {}))
+    fields = (("vllm", old.get("vllm")), ("gpu", (prev.get("fingerprint") or {})
+              .get("hw", {}).get("gpu_name")))
+    diff = [f"{k}: {v} -> {stamp.get(k)}" for k, v in fields
+            if v is not None and stamp.get(k) is not None and v != stamp.get(k)]
+    if diff:
+        log(f"  seed      WARNING, --seed-from-run {seed_from_run} was measured "
+            f"under a different environment ({'; '.join(diff)}).")
+        log(f"            A warm start searches that answer's neighbourhood, "
+            f"which is the wrong place to look if the upgrade opened a better "
+            f"region. Drop the flag to search from the default seed.")
+
+
 def optimize(
     *,
     model: str,
@@ -204,10 +234,20 @@ def optimize(
                           benchmarks=bench, quality_every=quality_every_config,
                           log=log)
 
-    # The seed. Identical across strategies unless a previous run is continued,
-    # which only the chaining strategy can use.
+    # The seed. Identical across strategies, and --seed-from-run replaces it for
+    # ALL THREE, not only the chaining walk.
+    #
+    # Two comments used to claim otherwise, here and in strategies.py, and the
+    # code never matched them: search() takes the seed for every strategy, yolo
+    # builds both its cells from dict(seed) and the screen builds all twelve of
+    # its rows from it. That is not a bug in the behaviour. A screen centred on a
+    # previous answer is still valid arithmetic, since the difference of means
+    # only requires every row to share A background rather than the DEFAULT one.
+    # What it changes is what the effects are local to, and the bug was that
+    # nothing said so and nothing recorded it.
     seed = seed_config(fp)
     if seed_from_run:
+        _warn_if_stale_seed(seed_from_run, runner.stamp, log)
         prev = json.loads((Path(seed_from_run) / "result.json").read_text())
         inc = (prev.get("incumbent") or prev.get("chosen") or {})
         inc = inc.get("config") or inc
@@ -231,6 +271,13 @@ def optimize(
                 f"walk would still run its lossy branch.")
         strat = (cls(factors, repeats=repeats) if strategy == "yolo"
                  else cls(factors, repeats=repeats, survivors=survivors))
+
+    # The head start goes into the stamp, so a run centred on a previous answer
+    # is distinguishable on disk from one centred on the defaults. It is set
+    # after the runner is built because the seed is not known until here, and
+    # before any measure() call because that is what copies the stamp onto each
+    # trial.
+    runner.stamp.update(seed_fingerprint(seed, seed_from_run))
 
     t0 = time.time()
     out = strat.search(ctx, runner, seed, log=log)

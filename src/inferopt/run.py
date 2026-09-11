@@ -318,6 +318,12 @@ def cmd_optimize(args) -> int:
     port = free_port(args.port)
     from inferopt.provenance import banner, provenance, trial_stamp
     stamp = trial_stamp(fp, args.trace, slo)
+    # The starting config goes in the stamp too. Without it a walk warm started
+    # from a previous answer is indistinguishable on disk from one started at
+    # the conservative seed, which is the head start this module's own history
+    # says nobody could see.
+    from inferopt.provenance import seed_fingerprint
+    stamp.update(seed_fingerprint(cfg, getattr(args, "seed_from_run", None)))
 
     # Decide before truncating. Unconditional truncation is what made pointing
     # at an occupied run directory destroy its record, and what made a restart

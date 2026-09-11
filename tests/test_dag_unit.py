@@ -2369,6 +2369,79 @@ def test_resume():
 
 
 # ==========================================================================
+def test_seed_provenance():
+    """A head start must never be invisible."""
+    import inspect, json, tempfile
+    from pathlib import Path
+    from inferopt import api, strategies
+    from inferopt.provenance import seed_fingerprint
+
+    section("seed_fingerprint: the starting config is part of the identity")
+    a = seed_fingerprint({"max_num_seqs": 256, "enforce_eager": True})
+    b = seed_fingerprint({"enforce_eager": True, "max_num_seqs": 256})
+    check("key order does not change the digest", a == b, (a, b))
+    c = seed_fingerprint({"max_num_seqs": 512, "enforce_eager": True})
+    check("a different starting config is a different digest", a["seed_sha"] != c["seed_sha"])
+    w = seed_fingerprint({"max_num_seqs": 256}, "runs/previous")
+    check("a warm start records where it came from", w["seed_from"] == "runs/previous")
+    check("a default seed records no origin", "seed_from" not in a)
+    check("an empty seed produces nothing to record", seed_fingerprint(None) == {})
+
+    section("the comments no longer contradict the code")
+    # search() takes the seed for EVERY strategy, yolo builds both cells from
+    # dict(seed) and the screen builds all twelve rows from it, so a claim that
+    # --seed-from-run is sequential-only was false wherever it appeared.
+    # The phrase still appears, in a sentence saying the claim was false. What
+    # must not survive is the ASSERTION, so check the correction is there rather
+    # than that the words are absent.
+    # Whitespace-normalised: the docstring is hard wrapped, so a raw substring
+    # spanning a line break never matches and the check would fail on formatting
+    # rather than on content.
+    doc = " ".join(strategies.__doc__.split())
+    check("the old claim is marked as history, not stated",
+          "used to say the flag applies to the sequential walk only" in doc
+          and "It never did" in doc,
+          "the screen and yolo both relocate with the seed")
+    check("and says what it actually does", "relocates all three" in doc)
+    src = inspect.getsource(api.optimize)
+    check("api.py no longer claims only the chaining strategy can use it",
+          "only the chaining strategy can use" not in src)
+    check("api.py says it applies to all three", "ALL THREE" in src)
+
+    section("the stamp carries it, on every trial")
+    check("optimize stamps the seed before any measurement",
+          "runner.stamp.update(seed_fingerprint(" in src,
+          "the stamp is copied onto each trial inside measure(), so it has to be "
+          "set before the first one")
+    i_stamp = src.index("runner.stamp.update(seed_fingerprint(")
+    i_search = src.index("strat.search(")
+    check("...and before search runs", i_stamp < i_search)
+    rsrc = Path("src/inferopt/run.py").read_text()
+    check("the DAG entry point stamps it too",
+          "stamp.update(seed_fingerprint(" in rsrc)
+
+    section("a warm start from a different environment warns")
+    d = Path(tempfile.mkdtemp())
+    (d / "run_meta.json").write_text(json.dumps({
+        "environment": {"vllm": "0.24.0"},
+        "fingerprint": {"hw": {"gpu_name": "NVIDIA GB10"}}}))
+    said = []
+    api._warn_if_stale_seed(d, {"vllm": "0.26.0", "gpu": "NVIDIA GB10"}, said.append)
+    joined = " ".join(said)
+    check("it warns when vLLM changed", "WARNING" in joined, joined[:90])
+    check("and names the change", "0.24.0 -> 0.26.0" in joined, joined[:120])
+    check("it warns rather than refusing", "Drop the flag" in joined,
+          "after an upgrade is exactly when you re-optimize, so refusing would "
+          "block the case the flag exists for")
+    quiet = []
+    api._warn_if_stale_seed(d, {"vllm": "0.24.0", "gpu": "NVIDIA GB10"}, quiet.append)
+    check("and is silent when nothing changed", not quiet, quiet)
+    gone = []
+    api._warn_if_stale_seed(Path(tempfile.mkdtemp()), {"vllm": "0.26.0"}, gone.append)
+    check("a missing run_meta is not fatal", not gone)
+
+
+# ==========================================================================
 def test_dag_file():
     section("dag/llm.json: structural invariants")
     d = json.loads(_DAG.read_text())
@@ -2511,7 +2584,7 @@ def test_reachability():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
