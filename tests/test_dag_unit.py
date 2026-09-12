@@ -2441,6 +2441,27 @@ def test_seed_provenance():
     check("the DAG entry point stamps it too",
           "stamp.update(seed_fingerprint(" in rsrc)
 
+    section("optimize() can run stage 1.2, and says which way it went")
+    osrc = inspect.getsource(api.optimize)
+    check("optimize takes a predict flag",
+          "predict" in inspect.signature(api.optimize).parameters)
+    check("it is OFF by default", api.__dict__ and
+          inspect.signature(api.optimize).parameters["predict"].default is False,
+          "a prediction moves the starting point, so turning it on silently would "
+          "make every new result incomparable with every recorded one")
+    check("the prediction lands BEFORE the stamp is taken",
+          osrc.index("if predict:") < osrc.index("runner.stamp.update(seed_fingerprint("),
+          "otherwise the seed digest would describe the wrong seed")
+    check("and before seed_from_run, so an explicit warm start still wins",
+          osrc.index("if predict:") < osrc.index("if seed_from_run:"))
+    check("a missing predictor does not take the run down",
+          "stage 1.2 unavailable" in osrc,
+          "aiconfigurator is an optional extra; optimize() must degrade, not crash")
+    check("hardware defaults go ON TOP of the prediction",
+          osrc.index("**prediction.seed_config") < osrc.index("**hardware_defaults(fp)"),
+          "the predictor picks the shape, the defaults keep the rails it does not "
+          "model, so the defaults must win")
+
     section("a warm start from a different environment warns")
     d = Path(tempfile.mkdtemp())
     (d / "run_meta.json").write_text(json.dumps({

@@ -198,6 +198,7 @@ def optimize(
     allow_loss: float | None = None,
     dag: str | None = None,
     seed_from_run: str | None = None,
+    predict: bool = False,
     run_dir: str | None = None,
     gpu: str = "0",
     port: int = 8100,
@@ -246,6 +247,39 @@ def optimize(
     # What it changes is what the effects are local to, and the bug was that
     # nothing said so and nothing recorded it.
     seed = seed_config(fp)
+
+    # STAGE 1.2. run.py has always done this and optimize() never did, so the
+    # two entry points disagreed about whether a prediction seeds the search.
+    #
+    # It applies to every strategy, not just the chaining walk, which is what
+    # keeps a method comparison fair: all three start from the same place. The
+    # asymmetry that damaged an earlier comparison was the walk being seeded
+    # from a prediction while yolo and the screen were not, and that cannot
+    # happen here because the seed is computed once, above, and handed to
+    # whichever strategy runs.
+    #
+    # Off by default all the same. A prediction moves the starting point, so
+    # turning it on silently would make every result incomparable with every
+    # result already recorded, and the benchmark runs in this repo all passed
+    # --skip-predict for exactly that reason. seed_fingerprint records which
+    # way it went, so the two cases are distinguishable on disk.
+    if predict:
+        from inferopt.predictor import describe, predict as run_predictor
+        try:
+            prediction = run_predictor(fp, slo_, log=log)
+            describe(prediction, log=log)
+            if prediction.seed_config:
+                # The predictor picks the SHAPE, batch size and parallelism. The
+                # conservative defaults keep the rails it does not model, so they
+                # go on top rather than under.
+                seed = {**seed, **prediction.seed_config,
+                        **hardware_defaults(fp)}
+                if fp.hw.gpu_count == 1:
+                    seed.pop("tensor_parallel_size", None)
+        except Exception as e:
+            log(f"  stage 1.2 unavailable ({type(e).__name__}: {e}), "
+                f"using the conservative seed")
+
     if seed_from_run:
         _warn_if_stale_seed(seed_from_run, runner.stamp, log)
         prev = json.loads((Path(seed_from_run) / "result.json").read_text())
