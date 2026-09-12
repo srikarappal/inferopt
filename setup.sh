@@ -97,6 +97,37 @@ import evalplus.evaluate, evalplus.sanitize
 print('  ok')" || echo "  STILL not importable -- MBPP+ will not score"
 fi
 
+note "config predictor (stage 1.2, NVIDIA aiconfigurator)"
+# --no-deps is mandatory, not tidiness. aiconfigurator pins numpy~=1.26.4 and
+# this environment runs 2.3.5, so a plain install downgrades numpy and takes
+# torch and vLLM with it. Pinning numpy alongside it is worse: pip then resolves
+# aiconfigurator 0.1.1 rather than 0.11.0, pulling in gradio and downgrading
+# pydantic and pandas, and you end up with a version from years ago while the
+# install looks like it worked.
+#
+# Every other dependency it declares is a >= floor that this environment already
+# clears. The one real incompatibility is plotext, which it needs at <6, and
+# which nothing else here requires.
+if $PY -c "import aiconfigurator.cli" 2>/dev/null; then
+    echo "  already installed"
+else
+    echo "  installing aiconfigurator (--no-deps) and pinning plotext<6 ..."
+    $PY -m pip install -q --no-deps aiconfigurator aiconfigurator-core && \
+    $PY -m pip install -q --no-deps "plotext<6" || echo "  pip failed"
+    $PY -c "
+from aiconfigurator.cli import cli_support
+print('  ok')" 2>/dev/null || echo "  STILL not importable, stage 1.2 will fall back to the conservative seed"
+fi
+$PY - <<'CHECK'
+import importlib.metadata as md
+for pkg, want in (("numpy", "2."), ("plotext", "5.")):
+    try:
+        v = md.version(pkg)
+        print(f"  {pkg} {v}" + ("" if v.startswith(want) else f"  <-- expected {want}x"))
+    except Exception:
+        pass
+CHECK
+
 note "weight-quantization producer (int4_awq, nvfp4)"
 # Not in requirements.txt, and not isolated either. nvidia-modelopt installs
 # straight into the serving env because it has no pin conflicts with vLLM, which

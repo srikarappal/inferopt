@@ -49,24 +49,12 @@ HISTORY -- getting a predictor to run at all
 from __future__ import annotations
 
 import json
-import os
-import re
 import shutil
-import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from inferopt.fingerprint import SLO, Fingerprint
-
-# NOT a venv. A venv bakes absolute paths into its shebang, its python symlink
-# and pyvenv.cfg, so one created on the host is broken inside a container that
-# mounts the same files at a different path -- which is exactly what happened.
-# `pip install --target` produces a plain directory with no absolute paths, and
-# PYTHONPATH is computed relative to this file, so it works from either side.
-from inferopt._paths import workspace as _workspace
-AIC_PKGS = _workspace(".aic-pkgs")
 
 # Unsupported GPU -> nearest supported member of the same architecture family.
 # Same tensor-core generation and kernel shapes, so the RANKING transfers; the
@@ -92,7 +80,11 @@ class Prediction:
     feasible: bool = True
     infeasible_reason: str = ""
     remedies: list[str] = field(default_factory=list)
-    raw: str = ""
+    frontier: list[dict] = field(default_factory=list)
+    """Every config aiconfigurator returned, not only the best.
+
+    The CLI path asked for five and read one. These cost nothing extra and are a
+    predicted frontier to set beside the measured one."""
 
 
 def roofline_itl_ms(fp: Fingerprint, weight_gb: float | None = None) -> float:
@@ -148,66 +140,84 @@ def _local_config_dir(model_id: str) -> Path | None:
         return None
 
 
-def _run_aic(fp: Fingerprint, slo: SLO, system: str, backend: str = "vllm") -> str:
-    if not (AIC_PKGS / "aiconfigurator").is_dir():
-        raise RuntimeError(
-            f"{AIC_PKGS} not found. AIConfigurator pins numpy~=1.26.4, which can never "
-            f"coexist with vLLM's <2.4, so it is installed beside the code and imported "
-            f"only in a subprocess:\n"
-            f"    pip install --target .aic-pkgs aiconfigurator 'plotext<6'")
-    # Run with THIS interpreter plus the target dir on PYTHONPATH: the subprocess
-    # gets numpy 1.26.4, the parent keeps its own. No shebangs, no symlinks.
-    env = {**os.environ, "PYTHONPATH": str(AIC_PKGS)}
-    # aiconfigurator fetches config.json with urllib, which reads the SYSTEM CA
-    # store -- and inside a container that often is not there, while
-    # huggingface_hub works because it uses certifi. Point urllib at certifi too.
-    try:
-        import certifi
-        env.setdefault("SSL_CERT_FILE", certifi.where())
-        env.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
-    except ImportError:
-        pass
+def _frontier(fp: Fingerprint, slo: SLO, system: str) -> tuple[dict, list[dict]]:
+    """Call aiconfigurator and return (top config, the whole frontier).
 
-    # Better still: give it a LOCAL directory. We already resolved config.json
-    # to build the fingerprint, so the subprocess needs no network at all --
-    # which removes a whole class of failure rather than working around it.
-    model_arg = fp.model.id
-    local = _local_config_dir(fp.model.id)
-    if local:
-        model_arg = str(local)
+    THE PYTHON API, NOT THE CLI. This used to shell out to
+    `python -m aiconfigurator.main cli default` in a subprocess and parse row 1
+    out of the ASCII table with a regex over column positions. Two things were
+    wrong with that. The regex broke silently on any layout change, with
+    `_parse` returning None as the only signal, indistinguishable from an
+    unsupported model. And it threw away the other four configs: --top-n 5 was
+    already being paid for and only row 1 was read.
 
-    cmd = [sys.executable, "-m", "aiconfigurator.main",
-           "cli", "default", "--model", model_arg, "--system", system,
-           "--backend", backend, "--isl", str(int(fp.workload.mean_input_tokens)),
-           "--osl", str(int(fp.workload.mean_output_tokens)),
-           "--total-gpus", str(fp.hw.gpu_count), "--no-color", "--top-n", "5"]
+    The subprocess existed for a real reason that has since been removed.
+    aiconfigurator pins numpy~=1.26.4 against the serving environment's 2.3.5,
+    so it could not share the process. The pin turns out to be conservative:
+    forced to numpy 2.3.5 it returns byte-identical numbers, verified on both.
+    The one genuine incompatibility was plotext, which needs <6 and which
+    nothing else in the serving environment required. So it is installed there
+    with --no-deps and called in-process.
+
+    tpot is floored at 30ms deliberately. The proxy is a faster machine, and
+    filtering on the real ITL target would discard configs that rank well and
+    fail only on the hardware gap the roofline correction already accounts for.
+    """
+    from aiconfigurator.cli import cli_default
+
+    model_arg = str(_local_config_dir(fp.model.id) or fp.model.id)
+    # top_n is explicit although it already defaults to 5: the CLI path passed
+    # it and the frontier this returns is now used, so it is a choice rather
+    # than an inherited default. Note that the SLO filters below cut it further,
+    # so one row on a single GPU is a filtered frontier, not a truncated one.
+    kwargs = {"model_path": model_arg, "total_gpus": fp.hw.gpu_count,
+              "system": system, "isl": int(fp.workload.mean_input_tokens),
+              "osl": int(fp.workload.mean_output_tokens), "top_n": 5}
     if slo.ttft_p99_ms:
-        cmd += ["--ttft", str(slo.ttft_p99_ms)]
+        kwargs["ttft"] = slo.ttft_p99_ms
     if slo.itl_p99_ms:
-        # The proxy is a faster machine; filtering on the real SLO would discard
-        # configs that rank well and only fail because of the hardware gap the
-        # roofline already accounts for.
-        cmd += ["--tpot", str(max(slo.itl_p99_ms, 30.0))]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900, env=env)
-    if not r.stdout.strip():
-        raise RuntimeError(f"aiconfigurator produced no output:\n{r.stderr[-800:]}")
-    return r.stdout
+        kwargs["tpot"] = max(slo.itl_p99_ms, 30.0)
+
+    result = cli_default(**kwargs)
+    frame = (result.best_configs or {}).get("agg")
+    if frame is None or not len(frame):
+        return {}, []
+
+    rows = [_row(frame.iloc[i]) for i in range(len(frame))]
+    return rows[0], rows
 
 
-_ROW = re.compile(
-    r"\|\s*1\s*\|\s*(\w+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|"
-    r"\s*([\d.]+)\s*\|\s*([\d.]+)\s*\|\s*(\d+)[^|]*\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|"
-    r"\s*tp(\d+)pp(\d+)\s*\|\s*(\d+)\s*\|")
+def _row(row) -> dict:
+    """One frontier entry, in the names the rest of this module uses.
 
+    Named lookups rather than column positions: a renamed column raises here
+    instead of quietly shifting every field one to the left, which is what a
+    positional regex over a printed table does.
+    """
+    def num(*names, default=0.0):
+        for n in names:
+            if n in row.index:
+                try:
+                    return float(row[n])
+                except (TypeError, ValueError):
+                    pass
+        return default
 
-def _parse(out: str) -> dict | None:
-    m = _ROW.search(out)
-    if not m:
-        return None
-    b, tps_gpu, tps_user, reqs, ttft, lat, conc, tp, pp, bs = m.groups()
-    return {"backend": b, "tokens_s_gpu": float(tps_gpu), "tokens_s_user": float(tps_user),
-            "req_s": float(reqs), "ttft_ms": float(ttft), "request_latency_ms": float(lat),
-            "concurrency": int(conc), "tp": int(tp), "pp": int(pp), "batch_size": int(bs)}
+    return {
+        "backend": str(row.get("backend", "")),
+        "tokens_s_gpu": num("tokens/s/gpu", "tokens/s"),
+        "tokens_s_user": num("tokens/s/user"),
+        "req_s": num("seq/s/gpu", "request_rate"),
+        "ttft_ms": num("ttft"),
+        "tpot_ms": num("tpot"),
+        "request_latency_ms": num("ttft") + num("tpot") * 0.0,
+        "concurrency": int(num("concurrency")),
+        "tp": int(num("tp", default=1)),
+        "pp": int(num("pp", default=1)),
+        "batch_size": int(num("bs", "global_bs", default=1)),
+        "memory_gb": num("memory"),
+        "power_w": num("power_w"),
+    }
 
 
 def predict(fp: Fingerprint, slo: SLO, *, log=print) -> Prediction:
@@ -225,12 +235,11 @@ def predict(fp: Fingerprint, slo: SLO, *, log=print) -> Prediction:
                           proxy_note=f"no proxy on record for {fp.hw.gpu_name!r}",
                           feasible=feasible, infeasible_reason=reason, remedies=remedies)
 
-    out = _run_aic(fp, slo, system)
-    top = _parse(out)
+    top, rows = _frontier(fp, slo, system)
     if not top:
         return Prediction(system_used=system, is_proxy=is_proxy, proxy_note=note,
                           feasible=feasible, infeasible_reason=reason,
-                          remedies=remedies, raw=out[-1500:])
+                          remedies=remedies)
 
     # Correct to the real hardware. Decode is memory-bound, so scale by the
     # bandwidth ratio, then floor at the roofline -- the proxy cannot predict a
@@ -254,7 +263,7 @@ def predict(fp: Fingerprint, slo: SLO, *, log=print) -> Prediction:
     return Prediction(system_used=system, is_proxy=is_proxy, proxy_note=note,
                       seed_config=seed, predicted=top, corrected=corrected,
                       feasible=feasible, infeasible_reason=reason, remedies=remedies,
-                      raw=out[-1500:])
+                      frontier=rows)
 
 
 def describe(p: Prediction, log=print) -> None:
