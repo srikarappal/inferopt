@@ -48,6 +48,7 @@ HISTORY -- getting a predictor to run at all
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import shutil
 import tempfile
@@ -138,6 +139,35 @@ def _local_config_dir(model_id: str) -> Path | None:
         return d
     except Exception:
         return None
+
+
+def environment_warning() -> str:
+    """Non-empty when installing the predictor has broken the server.
+
+    `pip install aiconfigurator` in a vLLM environment resolves numpy~=1.26.4
+    and downgrades it. vLLM and torch then fail at import or at launch, with an
+    error that says nothing about aiconfigurator, and the person debugging it
+    has no reason to connect the two. This turns that into one sentence at the
+    point of use.
+
+    Checked rather than assumed: a serving environment is one where vLLM is
+    importable, so the pairing that matters is numpy 1.x beside vLLM.
+    """
+    try:
+        numpy_version = importlib.metadata.version("numpy")
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+    if not numpy_version.startswith("1."):
+        return ""
+    try:
+        importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError:
+        return ""
+    return (f"numpy is {numpy_version} in an environment that also has vLLM. "
+            f"Installing aiconfigurator without --no-deps downgrades numpy to "
+            f"satisfy its numpy~=1.26.4 pin, which breaks torch and vLLM. Repair "
+            f"with: pip install --no-deps -U 'numpy>=2' , then reinstall "
+            f"aiconfigurator with --no-deps, or run ./setup.sh which does both.")
 
 
 def _frontier(fp: Fingerprint, slo: SLO, system: str) -> tuple[dict, list[dict]]:
@@ -267,6 +297,9 @@ def predict(fp: Fingerprint, slo: SLO, *, log=print) -> Prediction:
 
 
 def describe(p: Prediction, log=print) -> None:
+    warning = environment_warning()
+    if warning:
+        log(f"  stage 1.2 WARNING: {warning}")
     if p.is_proxy:
         log(f"  stage 1.2 predicted on PROXY system {p.system_used}")
         log(f"            {p.proxy_note}")

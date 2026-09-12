@@ -25,6 +25,30 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Stage 1.2, NVIDIA's config predictor. An EXTRA and not a dependency, for one
+# reason: aiconfigurator 0.11 pins numpy~=1.26.4, and inferopt has to live in the
+# same environment as vLLM to measure anything, where numpy is 2.x. Declaring it
+# outright would downgrade numpy on every real installation and break the server
+# it exists to tune.
+#
+# The pin is demonstrably conservative. Forced to numpy 2.3.5 aiconfigurator
+# returns byte-identical predictions, verified against a throwaway environment:
+# same support verdict, request_rate 107.287, ttft 187.127, tpot 18.023. Until
+# upstream relaxes it this cannot be expressed in packaging metadata, so:
+#
+#   no vLLM in the env   pip install inferopt[predict]      works, numpy 1.26.4
+#                                                           is harmless there
+#   vLLM in the env      ./setup.sh                         installs it with
+#                                                           --no-deps, the only
+#                                                           form that does not
+#                                                           break numpy
+#
+# The version floor matters. With numpy also constrained, pip given a bare
+# `aiconfigurator` silently resolves 0.1.1, a release from years ago that pulls
+# in gradio and downgrades pydantic and pandas, and reports success. With
+# >=0.11 it fails loudly with ResolutionImpossible naming numpy~=1.26.4 as the
+# cause, which is the error the user should see.
+predict = ["aiconfigurator>=0.11"]
 plots = ["matplotlib>=3.7", "seaborn"]
 data = ["datasets"]
 dev = ["networkx", "python-docx", "matplotlib>=3.7", "seaborn"]
