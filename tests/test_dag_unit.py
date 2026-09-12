@@ -2395,6 +2395,7 @@ def test_seed_provenance():
     import inspect, json, tempfile
     from pathlib import Path
     from inferopt import api, strategies
+    from inferopt.api import Result
     from inferopt.provenance import seed_fingerprint
 
     section("seed_fingerprint: the starting config is part of the identity")
@@ -2461,6 +2462,37 @@ def test_seed_provenance():
           osrc.index("**prediction.seed_config") < osrc.index("**hardware_defaults(fp)"),
           "the predictor picks the shape, the defaults keep the rails it does not "
           "model, so the defaults must win")
+
+    section("the predicted frontier reaches the caller")
+    from inferopt.predictor import Prediction, prediction_as_dict
+    pred = Prediction(system_used="b200_sxm", is_proxy=True, proxy_note="proxy",
+                      seed_config={"max_num_seqs": 512},
+                      predicted={"batch_size": 512, "tokens_s_gpu": 46192.0},
+                      corrected={"tokens_s_gpu": 1576.0},
+                      frontier=[{"batch_size": 512, "tokens_s_gpu": 46192.0},
+                                {"batch_size": 256, "tokens_s_gpu": 31000.0}])
+    d = prediction_as_dict(pred)
+    check("every row is returned, not just the top",
+          len(d["frontier"]) == 2,
+          "aiconfigurator is asked for five configs and the search consumed one; "
+          "the rest are a predicted Pareto set that cost nothing extra")
+    check("the top is still identified", d["top"]["batch_size"] == 512)
+    check("proxy status travels with the numbers", d["is_proxy"] is True,
+          "on an unsupported part these are predicted on a proxy and rescaled, so "
+          "a consumer plotting them beside measured points has to be able to say so")
+    check("the correction travels too", d["corrected"]["tokens_s_gpu"] == 1576.0)
+    check("it is plain data a caller can serialise",
+          bool(__import__("json").dumps(d)))
+
+    check("Result keeps the two frontiers apart",
+          "predicted" in Result.__dataclass_fields__
+          and "frontier" in Result.__dataclass_fields__,
+          "frontier is MEASURED, predicted holds stage 1.2 including its own rows")
+    osrc = inspect.getsource(api.optimize)
+    check("optimize fills it only when stage 1.2 ran",
+          "predicted: dict = {}" in osrc and "predicted=predicted" in osrc,
+          "an empty dict means the predictor did not run, which is not the same "
+          "as it running and finding nothing")
 
     section("a warm start from a different environment warns")
     d = Path(tempfile.mkdtemp())

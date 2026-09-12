@@ -88,6 +88,33 @@ class Prediction:
     predicted frontier to set beside the measured one."""
 
 
+def prediction_as_dict(p: "Prediction") -> dict:
+    """The whole prediction as plain data, for a caller to plot or search.
+
+    Returned rather than kept private because the frontier is the part with
+    reuse in it: aiconfigurator is asked for five configs and the search only
+    ever consumed the first. The other four are a predicted Pareto set that
+    cost nothing extra, and a caller may want to draw it beside the measured
+    one, or start a search from a row other than the top.
+
+    Every number here is PREDICTED, and on an unsupported part it is predicted
+    on a proxy and rescaled, so `is_proxy` and `corrected` travel with it. A
+    consumer that plots these beside measured points without saying which is
+    which is drawing a chart that lies.
+    """
+    return {
+        "system_used": p.system_used,
+        "is_proxy": p.is_proxy,
+        "proxy_note": p.proxy_note,
+        "feasible": p.feasible,
+        "infeasible_reason": p.infeasible_reason,
+        "seed_config": dict(p.seed_config),
+        "top": dict(p.predicted),
+        "corrected": dict(p.corrected),
+        "frontier": [dict(r) for r in p.frontier],
+    }
+
+
 def roofline_itl_ms(fp: Fingerprint, weight_gb: float | None = None) -> float:
     """Minimum inter-token latency: one decode step reads every active weight.
 

@@ -53,6 +53,15 @@ class Result:
     launches: int = 0
     minutes: float = 0.0
     run_dir: str | None = None
+    predicted: dict = field(default_factory=dict)
+    """Stage 1.2's output, when it ran. Empty otherwise.
+
+    Distinct from `frontier`, which is MEASURED. This one is predicted, and on
+    an unsupported part it is predicted on a proxy and rescaled, so it carries
+    `is_proxy` and `corrected` alongside the rows. Holding both lets a caller
+    draw the predicted Pareto set beside the measured one, or start a search
+    from a row other than the top, which is what the five configs
+    aiconfigurator returns were always for."""
     provenance: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
@@ -263,11 +272,14 @@ def optimize(
     # result already recorded, and the benchmark runs in this repo all passed
     # --skip-predict for exactly that reason. seed_fingerprint records which
     # way it went, so the two cases are distinguishable on disk.
+    predicted: dict = {}
     if predict:
-        from inferopt.predictor import describe, predict as run_predictor
+        from inferopt.predictor import (describe, prediction_as_dict,
+                                        predict as run_predictor)
         try:
             prediction = run_predictor(fp, slo_, log=log)
             describe(prediction, log=log)
+            predicted = prediction_as_dict(prediction)
             if prediction.seed_config:
                 # The predictor picks the SHAPE, batch size and parallelism. The
                 # conservative defaults keep the rails it does not model, so they
@@ -320,7 +332,7 @@ def optimize(
         chosen=out.chosen, best_seen=out.best_seen, frontier=out.frontier,
         launches=out.launches or len(out.trials),
         minutes=out.minutes or (time.time() - t0) / 60,
-        run_dir=rd, provenance={**runner.stamp,
+        run_dir=rd, predicted=predicted, provenance={**runner.stamp,
                                 "workload": fp.workload.model_dump()},
         extra=out.extra,
     )
