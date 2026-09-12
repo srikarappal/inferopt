@@ -2494,6 +2494,26 @@ def test_seed_provenance():
           "an empty dict means the predictor did not run, which is not the same "
           "as it running and finding nothing")
 
+    section("and survives the round trip through result.json")
+    # In-process access is no help to anything reading the file back, which is
+    # the only way a separate consumer sees a run at all.
+    import tempfile as _tf
+    r = Result(model="m", strategy="sequential",
+               predicted={"is_proxy": True, "system_used": "b200_sxm",
+                          "frontier": [{"batch_size": 512}, {"batch_size": 256}],
+                          "top": {"batch_size": 512}})
+    out = Path(_tf.mkdtemp()) / "result.json"
+    r.save(out)
+    back = json.loads(out.read_text())
+    check("save() writes the predicted block", "predicted" in back,
+          "the literal listed eleven keys and this was not one of them")
+    check("with every frontier row", len(back["predicted"]["frontier"]) == 2)
+    check("and the proxy flag", back["predicted"]["is_proxy"] is True,
+          "a consumer rendering these must be able to say they are predicted on "
+          "a proxy and rescaled")
+    check("the measured frontier keeps its own key", "frontier" in back,
+          "two frontiers, two keys, neither shadowing the other")
+
     section("a warm start from a different environment warns")
     d = Path(tempfile.mkdtemp())
     (d / "run_meta.json").write_text(json.dumps({

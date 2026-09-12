@@ -119,6 +119,10 @@ class Result:
             "chosen": _d(self.chosen), "best_seen": _d(self.best_seen),
             "baselines": {k: _d(v) for k, v in self.baselines.items()},
             "frontier": [_d(t) for t in self.frontier],
+            # MEASURED above, PREDICTED here, and both on disk. A reader that
+            # only ever sees result.json cannot recover stage 1.2 otherwise, and
+            # in-process access is no help to anything reading the file back.
+            "predicted": self.predicted,
             "trials": [_d(t) for t in self.trials],
             "quality_changes": [vars(c) for c in self.quality_changes],
             **self.extra,
