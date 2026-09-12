@@ -25,29 +25,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Stage 1.2, NVIDIA's config predictor. An EXTRA and not a dependency, for one
-# reason: aiconfigurator 0.11 pins numpy~=1.26.4, and inferopt has to live in the
-# same environment as vLLM to measure anything, where numpy is 2.x. Declaring it
-# outright would downgrade numpy on every real installation and break the server
-# it exists to tune.
+# Stage 1.2, NVIDIA's config predictor. This SHOULD be a plain dependency and
+# cannot be one, for a reason that is upstream's: aiconfigurator 0.11 declares
+# numpy~=1.26.4 while inferopt runs beside vLLM on numpy 2.x.
 #
-# The pin is demonstrably conservative. Forced to numpy 2.3.5 aiconfigurator
-# returns byte-identical predictions, verified against a throwaway environment:
-# same support verdict, request_rate 107.287, ttft 187.127, tpot 18.023. Until
-# upstream relaxes it this cannot be expressed in packaging metadata, so:
+# The pin is false, not merely inconvenient. Across all five entry points,
+# cli_support, cli_generate, cli_default, cli_recommend and cli_exp, numpy
+# 1.26.4 and 2.3.5 produce byte-identical output: same support verdict, same
+# frontier, request_rate 107.287, ttft 187.127, tpot 18.023. The software runs
+# fine on numpy 2; only its metadata says otherwise.
 #
-#   no vLLM in the env   pip install inferopt[predict]      works, numpy 1.26.4
-#                                                           is harmless there
-#   vLLM in the env      ./setup.sh                         installs it with
-#                                                           --no-deps, the only
-#                                                           form that does not
-#                                                           break numpy
-#
-# The version floor matters. With numpy also constrained, pip given a bare
-# `aiconfigurator` silently resolves 0.1.1, a release from years ago that pulls
-# in gradio and downgrades pydantic and pandas, and reports success. With
-# >=0.11 it fails loudly with ResolutionImpossible naming numpy~=1.26.4 as the
-# cause, which is the error the user should see.
+# pip offers no way for a dependent to relax a dependency's pin. Verified: a
+# plain install downgrades numpy, `--constraint numpy>=2.3.5` errors, and
+# pinning the version errors. So until the pin is relaxed upstream this is an
+# extra, and setup.sh installs it with --no-deps for the serving environment.
+# When it is relaxed, this moves into `dependencies` and setup.sh drops it.
 predict = ["aiconfigurator>=0.11"]
 plots = ["matplotlib>=3.7", "seaborn"]
 data = ["datasets"]

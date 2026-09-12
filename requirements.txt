@@ -61,20 +61,12 @@ python-docx==1.2.0
 #                   requirements file in one pass and cannot express "install
 #                   this, then undo what it did to setuptools".
 #
-#   aiconfigurator  NVIDIA's config predictor, stage 1.2. Lives in the serving
-#                   env now, but it CANNOT be listed here. It pins
-#                   numpy~=1.26.4 against this env's 2.3.5, so `pip install
-#                   aiconfigurator` downgrades numpy and breaks torch and vLLM.
-#                   Pinning numpy alongside it is worse, not better: pip then
-#                   resolves aiconfigurator 0.1.1 instead of 0.11.0 and drags in
-#                   gradio, downgrading pydantic and pandas on the way, so you
-#                   silently get a version from years ago. setup.sh installs it
-#                   with --no-deps, which is the only form that works.
-#
-#                   The numpy pin is conservative: forced to 2.3.5 it returns
-#                   byte-identical predictions, verified on both. The real
-#                   incompatibility is plotext, which it needs at <6, and which
-#                   nothing else in this environment required.
+#   aiconfigurator  NVIDIA's config predictor, stage 1.2. Absent here because
+#                   it declares numpy~=1.26.4 against this environment's 2.3.5,
+#                   and pip has no way for a dependent to relax that. The pin is
+#                   false: all five of its entry points give byte-identical
+#                   output on numpy 2.3.5. setup.sh installs it with --no-deps
+#                   until upstream fixes the metadata.
 #
 # This project has been broken twice by a dependency installed for a side
 # feature. modelopt and aiconfigurator both go in with --no-deps; evalplus stays
