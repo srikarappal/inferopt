@@ -460,7 +460,11 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             budget = ctx.slo.quality_budget
             for b, v in best.quality.items():
                 ref = ctx.quality_baseline.get(b)
-                if ref is None:
+                # v is None when a benchmark was requested but could not be
+                # scored -- a gated dataset, a missing harness. That is not a
+                # quality of zero, and gating on it would reject a
+                # configuration for a HuggingFace licence.
+                if ref is None or v is None:
                     continue
                 delta = ref - v
                 tol, _ = STORE.quality_tolerance(ctx.fingerprint, b)
@@ -481,7 +485,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             # and re-anchor the baseline to the post-lossless incumbent.
             for b, v in best.quality.items():
                 ref = ctx.quality_baseline.get(b)
-                if ref is not None:
+                if ref is not None and v is not None:
                     ctx.quality_tolerance[b] = max(abs(ref - v), 1e-4)
 
             # THE ZERO-WIDTH GATE CHECK. Both numbers exist for the first time
@@ -520,7 +524,10 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                     break
             log(f"        measured quality tolerance: "
                 + "  ".join(f"{k}={v:.4f}" for k, v in ctx.quality_tolerance.items()))
-            ctx.quality_baseline.update(best.quality)
+            # An unscored benchmark must not overwrite a real baseline with None,
+            # or every later comparison against it silently stops happening.
+            ctx.quality_baseline.update(
+                {k: v for k, v in best.quality.items() if v is not None})
 
         if best:
             best.kept = keep

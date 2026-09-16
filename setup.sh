@@ -128,6 +128,39 @@ for pkg, want in (("numpy", "2."), ("plotext", "5.")):
         pass
 CHECK
 
+note "leaderboard benchmarks (lm-evaluation-harness, OWN environment)"
+# IN ITS OWN VENV, ON PURPOSE. lm_eval pulls transformers, datasets, sympy, nltk
+# and antlr. None of that belongs beside a pinned vLLM, and this project has
+# twice been broken by a dependency installed for a side feature. It never needs
+# to share: lm_eval talks to the running server over HTTP like any other client
+# and never loads the model itself.
+#
+# Skip with INFEROPT_SKIP_LEADERBOARD=1. Without it the six leaderboard
+# benchmarks are simply unavailable; everything else still works.
+LMEVAL_ENV="$(pwd)/lmeval-env"
+if [ -n "${INFEROPT_SKIP_LEADERBOARD:-}" ]; then
+    echo "  skipped (INFEROPT_SKIP_LEADERBOARD set)"
+elif [ -x "$LMEVAL_ENV/bin/python" ] && "$LMEVAL_ENV/bin/python" -c "import lm_eval" 2>/dev/null; then
+    echo "  already installed at $LMEVAL_ENV"
+else
+    echo "  creating $LMEVAL_ENV and installing lm_eval[api,math,ifeval] ..."
+    $PY -m venv "$LMEVAL_ENV" 2>/dev/null && \
+    "$LMEVAL_ENV/bin/pip" install -q --upgrade pip && \
+    "$LMEVAL_ENV/bin/pip" install -q "lm_eval[api,math,ifeval]" transformers \
+        "math-verify" "sympy>=1.12" "antlr4-python3-runtime==4.11" \
+        || echo "  pip failed -- leaderboard benchmarks will be unavailable"
+fi
+if [ -x "$LMEVAL_ENV/bin/python" ] && "$LMEVAL_ENV/bin/python" -c "import lm_eval" 2>/dev/null; then
+    echo "  point inferopt at it with:"
+    echo "    export INFEROPT_LMEVAL_PYTHON=$LMEVAL_ENV/bin/python"
+    # GPQA is gated on HuggingFace and a valid token is not sufficient: the
+    # account behind it must have accepted the dataset terms. Said here rather
+    # than discovered after a sweep has already paid for the GPU.
+    echo "  note: leaderboard_gpqa needs its terms accepted at"
+    echo "    https://huggingface.co/datasets/Idavidrein/gpqa"
+    echo "    signed in as the owner of HF_TOKEN. The other five need nothing."
+fi
+
 note "weight-quantization producer (int4_awq, nvfp4)"
 # Not in requirements.txt, and not isolated either. nvidia-modelopt installs
 # straight into the serving env because it has no pin conflicts with vLLM, which

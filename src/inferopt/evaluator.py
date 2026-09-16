@@ -85,6 +85,7 @@ from typing import Any
 import httpx
 
 from inferopt.calibration import STORE
+from inferopt import leaderboard
 from inferopt.fingerprint import SLO, Fingerprint
 from goodput.driver import Req, _closed_loop, _load, _mt, _one
 from goodput.metrics import _reasons, summarize
@@ -582,6 +583,59 @@ class VllmEvaluator:
         # measure(), so this one hook covers the DAG walk, the screen and yolo
         # rather than each growing its own resume logic.
         self.replay: dict | None = None
+
+    def _score(self, model, config: dict, benchmarks, tag: str, el) -> dict:
+        """Score every requested benchmark, dispatching by who owns it.
+
+        TWO KINDS, MEASURED DIFFERENTLY ON PURPOSE.
+
+        Ours (math_500, mbpp_plus, humaneval_plus) run through _greedy with this
+        project's prompts, budgets and graders. They are internally consistent,
+        which is all a walk needs to RANK configurations, and externally
+        unquotable, because nobody can reproduce a number whose harness they do
+        not have.
+
+        leaderboard_* are handed to lm-evaluation-harness against the endpoint
+        already serving, so the number means the same thing as anyone else's. It
+        costs a subprocess and a second environment, and it buys a score that
+        survives being asked where it came from.
+
+        A LEADERBOARD TASK THAT FAILS IS RECORDED AS None, NOT AS ZERO. A gated
+        dataset and a model that scores nothing are different facts, and a
+        quality gate reading 0.0 would reject a configuration for a missing
+        HuggingFace licence.
+        """
+        from inferopt.quality import resolution, run_benchmark
+        qual: dict = {}
+        d = self.run_dir / "launches" / tag
+        for b in benchmarks:
+            if b in leaderboard.TASKS:
+                # max_length bounds prompt+generation and MUST fit the served
+                # context, or every long-shot prompt comes back as an HTTP 400
+                # that reads like a bad model rather than a bad ceiling.
+                ceiling = int(config.get("max_model_len") or 0) or 8192
+                try:
+                    res = leaderboard.run(
+                        [b], self.base_url, self.fp.model.id,
+                        max_length=max(512, ceiling - CONTEXT_MARGIN_TOKENS),
+                        out_dir=d, log=self.log)
+                    row = res[b]
+                    qual[b] = row.get("score")
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"leaderboard-{b}.json").write_text(
+                        json.dumps(row, indent=2, default=str))
+                except leaderboard.LeaderboardError as e:
+                    qual[b] = None
+                    self.log(f"        {el()} {b:20s} SKIPPED: {str(e).splitlines()[0]}")
+                continue
+            qual[b] = run_benchmark(
+                b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
+                max_input_tokens=config.get("max_model_len"),
+                model=self.fp.model.id,
+                record=d / f"generations-{b}.jsonl")
+            self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
+                     f"(+/- {resolution(b):.1%} resolution at this sample size)")
+        return qual
 
     def export_run(self, reqs: list[Req], t0: float, t1: float, *,
                    node_id: str, concurrency: int, label: str = "",
@@ -1237,15 +1291,7 @@ class VllmEvaluator:
                                  f"first-{self.equiv_k}-token prefixes differ")
                     qual = {}
                     if "quality" in probes and benchmarks:
-                        from inferopt.quality import resolution, run_benchmark
-                        for b in benchmarks:
-                            qual[b] = run_benchmark(
-                                b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
-                                max_input_tokens=config.get("max_model_len"),
-                                model=self.fp.model.id,
-                                record=self.run_dir / "launches" / tag / f"generations-{b}.jsonl")
-                            self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
-                                     f"(+/- {resolution(b):.1%} resolution)")
+                        qual = self._score(model, config, benchmarks, tag, el)
                     mem = self._gpu_memory_gb()
                     self.log(f"        {el()} done, tearing down")
                     return Trial(
@@ -1377,15 +1423,7 @@ class VllmEvaluator:
                              f"prefixes differ from the reference")
                 qual = {}
                 if "quality" in probes and benchmarks:
-                    from inferopt.quality import resolution, run_benchmark
-                    for b in benchmarks:
-                        qual[b] = run_benchmark(
-                            b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
-                            max_input_tokens=config.get("max_model_len"),
-                            model=self.fp.model.id,
-                            record=self.run_dir / "launches" / tag / f"generations-{b}.jsonl")
-                        self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
-                                 f"(+/- {resolution(b):.1%} resolution at this sample size)")
+                    qual = self._score(model, config, benchmarks, tag, el)
                 mem = self._gpu_memory_gb()
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:

@@ -51,6 +51,36 @@ from inferopt.traverse import report, traverse
 BASELINE_BENCHMARKS = ["math_500"]
 
 
+def _benchmarks(a) -> list[str]:
+    """Which accuracy benchmarks this run scores.
+
+    Validated HERE rather than at first use, because the first use is after a
+    server has booted and a sweep has run: a typo in a benchmark name should
+    cost a second, not an hour of GPU. Leaderboard tasks are additionally
+    preflighted, since a gated dataset is not discoverable from the name.
+    """
+    from inferopt import leaderboard
+    from inferopt.quality import BENCHMARKS
+
+    names = [s.strip() for s in (a.benchmarks or "").split(",") if s.strip()]
+    if not names:
+        return list(BASELINE_BENCHMARKS)
+    known = set(BENCHMARKS) | set(leaderboard.TASKS)
+    bad = [n for n in names if n not in known]
+    if bad:
+        raise SystemExit(
+            f"  unknown benchmark(s): {', '.join(bad)}\n"
+            f"  ours:        {', '.join(sorted(BENCHMARKS))}\n"
+            f"  leaderboard: {', '.join(leaderboard.ALL)}")
+    blocked = {k: v for k, v in leaderboard.preflight(
+        [n for n in names if n in leaderboard.TASKS]).items() if v}
+    if blocked:
+        raise SystemExit("  " + "\n  ".join(f"{k}: {v}" for k, v in blocked.items()))
+    if any(n in leaderboard.TASKS for n in names) and not leaderboard.lmeval_python():
+        raise SystemExit("  " + leaderboard.INSTALL_HINT.replace("\n", "\n  "))
+    return names
+
+
 def cmd_trace(args) -> int:
     """Build a replayable trace from a ShareGPT dump.
 
@@ -367,7 +397,7 @@ def cmd_optimize(args) -> int:
         from inferopt.evaluator import SWEEP_LEVELS
         sweep_off = args.skip_sweep or args.fixed_concurrency
         t = ev.measure(cfg, probes=["goodput", "equivalence", "quality"],
-                       benchmarks=BASELINE_BENCHMARKS, node_id="stage_1_3",
+                       benchmarks=_benchmarks(a), node_id="stage_1_3",
                        levels=None if sweep_off else SWEEP_LEVELS,
                        fixed_concurrency=args.fixed_concurrency)
         if t.diagnostics.get("launch_error"):
@@ -488,7 +518,7 @@ def cmd_optimize(args) -> int:
                    concurrency=operating_L,
                    fixed_concurrency=args.fixed_concurrency,
                    provenance=stamp,
-                   force_benchmarks=(BASELINE_BENCHMARKS
+                   force_benchmarks=(_benchmarks(a)
                                      if args.quality_every_node else None))
 
     # Full sweep on the finalists. The traversal ranks configs at one operating
@@ -588,6 +618,18 @@ def main() -> int:
     o.add_argument("--trace", required=True)
     o.add_argument("--ttft-p99", type=float, default=None)
     o.add_argument("--itl-p99", type=float, default=None)
+    o.add_argument("--benchmarks", default=None, metavar="A,B",
+                   help="comma-separated accuracy benchmarks to score. Default "
+                        "math_500. Ours (math_500, mbpp_plus, humaneval_plus) "
+                        "use this project's own prompts and graders, which rank "
+                        "configs consistently but cannot be compared with anyone "
+                        "else's numbers. The six leaderboard_* benchmarks run "
+                        "through lm-evaluation-harness instead and are directly "
+                        "comparable: leaderboard_bbh, leaderboard_gpqa, "
+                        "leaderboard_mmlu_pro, leaderboard_musr, "
+                        "leaderboard_math_hard, leaderboard_ifeval. Each brings "
+                        "its own generation budget and shot count. They need "
+                        "INFEROPT_LMEVAL_PYTHON; see docs/leaderboard.md.")
     o.add_argument("--quality-every-node", action="store_true",
                    help="score the accuracy benchmark on EVERY config, not just "
                         "the baseline and the lossy nodes. Slower, and needed "
