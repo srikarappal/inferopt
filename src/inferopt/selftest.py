@@ -46,6 +46,8 @@ import sys
 import time
 from pathlib import Path
 
+import goodput.driver
+
 FAILURES: list[str] = []
 
 
@@ -86,7 +88,11 @@ def install_fake_server(ev, per_token_s: float = 0.004):
         r.ok = True
         STATE["inflight"] -= 1
         return r
-    ev._one = fake_one
+    # _one now lives in goodput.driver, and _closed_loop resolves it THERE.
+    # Patching inferopt.evaluator._one leaves the real network call in place
+    # and the fake server silently never runs, which reads as a passing suite
+    # measuring nothing.
+    goodput.driver._one = fake_one
 
 
 def configs_under_test_backend(er, fp):
@@ -302,16 +308,16 @@ def main() -> int:
 
     print("\n=== prompt cursor: phases must not replay the same prompts ===")
     seen: list[str] = []
-    orig = ev._one
+    orig = goodput.driver._one
     async def recording(c, base_url, model, prompt, max_tokens, stream=True):
         seen.append(prompt)
         return await orig(c, base_url, model, prompt, max_tokens, stream)
-    ev._one = recording
+    goodput.driver._one = recording
     cur = [0]
     for _ in range(3):                       # warmup + two passes
         asyncio.run(ev._closed_loop("http://x", "m", [f"p{i}" for i in range(400)],
                                     8, 6, 0.1, 0.3, cursor=cur))
-    ev._one = orig
+    goodput.driver._one = orig
     uniq = len(set(seen))
     check("the cursor advanced across phases", cur[0] > 0, f"cursor={cur[0]}")
     check("phases served mostly DISJOINT prompts, not the same ones replayed",

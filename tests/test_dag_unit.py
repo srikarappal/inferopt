@@ -27,6 +27,8 @@ from inferopt._paths import default_dag
 _DAG = default_dag()
 from pathlib import Path
 
+import goodput.driver
+
 FAIL: list[str] = []
 N = 0
 
@@ -1790,13 +1792,13 @@ def test_closed_loop_stagger():
 
     def spread(stagger):
         started.clear()
-        orig = E._one
-        E._one = fake_one
+        orig = goodput.driver._one
+        goodput.driver._one = fake_one
         try:
             asyncio.run(E._closed_loop("http://x", "m", ["p"] * 64, 4, 16,
                                        0.30, 0.40, stagger_s=stagger))
         finally:
-            E._one = orig
+            goodput.driver._one = orig
         base = min(started)
         bins = {}
         for t in started:
@@ -1850,12 +1852,12 @@ def test_replay_lengths():
 
     prompts = [f"p{i}" for i in range(8)]
     lengths = [3, 9, 3, 9, 3, 9, 3, 9]
-    orig = E._one
-    E._one = fake_one
+    orig = goodput.driver._one
+    goodput.driver._one = fake_one
     try:
         asyncio.run(E._closed_loop("http://x", "m", prompts, lengths, 4, 0.05, 0.15))
     finally:
-        E._one = orig
+        goodput.driver._one = orig
     check("something ran", len(seen) >= 4, f"{len(seen)} requests")
     paired = {p: mt for p, mt in seen}
     check("prompt p1 always got length 9", paired.get("p1") == 9, paired)

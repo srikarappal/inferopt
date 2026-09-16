@@ -56,7 +56,7 @@ inferopt-selftest = "inferopt.selftest:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["inferopt"]
+packages = ["inferopt", "goodput"]
 
 [tool.setuptools.package-data]
 # The shipped DAG travels with the wheel; runs/, artifacts/ and data/ do not --
