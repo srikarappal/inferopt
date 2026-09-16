@@ -52,6 +52,7 @@ run() {
 }
 
 echo
+run "unit (goodput)"    $PY tests/test_goodput.py
 run "unit (DAG)"        $PY tests/test_dag_unit.py
 run "integration (DAG)" $PY tests/test_dag_integration.py
 run "selftest"          $PY -m inferopt.selftest
