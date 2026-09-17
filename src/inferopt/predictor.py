@@ -223,10 +223,10 @@ def _frontier(fp: Fingerprint, slo: SLO, system: str) -> tuple[dict, list[dict]]
     from aiconfigurator.cli import cli_default
 
     model_arg = str(_local_config_dir(fp.model.id) or fp.model.id)
-    # top_n is explicit although it already defaults to 5: the CLI path passed
-    # it and the frontier this returns is now used, so it is a choice rather
-    # than an inherited default. Note that the SLO filters below cut it further,
-    # so one row on a single GPU is a filtered frontier, not a truncated one.
+    # top_n bounds the RANKING in best_configs, which is where `top` comes
+    # from. It does not bound pareto_fronts, so it no longer caps the frontier
+    # this returns: 31 rows came back at top_n=5 on Qwen3-1.7B at h100_sxm.
+    # The ttft/tpot below likewise filter the ranking, not the Pareto set.
     kwargs = {"model_path": model_arg, "total_gpus": fp.hw.gpu_count,
               "system": system, "isl": int(fp.workload.mean_input_tokens),
               "osl": int(fp.workload.mean_output_tokens), "top_n": 5}
@@ -236,20 +236,47 @@ def _frontier(fp: Fingerprint, slo: SLO, system: str) -> tuple[dict, list[dict]]
         kwargs["tpot"] = max(slo.itl_p99_ms, 30.0)
 
     result = cli_default(**kwargs)
-    frame = (result.best_configs or {}).get("agg")
-    if frame is None or not len(frame):
+
+    # TWO FRAMES, TWO PURPOSES, AND THEY ARE NOT THE SAME LENGTH.
+    #
+    # best_configs["agg"] is the SLO-FILTERED ranking, and its rank 1 is the
+    # config the search seeds from. That is what `top` must stay: filtered,
+    # ordered, one row on a single GPU.
+    #
+    # pareto_fronts["agg"] is the UNFILTERED Pareto set, and it is what a
+    # frontier means. Reading the frontier out of best_configs returned the one
+    # surviving row and called it a frontier, which is how a 31-point predicted
+    # curve was reported as a single point.
+    #
+    # The two frames carry identical columns, verified on Qwen3-1.7B at
+    # h100_sxm, so _row reads both without a second mapping.
+    best = (result.best_configs or {}).get("agg")
+    pareto = (result.pareto_fronts or {}).get("agg")
+    if best is None or not len(best):
         return {}, []
 
-    rows = [_row(frame.iloc[i]) for i in range(len(frame))]
-    return rows[0], rows
+    top = _row(best.iloc[0], slo)
+    # PARETO ROWS ARE NOT SLO-FILTERED. That is correct for a frontier -- a
+    # point that misses the target is still a measurement someone may want --
+    # but it means a caller cannot assume every row conforms. Each row carries
+    # meets_slo so the distinction survives into whatever plots it.
+    frame = pareto if pareto is not None and len(pareto) else best
+    rows = [_row(frame.iloc[i], slo) for i in range(len(frame))]
+    return top, rows
 
 
-def _row(row) -> dict:
+def _row(row, slo: SLO | None = None) -> dict:
     """One frontier entry, in the names the rest of this module uses.
 
     Named lookups rather than column positions: a renamed column raises here
     instead of quietly shifting every field one to the left, which is what a
     positional regex over a printed table does.
+
+    `meets_slo` is judged against the CALLER'S targets, not against the floored
+    tpot that _frontier sends to aiconfigurator. The floor exists so a proxy
+    machine does not over-filter the query; using it here would mark rows as
+    conforming to a target nobody asked for. None means no SLO was supplied and
+    conformance is unknown, which is not the same as False.
     """
     def num(*names, default=0.0):
         for n in names:
@@ -267,14 +294,35 @@ def _row(row) -> dict:
         "req_s": num("seq/s/gpu", "request_rate"),
         "ttft_ms": num("ttft"),
         "tpot_ms": num("tpot"),
-        "request_latency_ms": num("ttft") + num("tpot") * 0.0,
+        # The frame carries request_latency directly. This used to read
+        # `num("ttft") + num("tpot") * 0.0`, which is ttft with a term that
+        # multiplies out to nothing, so end-to-end latency was reported as
+        # time-to-first-token. Harmless while only rank 1 was consumed and
+        # wrong on every row of a frontier that is now exposed.
+        "request_latency_ms": num("request_latency", default=float("nan")),
         "concurrency": int(num("concurrency")),
         "tp": int(num("tp", default=1)),
         "pp": int(num("pp", default=1)),
         "batch_size": int(num("bs", "global_bs", default=1)),
         "memory_gb": num("memory"),
         "power_w": num("power_w"),
+        "meets_slo": _meets(num("ttft"), num("tpot"), slo),
     }
+
+
+def _meets(ttft_ms: float, tpot_ms: float, slo: SLO | None) -> bool | None:
+    """Does this predicted point sit inside the caller's targets?
+
+    None when there is nothing to judge against. An unset bound is not a bound:
+    a slo carrying only a ttft target constrains only ttft.
+    """
+    if slo is None:
+        return None
+    if slo.ttft_p99_ms and ttft_ms > slo.ttft_p99_ms:
+        return False
+    if slo.itl_p99_ms and tpot_ms > slo.itl_p99_ms:
+        return False
+    return True
 
 
 def predict(fp: Fingerprint, slo: SLO, *, log=print) -> Prediction:
