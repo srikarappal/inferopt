@@ -365,7 +365,7 @@ def main() -> int:
     check("concurrency is recorded on the aggregate", med.get("concurrency") == 12)
     check("pass-to-pass spread is reported", "pass_spread" in med)
     import inspect as _i
-    src_ev = _i.getsource(ev.VllmEvaluator.measure)
+    src_ev = _i.getsource(ev.VllmEvaluator._measure_served)
     check("measure() delegates rather than keeping its own copy",
           "self.serving_metrics(" in src_ev,
           "two implementations of one measurement diverge -- that is how a "

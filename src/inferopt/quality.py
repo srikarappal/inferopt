@@ -446,6 +446,25 @@ BENCHMARKS: dict[str, Benchmark] = {
 }
 
 
+def context_needed(names: list[str], model: str | None = None) -> int:
+    """The smallest max_model_len under which every row of `names` is scorable.
+
+    Longest prompt plus the generation budget, and the largest benchmark wins.
+    Same prompt builder and same len // 4 estimate as run_benchmark's filter, so
+    the two cannot disagree about what fits. Names this module does not own
+    contribute nothing: a leaderboard task sizes its own max_length.
+    """
+    need = 0
+    for name in names:
+        b = BENCHMARKS.get(name)
+        if b is None:
+            continue
+        prompt = _chat_wrapper(b.prompt, model) if b.chat else b.prompt
+        longest = max(len(prompt(r)) // 4 for r in _load(name, None))
+        need = max(need, longest + b.max_tokens + 1)
+    return need
+
+
 def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                   max_input_tokens: int | None = None,
                   model: str | None = None,

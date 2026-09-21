@@ -25,9 +25,12 @@ sys.path.insert(0, str(_P(__file__).resolve().parent.parent / 'src'))
 from inferopt._paths import default_dag
 
 _DAG = default_dag()
+from contextlib import contextmanager
 from pathlib import Path
 
 import goodput.driver
+from inferopt import evaluator, quality
+from inferopt.traverse import Trial
 
 FAIL: list[str] = []
 N = 0
@@ -1753,7 +1756,7 @@ def test_percentile_stability():
     check("...and it does", agg["ttft_p95_ms"] == 90.0 and agg["ttft_n"] == 300, agg)
     # Turn 4 recorded p95 nan / n=0 on all three launches: summarize() emitted
     # them and the Trial's diagnostics dict is a whitelist that did not.
-    src = inspect.getsource(VllmEvaluator.measure)
+    src = inspect.getsource(VllmEvaluator._measure_served)
     for k in ("ttft_p95_ms", "itl_p95_ms", "ttft_n"):
         check(f"{k} is in the diagnostics whitelist", src.count(f'"{k}"') >= 2,
               f"counted {src.count(chr(34) + k + chr(34))} -- both the sweep and the "
@@ -1899,7 +1902,7 @@ def test_replay_lengths():
     check("falls back to the mean", Bare().replay_lengths() == [8, 8])
 
     section("the load paths do NOT send the mean")
-    for name in ("serving_metrics", "_point", "measure"):
+    for name in ("serving_metrics", "_point", "_measure_served"):
         src = inspect.getsource(getattr(E.VllmEvaluator, name))
         if "_load(" in src or "_closed_loop(" in src:
             check(f"{name} passes replay_lengths()", "self.replay_lengths()" in src)
@@ -2121,7 +2124,7 @@ def test_review_fixes():
           f"since the server booted, which made the curve a staircase that read "
           f"as 'preemptions rise with L'")
 
-    src = inspect.getsource(E.VllmEvaluator.measure)
+    src = inspect.getsource(E.VllmEvaluator._measure_served)
     check("across levels the gauge is maxed", "for k in self._GAUGES" in src)
     check("...and the counter is SUMMED", "diag[k] = sum(vals)" in src,
           "per-level deltas add up; taking their max would under-report")
@@ -2271,7 +2274,7 @@ vllm:time_to_first_token_seconds_bucket{le="0.1"} 12
 
     section("the launch tag is deterministic")
     import inspect
-    src = inspect.getsource(V.measure)
+    src = inspect.getsource(V._launch_tag)
     check("sha256, not hash()", "hashlib.sha256" in src)
     check("hash() is gone", "abs(hash(" not in src,
           "Python randomises string hashing per process, so the same config "
@@ -2677,10 +2680,110 @@ def test_reachability():
 
 
 # ==========================================================================
+class _TightContextEvaluator(evaluator.VllmEvaluator):
+    """No server. Records what each launch served and where quality was scored."""
+
+    def __init__(self, *, slo_ok=True, replayed=False, quality_launch_fails=False):
+        self.log = lambda *a: None
+        self.fp = _ctx().fingerprint
+        self.slo_ok, self.replayed = slo_ok, replayed
+        self.quality_launch_fails = quality_launch_fails
+        self.launched, self.scored_under, self.inner_benchmarks = [], [], None
+
+    @contextmanager
+    def _serve(self, config, tag):
+        if self.quality_launch_fails:
+            raise evaluator.LaunchError("out of memory")
+        self.launched.append(dict(config))
+        yield "model"
+
+    def _score(self, model, config, benchmarks, tag, el):
+        self.scored_under.append(config.get("max_model_len"))
+        return {b: 0.5 for b in benchmarks}
+
+    def _measure_served(self, config, *, probes, benchmarks, node_id, **_):
+        self.inner_benchmarks = list(benchmarks)
+        scores = (self._score("model", config, benchmarks, "tag", None)
+                  if "quality" in probes and benchmarks else {})
+        return Trial(node_id=node_id, config=dict(config), goodput=100.0,
+                     ttft_p99_ms=1.0, itl_p99_ms=1.0, memory_gb=1.0, quality=scores,
+                     slo_ok=self.slo_ok,
+                     diagnostics={"replayed": True} if self.replayed else {})
+
+
+def _rows_of_400_chars(name, n):
+    return [{"problem": "x" * 400}]
+
+
+def test_quality_gets_room():
+    """A context right-sized to the traffic must not make quality unscorable."""
+    saved = quality._load
+    quality._load = _rows_of_400_chars
+    try:
+        section("context_needed: longest prompt plus the generation budget")
+        prompt_tokens = len(quality._math_500_prompt({"problem": "x" * 400})) // 4
+        need = quality.context_needed(["math_500"])
+        check("prompt + max_tokens + 1", need == prompt_tokens + 1024 + 1, need)
+        check("a context of exactly that size passes run_benchmark's filter",
+              prompt_tokens < need - 1024)
+        check("a name this module does not own asks for nothing",
+              quality.context_needed(["leaderboard_ifeval"]) == 0)
+        check("the largest benchmark wins",
+              quality.context_needed(["leaderboard_ifeval", "math_500"]) == need)
+
+        section("measure: the run that died at lossless_complete")
+        tight = {"max_model_len": 1024, "max_num_batched_tokens": 1024}
+        ev = _TightContextEvaluator()
+        t = ev.measure(tight, probes=["goodput", "quality"], benchmarks=["math_500"],
+                       node_id="lossless_complete")
+        check("goodput was measured with no benchmark attached", ev.inner_benchmarks == [])
+        check("quality was scored under a second launch", len(ev.launched) == 1)
+        check("...with room for the generation", ev.scored_under == [2048], ev.scored_under)
+        check("...and a token budget vLLM accepts with chunked prefill off",
+              ev.launched[0]["max_num_batched_tokens"] == 2048, ev.launched[0])
+        check("the trial still describes the tight config", t.config == tight, t.config)
+        check("and carries the score", t.quality == {"math_500": 0.5}, t.quality)
+        check("and says where it came from",
+              t.diagnostics.get("quality_max_model_len") == 2048, t.diagnostics)
+
+        section("measure: no second launch when one is not needed")
+        ev = _TightContextEvaluator()
+        t = ev.measure({"max_model_len": 4096}, probes=["goodput", "quality"],
+                       benchmarks=["math_500"], node_id="kv_cache_fp8")
+        check("a context that fits scores in place",
+              ev.launched == [] and ev.scored_under == [4096], ev.scored_under)
+        ev = _TightContextEvaluator()
+        ev.measure(tight, probes=["goodput"], benchmarks=["math_500"], node_id="n")
+        check("no quality probe, no relaunch", ev.launched == [] and ev.scored_under == [])
+        ev = _TightContextEvaluator(slo_ok=False)
+        ev.measure(tight, probes=["quality"], benchmarks=["math_500"], node_id="n")
+        check("a config already out on goodput is not relaunched", ev.launched == [])
+        ev = _TightContextEvaluator(replayed=True)
+        ev.measure(tight, probes=["quality"], benchmarks=["math_500"], node_id="n")
+        check("a trial replayed from the journal is not relaunched", ev.launched == [])
+
+        section("measure: an unmeasurable quality is not keepable")
+        ev = _TightContextEvaluator(quality_launch_fails=True)
+        t = ev.measure(tight, probes=["quality"], benchmarks=["math_500"], node_id="n")
+        check("slo_ok goes false, so the walk cannot keep it ungated", t.slo_ok is False)
+        check("and the reason is recorded",
+              "out of memory" in t.diagnostics.get("quality_launch_error", ""), t.diagnostics)
+
+        section("measure: a model with no more context to give")
+        ev = _TightContextEvaluator()
+        ev.fp.model.max_model_len = 1024
+        ev.measure(tight, probes=["quality"], benchmarks=["math_500"], node_id="n")
+        check("scores in place, where run_benchmark refuses by name",
+              ev.launched == [] and ev.scored_under == [1024], ev.scored_under)
+    finally:
+        quality._load = saved
+
+
+# ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

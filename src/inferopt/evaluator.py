@@ -87,6 +87,8 @@ import httpx
 from inferopt.calibration import STORE
 from inferopt import leaderboard
 from inferopt.fingerprint import SLO, Fingerprint
+from inferopt.legality import repair
+from inferopt.quality import context_needed
 from goodput.driver import Req, _closed_loop, _load, _mt, _one
 from goodput.metrics import _reasons, summarize
 from inferopt.traverse import Trial
@@ -1203,7 +1205,91 @@ class VllmEvaluator:
                 concurrency: int | None = None,
                 levels: tuple[int, ...] | list[int] | None = None,
                 fixed_concurrency: int | None = None) -> Trial:
-        """Measure one config.
+        """Measure one config, scoring quality where the benchmark has room.
+
+        Goodput is always measured under `config` exactly. Quality is scored in
+        the same launch when the served context holds the benchmark, and under
+        a second launch with the context raised when it does not.
+        """
+        wants_quality = "quality" in probes and bool(benchmarks)
+        roomy = self._config_with_room(config, benchmarks) if wants_quality else None
+        trial = self._measure_served(
+            config, probes=probes, benchmarks=[] if roomy else benchmarks,
+            node_id=node_id, concurrency=concurrency, levels=levels,
+            fixed_concurrency=fixed_concurrency)
+        # A second launch is not spent on a trial that came from the journal, or
+        # on a config already out on goodput: neither can use the score.
+        if roomy is None or (trial.diagnostics or {}).get("replayed") or not trial.slo_ok:
+            return trial
+        return self._score_relaunched(trial, roomy, benchmarks, node_id)
+
+    def _config_with_room(self, config: dict, benchmarks: list[str]) -> dict | None:
+        """`config` with the context raised until `benchmarks` fit, or None when
+        they already do.
+
+        max_model_len_rightsize sizes the context to the TRAFFIC, and a
+        benchmark is not traffic: MATH-500 generates 1024 tokens, so under a
+        right-sized 1024 nothing can be scored and a walk died at
+        lossless_complete with two hours of launches behind it. Flooring the
+        right-sized value at the benchmark's need would let the instrument set
+        the deployed config. Quality is a property of the weights and the KV
+        dtype, not of max_model_len, so it gets its own launch and goodput
+        keeps the tight one.
+        """
+        served = int(config.get("max_model_len") or 0)
+        if not served:
+            return None
+        need = context_needed(benchmarks, self.fp.model.id) + CONTEXT_MARGIN_TOKENS
+        if served >= need:
+            return None
+        raised = min(-(-need // 1024) * 1024, self.fp.model.max_model_len)
+        if raised <= served:
+            # The model itself has no more context to give. Score in place and
+            # let run_benchmark say so, which it does precisely.
+            return None
+        return repair({**config, "max_model_len": raised}, log=self.log)[0]
+
+    def _score_relaunched(self, trial: Trial, roomy: dict,
+                          benchmarks: list[str], node_id: str) -> Trial:
+        """Fill in `trial.quality` from a launch that has room to score it."""
+        tag = self._launch_tag(f"{node_id}-quality", roomy)
+        t_start = time.time()
+        el = lambda: f"+{(time.time()-t_start)/60:4.1f}m"
+        self.log(f"        {el()} relaunching at max_model_len={roomy['max_model_len']} "
+                 f"to score {', '.join(benchmarks)}: "
+                 f"{trial.config.get('max_model_len')} fits the traffic, not the benchmark")
+        try:
+            with self._serve(roomy, tag) as model:
+                trial.quality = self._score(model, roomy, benchmarks, tag, el)
+        except LaunchError as e:
+            # NOT KEEPABLE. The walk skips the quality gate when a trial carries
+            # no scores, so a lossy config whose quality could not be measured
+            # would otherwise be kept ungated.
+            self.log(f"        quality launch failed: {e}")
+            trial.slo_ok = False
+            trial.diagnostics = {**(trial.diagnostics or {}),
+                                 "quality_launch_error": str(e)}
+            return trial
+        trial.diagnostics = {**(trial.diagnostics or {}),
+                             "quality_max_model_len": roomy["max_model_len"]}
+        return trial
+
+    def _launch_tag(self, node_id: str, config: dict) -> str:
+        # sha256, not hash(). Python randomises string hashing per process
+        # (PYTHONHASHSEED), so the same config produced a different launch
+        # directory on every invocation and the directories could not be
+        # correlated across runs. Same digest family as provenance.trial_stamp.
+        return (f"{node_id}-"
+                + hashlib.sha256(
+                    json.dumps(config, sort_keys=True, default=str).encode()
+                ).hexdigest()[:8])
+
+    def _measure_served(self, config: dict[str, Any], *, probes: list[str],
+                        benchmarks: list[str], node_id: str,
+                        concurrency: int | None = None,
+                        levels: tuple[int, ...] | list[int] | None = None,
+                        fixed_concurrency: int | None = None) -> Trial:
+        """Measure one config under one launch.
 
         `concurrency` is the operating point found by the stage 1.3 sweep. Every
         node is measured there rather than at an arbitrary offered load -- run
@@ -1218,10 +1304,6 @@ class VllmEvaluator:
         decoding is the mirror. Neither needs a special case once the peak is
         what gets compared.
         """
-        # sha256, not hash(). Python randomises string hashing per process
-        # (PYTHONHASHSEED), so the same config produced a different launch
-        # directory on every invocation and the directories could not be
-        # correlated across runs. Same digest family as provenance.trial_stamp.
         # getattr, not self.replay: subclasses that bypass __init__ to fake a
         # server are a normal thing here, and one of them has done so since
         # before this hook existed. Same defensive read as settle_s below.
@@ -1237,10 +1319,7 @@ class VllmEvaluator:
                          f"({t.goodput:.1f} tok/s)")
                 return t
 
-        tag = (f"{node_id}-"
-               + hashlib.sha256(
-                   json.dumps(config, sort_keys=True, default=str).encode()
-               ).hexdigest()[:8])
+        tag = self._launch_tag(node_id, config)
         t_start = time.time()
         el = lambda: f"+{(time.time()-t_start)/60:4.1f}m"
         changed = {k: v for k, v in config.items() if k != "model"}
