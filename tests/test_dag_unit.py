@@ -1311,10 +1311,48 @@ def test_strategies():
     check("a launch with no goodput counts as failed", r.failed_launches == 1,
           f"{r.failed_launches} -- a dead launch cost the same as a live one")
 
+    section("strategies: the walk writes the runner's journal")
+    import tempfile
+    from inferopt import resume
+    dag = {"traversal": {"budget_guard": {"max_launches": 9, "max_minutes": 9}},
+           "nodes": [
+        {"id": "incumbent", "class": "root", "status": "active",
+         "on_keep": ["prefix_caching"]},
+        {"id": "prefix_caching", "class": "lossless", "status": "active",
+         "action": {"set": {"enable_prefix_caching": True}}, "probes": ["goodput"],
+         "on_keep": ["frontier"], "on_revert": ["frontier"]},
+        {"id": "frontier", "class": "terminal", "status": "active"}]}
+    with tempfile.TemporaryDirectory() as td:
+        runner = _Runner({})
+        runner.ev = _RawEvaluator({"prefix_caching": 20.0})
+        runner.journal = Path(td) / "trials.jsonl"
+        runner.stamp = {"model_sha": "abc"}
+        SequentialStrategy(dag).search(_ctx(), runner, {"max_model_len": 4096},
+                                       log=lambda *a: None)
+        plan = resume.plan(td, runner.stamp)
+        check("a second run finds every launch on disk",
+              plan.resuming and plan.n_trials == 2, plan.reason)
+        check("stamped with the runner's identity, so resume can trust them",
+              all(r["provenance"] == runner.stamp for r in plan.cache.values()))
+
 
 class _T:
     def __init__(self, gp):
         self.goodput = gp
+
+
+class _RawEvaluator:
+    """What the walk drives: measure(config, *, probes, benchmarks, node_id, ...)."""
+
+    def __init__(self, script: dict, default: float = 10.0):
+        self.script, self.default = script, default
+
+    def measure(self, config: dict, *, probes, benchmarks, node_id, **_):
+        from inferopt.traverse import Trial
+        gp = self.script.get(node_id, self.default)
+        return Trial(node_id=node_id, config=dict(config), goodput=gp,
+                     ttft_p99_ms=100.0, itl_p99_ms=10.0, memory_gb=1.0,
+                     slo_ok=bool(gp), concurrency=8)
 
 
 class _Runner:

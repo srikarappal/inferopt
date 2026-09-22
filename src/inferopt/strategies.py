@@ -135,11 +135,16 @@ class SequentialStrategy:
         evaluator = getattr(runner, "ev", runner)
         t0 = time.time()
         ctx.incumbent = dict(seed)
+        # The walk writes the runner's journal and stamps the runner's identity
+        # on every trial, or resume has nothing to replay. Through api.optimize
+        # neither was passed, so a run that died at lossless_complete restarted
+        # from the seed and paid for every lossless launch a second time.
         res = traverse(self.dag, ctx, evaluator, log=log,
                        lossless_only=self.lossless_only,
                        baseline=self.baseline,
                        concurrency=self.concurrency,
-                       provenance=self.provenance,
+                       provenance=self.provenance or getattr(runner, "stamp", None),
+                       journal=getattr(runner, "journal", None),
                        force_benchmarks=self.force_benchmarks)
         trials = ([self.baseline] if self.baseline else []) + list(res.trials)
         kept = [t for t in res.trials if t.kept]
