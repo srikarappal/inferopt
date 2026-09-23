@@ -182,6 +182,31 @@ Goodput is samples a second that met the latency target; the frontier axes
 are seconds per sample against samples an hour a GPU. Stage 1.2 does not
 exist: AIConfigurator is LLM only, so the plot is measured points alone.
 
+## Answered by the first run (LLaDA2.0-mini on the GB10, 23 Sep 2026)
+
+- SGLang 0.5.20 installs on aarch64 sm121 from wheels: it pins torch 2.13.0
+  and flashinfer 0.6.18, both already in the image, and sgl-kernel ships an
+  aarch64 wheel. Two traps: `cuda-tile` is an NVIDIA wheel stub that fetches
+  from pypi.nvidia.com and fails its own hash check on a bad link (install it
+  from that index directly), and the install drags `nvidia-cuda-runtime` back
+  to 13.0 against nvcc 13.4, which breaks flashinfer's JIT the same way it
+  once broke vLLM's; re-pin 13.4 after.
+- A dLLM streams one BLOCK per chunk. The driver counted chunks as tokens and
+  read a 40 tokens/s server as 1.3. Fixed by asking for
+  `stream_options.continuous_usage_stats` and crediting each chunk with the
+  tokens it carried (goodput `c361167`); exact for autoregressive streams too.
+- Inter token latency means what it did: the driver's per request ITL is
+  (latency minus TTFT) over completion tokens, a mean per token, so a block
+  arriving at once does not distort it.
+- CUDA graph capture overflows flashinfer's workspace on a dLLM at SGLang's
+  default capture batch sizes: a dLLM decode step is a prefill-shaped batch
+  of requests x block tokens. SGLang's own tests cap capture at
+  `--cuda-graph-bs-decode 1 2 3 4`. The engine's diffusion defaults need a
+  cap (`cuda_graph_max_bs_decode`), and graph_capture is then a real node.
+- Every translated flag was in `sglang serve --help` (538 flags), the server
+  accepted them all, and a launch that dies is recorded as goodput 0 and the
+  walk moves on, as with vLLM.
+
 ## What has to be verified on a machine before it is believed
 
 - SGLang wheels on the DGX (aarch64, sm121). The target is x86 H100 and
