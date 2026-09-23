@@ -3023,14 +3023,18 @@ def test_diffusion():
     eng = engines.SglangDiffusionEngine()
     argv = eng.translate({"model": "m", "num_inference_steps": 4, "guidance_scale": 1.0,
                           "enable_torch_compile": True, "quantization": "fp8",
-                          "cache_dit_config": {"residual_diff_threshold": 0.08},
+                          "enable_cache_dit": True, "cache_dit_params": {"residual_diff_threshold": 0.24},
                           "batching_max_size": 4})
     text = " ".join(argv)
-    check("request keys never become flags", "num-inference-steps" not in text and "guidance" not in text, text)
-    check("server keys do, JSON for a document",
+    check("request keys never become flags, cache-dit included",
+          "num-inference-steps" not in text and "guidance" not in text and "cache-dit" not in text, text)
+    check("server keys do",
           "--enable-torch-compile" in text and "--quantization fp8" in text
-          and '--cache-dit-config {"residual_diff_threshold": 0.08}' in text
           and "--batching-max-size 4" in text, text)
+    cached = D.request_body(shape, {"enable_cache_dit": True,
+                                    "cache_dit_params": {"residual_diff_threshold": 0.24}}, "a cat", 1)
+    check("cache-dit travels with the request on a native pipeline",
+          cached["enable_cache_dit"] is True and cached["cache_dit_params"]["residual_diff_threshold"] == 0.24)
     fp = _ctx().fingerprint.model_copy(update={"diffusion": shape})
     check("a pipeline picks the diffusion engine", engines.engine_for(fp).name == "sglang-diffusion")
     named = engines.SglangDiffusionEngine(model="m/p")

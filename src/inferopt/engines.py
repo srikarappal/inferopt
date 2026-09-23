@@ -429,6 +429,10 @@ class SglangDiffusionEngine(SglangEngine):
     REQUEST_KEYS = frozenset({
         "num_inference_steps", "guidance_scale", "true_cfg_scale", "width", "height",
         "num_frames", "fps", "seed", "negative_prompt", "enable_teacache", "flow_shift",
+        # Cache-DiT on a native pipeline is a per request opt-in with knobs;
+        # --cache-dit-config applies to the diffusers backend only (read from
+        # the installed 0.5.20: diffusers_pipeline.py and sampling_params.py).
+        "enable_cache_dit", "cache_dit_params",
     })
     REDUCE = {
         "sglang:diffusion_num_running_reqs": "max",

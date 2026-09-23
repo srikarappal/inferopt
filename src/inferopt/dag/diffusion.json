@@ -234,19 +234,23 @@
         "dit_fp8"
       ],
       "applicable_when": null,
-      "rationale": "Between adjacent steps most blocks' residuals change little; Cache-DiT reuses them and computes only the ones that moved past a threshold. SGLang calls it lossless; it changes the output, so here it is lossy and scored. The threshold is the knob and the sweep brackets it. cache_dit_config is a JSON document the server takes on its flag.",
+      "rationale": "Between adjacent steps most blocks' residuals change little; Cache-DiT reuses them and computes only the ones that moved past a threshold (DBCache R). SGLang calls it lossless; it changes the output, so here it is lossy and scored. On a native pipeline it is a per request opt-in, enable_cache_dit with cache_dit_params; --cache-dit-config reaches only the diffusers backend, found by two launches that measured nothing. The library default is a 0.24 threshold after 4 warm-up steps; a HIGHER threshold skips more, and an 8 step model needs fewer warm-up steps to have anything to skip.",
       "action": {
-        "set": {}
+        "set": {
+          "enable_cache_dit": true
+        }
       },
       "sweep": [
         {
-          "cache_dit_config": {
-            "residual_diff_threshold": 0.08
+          "cache_dit_params": {
+            "residual_diff_threshold": 0.24,
+            "max_warmup_steps": 2
           }
         },
         {
-          "cache_dit_config": {
-            "residual_diff_threshold": 0.16
+          "cache_dit_params": {
+            "residual_diff_threshold": 0.4,
+            "max_warmup_steps": 2
           }
         }
       ],
@@ -263,8 +267,7 @@
       ],
       "on_revert": [
         "steps"
-      ],
-      "verify": "the config document's keys are cache-dit's, not read from a launch that worked; a wrong key fails the launch and is recorded, not silently ignored"
+      ]
     },
     {
       "id": "steps",

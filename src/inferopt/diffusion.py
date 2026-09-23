@@ -179,7 +179,8 @@ def request_body(shape: DiffusionShape, config: dict, prompt: str, seed: int) ->
             "height": int(config.get("height", shape.height)),
             "num_inference_steps": int(config.get("num_inference_steps", shape.steps)),
             "guidance_scale": float(config.get("guidance_scale", shape.guidance_scale))}
-    for key in ("enable_teacache", "flow_shift", "negative_prompt", "true_cfg_scale"):
+    for key in ("enable_teacache", "flow_shift", "negative_prompt", "true_cfg_scale",
+                "enable_cache_dit", "cache_dit_params"):
         if key in config:
             body[key] = config[key]
     if shape.kind == "video":
