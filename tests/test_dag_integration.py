@@ -223,6 +223,22 @@ def test_quality_gate():
     check("the quality gate is keyed on class == 'lossy'", "l" in kept(res),
           f"kept={kept(res)} -- documents that a mislabelled lossy node is ungated")
 
+    # THE BEST VARIANT THAT PASSES. dllm_threshold measured 0.8 at +235% over
+    # budget and 0.9 at +80% within it; gating only the fastest reverted the
+    # whole node to +0%.
+    d3 = mkdag([node("sweep", cls="lossy", quality_benchmarks=["math_500"],
+                     sweep=[{"t": 0.9}, {"t": 0.8}])])
+    c5 = ctx(); c5.quality_baseline = {"math_500": 0.66}
+    c5.slo.quality_budget = 0.05
+    res, ev = run(d3, {"incumbent": 40.7,
+                       "sweep": [{"goodput": 73.3, "quality": {"math_500": 0.63}},
+                                 {"goodput": 136.3, "quality": {"math_500": 0.60}}]}, c=c5)
+    check("a sweep keeps the fastest variant the budget allows", "sweep" in kept(res),
+          f"kept={kept(res)} -- 0.8 fails the gate, 0.9 passes and was never asked")
+    winner = next(t for t in res.trials if t.node_id == "sweep" and t.kept)
+    check("and it is the passing one, not the fastest",
+          winner.goodput == 73.3 and winner.config.get("t") == 0.9, winner.config)
+
 
 def test_budget_guard():
     section("budget guard stops before spending")

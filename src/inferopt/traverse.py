@@ -219,6 +219,14 @@ def _value(v: Any, ctx: Context) -> Any:
             f"literal string.") from None
 
 
+def _variant_label(t: Trial, node: dict) -> str:
+    """The keys a sweep varied, with this trial's values, for a log line."""
+    keys = sorted({k for entry in (node.get("sweep") or []) for k in entry})
+    if not keys:
+        return t.node_id
+    return ", ".join(f"{k}={t.config.get(k)}" for k in keys)
+
+
 def _variants(node, base: dict, ctx: Context) -> list[dict]:
     """base config + the node's action, then one variant per sweep entry."""
     applied = dict(base)
@@ -462,18 +470,21 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
 
         # --- keep or revert ---
         eligible = [t for t in measured if t.slo_ok]
-        best = max(eligible, key=lambda t: t.goodput) if eligible else None
         threshold = incumbent_goodput * (1 + band)
-        keep = bool(best) and (incumbent_goodput == 0 or best.goodput > threshold)
 
-        if keep and node.get("class") == "lossy" and best.quality:
-            # Two thresholds, and both are needed. tolerance is the measured
-            # noise floor: a delta under it is not real, so rejecting on it
-            # would reject on noise. budget is the user's allowance: a delta
-            # over it is unacceptable however real. Between them the loss is
-            # genuine AND affordable, which is exactly a frontier point.
+        def within_quality_budget(t: Trial) -> bool:
+            """Whether a lossy trial's measured loss is one the user allowed.
+
+            Two thresholds, and both are needed. tolerance is the measured
+            noise floor: a delta under it is not real, so rejecting on it
+            would reject on noise. budget is the user's allowance: a delta
+            over it is unacceptable however real. Between them the loss is
+            genuine AND affordable, which is exactly a frontier point.
+            """
+            if node.get("class") != "lossy" or not t.quality:
+                return True
             budget = ctx.slo.quality_budget
-            for b, v in best.quality.items():
+            for b, v in t.quality.items():
                 ref = ctx.quality_baseline.get(b)
                 # v is None when a benchmark was requested but could not be
                 # scored -- a gated dataset, a missing harness. That is not a
@@ -487,12 +498,27 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 if delta <= tol:
                     continue                       # within noise; not a real loss
                 if budget is not None and delta > budget:
-                    keep = False
                     log(f"        quality gate: {b} {ref:.4f} -> {v:.4f} "
-                        f"(-{delta:.4f}) exceeds allow_loss {budget:.1%}")
-                    break
+                        f"(-{delta:.4f}) exceeds allow_loss {budget:.1%}"
+                        f"  [{_variant_label(t, node)}]")
+                    return False
                 log(f"        quality:      {b} -{delta:.4f} "
-                    f"(> tolerance {tol:.4f}, within budget)")
+                    f"(> tolerance {tol:.4f}, within budget)  [{_variant_label(t, node)}]")
+            return True
+
+        # THE BEST VARIANT THAT PASSES, not the best variant. A sweep's fastest
+        # point is the one most likely to have spent quality to get there, and
+        # gating only that one threw away the rest of the sweep: dllm_threshold
+        # measured 0.8 at +235% over budget and 0.9 at +80% within it, and the
+        # node reverted to +0% because 0.8 failed the gate and 0.9 was never
+        # asked. Variants are tried fastest first, so the answer is the fastest
+        # one the user's budget allows.
+        best = None
+        for candidate in sorted(eligible, key=lambda t: -t.goodput):
+            if within_quality_budget(candidate):
+                best = candidate
+                break
+        keep = bool(best) and (incumbent_goodput == 0 or best.goodput > threshold)
 
         if best and node.get("class") == "checkpoint" and best.quality:
             # lossless_complete: quality cannot have moved, so whatever moved IS
