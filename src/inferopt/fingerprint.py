@@ -66,6 +66,9 @@ class ModelFingerprint(BaseModel):
     decoding: str = Field("autoregressive", description=(
         "config | autoregressive, or diffusion for a masked diffusion LM (LLaDA, SDAR, "
         "DiffusionGemma). Gates the dLLM subtree and selects the engine that can serve it"))
+    dllm_block_size: int = Field(0, description=(
+        "config | positions denoised together, the checkpoint's own default as SGLang "
+        "reads it: LLaDA 2 32, SDAR 4, DiffusionGemma its canvas_length. 0 when not a dLLM"))
     is_dense: bool = Field(True, description="config | False for MoE; gates the expert-placement subtree")
     n_params_b: float = Field(description="config | parameter count in billions")
     n_layers: int = Field(description="config | num_hidden_layers")

@@ -786,6 +786,7 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
         id=req.model,
         architecture=architecture,
         decoding=decoding_of(architecture),
+        dllm_block_size=dllm_block_size_of(architecture, c),
         is_dense=n_experts == 0,
         n_params_b=round(n_params_b, 2),
         n_layers=n_layers, hidden_size=c["hidden_size"],
@@ -824,12 +825,28 @@ def detect_lora(req: InferOptRequest) -> LoraFingerprint:
 # "Diffusion": Dream's config says DreamModel, LLaDA 2's says LLaDA2MoeModelLM.
 DIFFUSION_ARCHITECTURES = ("LLaDA", "SDAR", "DiffusionGemma", "DreamModel")
 
+# The block each ships with, as SGLang's DllmConfig reads it (srt/dllm/config.py,
+# main, 23 Sep 2026). DiffusionGemma's is its config's canvas_length. An
+# architecture absent here is one SGLang refuses to serve, so 0 gates the block
+# node off rather than sweeping around a number nobody measured.
+DLLM_BLOCK_SIZES = {
+    "LLaDA2MoeModelLM": 32,
+    "SDARForCausalLM": 4,
+    "SDARMoeForCausalLM": 4,
+}
+
 
 def decoding_of(architecture: str) -> str:
     """How this model produces tokens, from its architecture name."""
     if any(architecture.startswith(prefix) for prefix in DIFFUSION_ARCHITECTURES):
         return "diffusion"
     return "autoregressive"
+
+
+def dllm_block_size_of(architecture: str, config: dict) -> int:
+    if architecture.startswith("DiffusionGemma"):
+        return int(config.get("canvas_length") or 256)
+    return DLLM_BLOCK_SIZES.get(architecture, 0)
 
 
 def build_fingerprint(req: InferOptRequest) -> tuple[Fingerprint, SLO]:

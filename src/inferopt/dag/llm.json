@@ -32,15 +32,15 @@
     "revert_semantics": "reverting discards the node's effect on the incumbent, NOT its measurements. A reverted config is still a Pareto candidate and may be the operating point the user wants.",
     "budget_guard": {
       "max_launches": {
-        "default": 24,
-        "multi_lora": 30
+        "default": 30,
+        "multi_lora": 36
       },
       "max_minutes": {
         "default": 480,
         "multi_lora": 520
       },
       "on_exceed": "stop traversal, emit the frontier from what was measured, list unvisited nodes",
-      "note": "Raised from 20/26 when max_num_batched_tokens added two launches. The guard is a backstop against a DAG that cannot finish, not a target -- graph_capture's hint also dropped 40 -> 9 after measurement, so the minute estimate fell by ~31."
+      "note": "Raised from 24/30 when the dLLM subtree added six launches; from 20/26 when max_num_batched_tokens added two. The guard is a backstop against a DAG that cannot finish, not a target, and a caller may override it (api.optimize max_launches, max_minutes)."
     },
     "skip_semantics": "A node is not executed when status != 'active' OR applicable_when evaluates false. In both cases the traverser follows its on_keep edge straight through. This keeps TODO and inapplicable nodes wired into the spine so enabling one is a predicate or status change, not a rewiring."
   },
@@ -396,7 +396,7 @@
       "requires": [
         "kv_block_size"
       ],
-      "applicable_when": "workload.mean_output_tokens > 64",
+      "applicable_when": "workload.mean_output_tokens > 64 and fingerprint.model.decoding != \"diffusion\"",
       "rationale": "Rejection sampling preserves the target distribution, so this is distributionally lossless. Needs no draft model. Helps decode only - pointless on prefill-dominated traffic. Gated on mean OUTPUT LENGTH rather than the decode token fraction: the token ratio understates decode's share of wall clock by roughly two orders of magnitude, so a 0.4 token-ratio threshold would exclude workloads that are overwhelmingly decode-bound in time.",
       "action": {
         "set": {}
@@ -522,12 +522,41 @@
       "cost_launches": 1,
       "cost_minutes_hint": 9,
       "on_keep": [
+        "dllm_fdfo"
+      ],
+      "on_revert": [
+        "dllm_fdfo"
+      ],
+      "cost_note": "~9 min measured on GB10/Qwen3-14B across runs 4, 7 and 9. Was 40, carried over from a different model on different hardware and never re-checked."
+    },
+    {
+      "id": "dllm_fdfo",
+      "title": "dLLM block scheduling: synchronous against first-done-first-out",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "graph_capture"
+      ],
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\"",
+      "rationale": "A masked diffusion LM denoises a block of tokens over several forward passes, and requests in a batch finish their blocks at different passes. SGLang's default, first-done-first-out, hands a finished block back and refills the slot; synchronous scheduling waits for the whole batch. Which wins depends on how uneven the workload's block completion is, so it is measured rather than assumed. The incumbent carries the default, so this node measures the other setting.",
+      "action": {
+        "set": {
+          "dllm_fdfo": false
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
         "lossless_complete"
       ],
       "on_revert": [
         "lossless_complete"
       ],
-      "cost_note": "~9 min measured on GB10/Qwen3-14B across runs 4, 7 and 9. Was 40, carried over from a different model on different hardware and never re-checked."
+      "engine_note": "dllm_* keys are emitted only by the SGLang engine; vLLM does not serve a diffusion LM, so the fingerprint routes these models to SGLang before any node runs."
     },
     {
       "id": "lossless_complete",
@@ -535,7 +564,7 @@
       "class": "checkpoint",
       "status": "active",
       "requires": [
-        "graph_capture"
+        "dllm_fdfo"
       ],
       "cost_launches": 1,
       "note": "Emit the lossless frontier before entering the lossy branch -- if the budget guard fires, the run still delivers a complete result here.\n\nALSO measures the quality tolerance, for free in the useful sense: lossless nodes cannot move quality by definition, so the difference between quality here and quality at stage 1.3 IS the noise, and it spans the whole lossless traversal -- every launch, config change and thermal state in between, which is exactly the variation the lossy gate has to survive. A dedicated repeat would measure less.\n\nBudgeted at 1 launch conservatively. When the preceding node was KEPT, the live server already holds the incumbent config and the probe is free; only a REVERTED predecessor requires a relaunch, since its server holds a rejected config rather than the incumbent.",
@@ -652,7 +681,7 @@
         "weight_autoquantize"
       ],
       "on_revert": [
-        "frontier"
+        "dllm_threshold"
       ],
       "revert_note": "Reverting means staying merged, which leaves no published checkpoint to quantize from. The lossy branch ends here with KV quantization already applied; weight quantization needs the calibration pipeline (see future.conversion_pipeline).",
       "quality_benchmarks_todo": [
@@ -737,6 +766,113 @@
         "equivalence"
       ],
       "cost_launches": 2,
+      "on_keep": [
+        "dllm_threshold"
+      ],
+      "on_revert": [
+        "dllm_threshold"
+      ]
+    },
+    {
+      "id": "dllm_threshold",
+      "title": "dLLM commit threshold",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "retune_batching_after_weight",
+        "lora_unmerge_for_weight_quant"
+      ],
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\"",
+      "rationale": "Each denoising pass commits the masked positions whose confidence clears a threshold, 0.95 by default. Lowering it commits more tokens per pass, so a block finishes in fewer passes and the forward cost per token falls; it also commits tokens the model was less sure of, so quality can move. That is the trade the lossy branch exists to measure, and it is the largest single lever a dLLM has.",
+      "action": {
+        "set": {
+          "dllm_algorithm": "LowConfidence"
+        }
+      },
+      "sweep": [
+        {
+          "dllm_threshold": 0.9
+        },
+        {
+          "dllm_threshold": 0.8
+        }
+      ],
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "dllm_block_size"
+      ],
+      "on_revert": [
+        "dllm_block_size"
+      ]
+    },
+    {
+      "id": "dllm_block_size",
+      "title": "dLLM block size",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "dllm_threshold"
+      ],
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\" and fingerprint.model.dllm_block_size > 0",
+      "rationale": "The block is how many positions are denoised together. A larger block amortises each forward pass over more tokens and lets more commit per pass; it also widens what every token in the block is conditioned on before its neighbours are known, which is where quality goes. The model ships a default (LLaDA 2 at 32, SDAR at 4); one step up and one down brackets it.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "dllm_block_size": "int(fingerprint.model.dllm_block_size * 2)"
+        },
+        {
+          "dllm_block_size": "max(4, int(fingerprint.model.dllm_block_size / 2))"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "dllm_algorithm"
+      ],
+      "on_revert": [
+        "dllm_algorithm"
+      ],
+      "sweep_note": "fingerprint.model.dllm_block_size is the checkpoint's own default, read the way SGLang reads it, so the sweep brackets what the model shipped with."
+    },
+    {
+      "id": "dllm_algorithm",
+      "title": "dLLM decoding algorithm",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "dllm_block_size"
+      ],
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\"",
+      "rationale": "JointThreshold commits on confidence and then allows a bounded number of post-edit passes to revise committed tokens, against LowConfidence which commits once. Same budget, different behaviour under a lowered threshold; measured last so it runs on whatever threshold and block the walk kept.",
+      "action": {
+        "set": {
+          "dllm_algorithm": "JointThreshold"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500"
+      ],
+      "cost_launches": 1,
       "on_keep": [
         "frontier"
       ],

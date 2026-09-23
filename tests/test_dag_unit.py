@@ -2930,6 +2930,42 @@ def test_engines():
     check("an explicit name wins", engines.engine_for(ctx.fingerprint, "vllm").name == "vllm")
     check("an unknown name is refused", raises(lambda: engines.engine_for(None, "trt"), ValueError))
 
+    section("dag: the dLLM subtree is there for a diffusion LM and silent otherwise")
+    from inferopt.predicates import Predicate
+    dag = json.loads(_DAG.read_text())
+    by_id = {n["id"]: n for n in dag["nodes"]}
+    dllm_nodes = [i for i in by_id if i.startswith("dllm_")]
+    check("four dLLM nodes", sorted(dllm_nodes) == ["dllm_algorithm", "dllm_block_size",
+                                                    "dllm_fdfo", "dllm_threshold"], dllm_nodes)
+    ar = _ctx()
+    check("every one skips an autoregressive model",
+          not any(Predicate(by_id[i]["applicable_when"]).evaluate(ar) for i in dllm_nodes))
+    check("and speculative decoding skips a diffusion one",
+          'decoding != "diffusion"' in by_id["spec_decode_ngram"]["applicable_when"])
+    dl = _ctx()
+    dl.fingerprint.model.decoding = "diffusion"
+    dl.fingerprint.model.dllm_block_size = 32
+    check("every one applies to a diffusion model with a known block",
+          all(Predicate(by_id[i]["applicable_when"]).evaluate(dl) for i in dllm_nodes))
+    dl.fingerprint.model.dllm_block_size = 0
+    check("an unknown block gates only the block node off",
+          not Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(dl)
+          and Predicate(by_id["dllm_threshold"]["applicable_when"]).evaluate(dl))
+    check("the lossy chain sits after the weight retune and ends at the frontier",
+          by_id["retune_batching_after_weight"]["on_keep"] == ["dllm_threshold"]
+          and by_id["dllm_algorithm"]["on_keep"] == ["frontier"])
+    check("the scheduling node sits before the lossless checkpoint",
+          by_id["graph_capture"]["on_keep"] == ["dllm_fdfo"]
+          and by_id["dllm_fdfo"]["on_keep"] == ["lossless_complete"])
+
+    section("fingerprint: the block a dLLM ships with")
+    from inferopt.request import dllm_block_size_of
+    check("LLaDA 2 is 32", dllm_block_size_of("LLaDA2MoeModelLM", {}) == 32)
+    check("DiffusionGemma reads its canvas",
+          dllm_block_size_of("DiffusionGemmaForBlockDiffusion", {"canvas_length": 128}) == 128)
+    check("a model SGLang does not serve has no block",
+          dllm_block_size_of("DreamModel", {}) == 0 and dllm_block_size_of("Qwen3ForCausalLM", {}) == 0)
+
     section("engines: the evaluator carries one")
     class Bare(VllmEvaluator):
         def __init__(self, fp):
