@@ -105,10 +105,11 @@ def runs(*parts: str) -> Path:
     return workspace("runs", *parts)
 
 
-def default_dag() -> Path:
-    """The shipped DAG, unless the workspace overrides it with its own."""
-    local = workspace("dag", "llm.json")
-    return local if local.exists() else package_file("dag", "llm.json")
+def default_dag(modality: str = "llm") -> Path:
+    """The shipped DAG for a modality, unless the workspace overrides it."""
+    name = f"{modality}.json"
+    local = workspace("dag", name)
+    return local if local.exists() else package_file("dag", name)
 
 
 def describe() -> str:

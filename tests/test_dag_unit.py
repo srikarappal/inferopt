@@ -2995,10 +2995,134 @@ def test_engines():
 
 
 # ==========================================================================
+def test_diffusion():
+    """Image and video on the same machinery; frames are the token."""
+    import asyncio, io, tempfile
+    from contextlib import contextmanager
+    from pathlib import Path
+    from inferopt import diffusion as D, engines
+    from inferopt.fingerprint import Context, DiffusionShape, Fingerprint, LoraFingerprint, SLO
+    from inferopt.predicates import Predicate
+
+    shape = DiffusionShape(kind="image", transformer_class="ZImageTransformer2DModel",
+                           transformer_params_b=6.0, text_encoder_arch="Qwen3Model",
+                           text_encoder_params_b=4.0, vae_class="AutoencoderKL", weights_gb=20.0,
+                           width=1024, height=1024, steps=8, guidance_scale=1.0, distilled=True)
+    video = shape.model_copy(update={"kind": "video", "transformer_class": "WanTransformer3DModel",
+                                     "frames": 81, "fps": 16, "steps": 30, "guidance_scale": 5.0,
+                                     "distilled": False, "width": 832, "height": 480})
+
+    section("diffusion: the request carries the sample, the flags carry the server")
+    body = D.request_body(shape, {"num_inference_steps": 4}, "a cat", 7)
+    check("image: steps from the config, size from the workload, b64 back",
+          body["num_inference_steps"] == 4 and body["width"] == 1024
+          and body["response_format"] == "b64_json" and body["seed"] == 7, body)
+    vbody = D.request_body(video, {}, "a cat", 7)
+    check("video: frames and fps travel, no b64",
+          vbody["num_frames"] == 81 and vbody["fps"] == 16 and "response_format" not in vbody, vbody)
+    eng = engines.SglangDiffusionEngine()
+    argv = eng.translate({"model": "m", "num_inference_steps": 4, "guidance_scale": 1.0,
+                          "enable_torch_compile": True, "quantization": "fp8",
+                          "cache_dit_config": {"residual_diff_threshold": 0.08},
+                          "batching_max_size": 4})
+    text = " ".join(argv)
+    check("request keys never become flags", "num-inference-steps" not in text and "guidance" not in text, text)
+    check("server keys do, JSON for a document",
+          "--enable-torch-compile" in text and "--quantization fp8" in text
+          and '--cache-dit-config {"residual_diff_threshold": 0.08}' in text
+          and "--batching-max-size 4" in text, text)
+    fp = _ctx().fingerprint.model_copy(update={"diffusion": shape})
+    check("a pipeline picks the diffusion engine", engines.engine_for(fp).name == "sglang-diffusion")
+
+    section("diffusion: goodput counts frames of samples inside the target")
+    def sample(latency_s, frames=1, ok=True):
+        s = D.Sample("p", 1); s.frames = frames
+        s.done = s.start + latency_s
+        if not ok: s.error = "HTTP 500"
+        return s
+    med = D.summarise([sample(2.0), sample(4.0), sample(9.0), sample(1.0, ok=False)], 60.0, 5000)
+    check("three completed, one failed", med["completed"] == 3 and med["failed"] == 1, med)
+    check("two of three met 5 s", abs(med["slo_attainment"] - 2 / 3) < 1e-9, med)
+    check("goodput is their frames over the window", abs(med["goodput_frames_s"] - 2 / 60) < 1e-9, med)
+    check("p99 is the slowest that completed", med["latency_p99_s"] == 9.0, med)
+    vmed = D.summarise([sample(30.0, frames=81)], 120.0, 60000)
+    check("a clip counts its frames", abs(vmed["goodput_frames_s"] - 81 / 120) < 1e-9, vmed)
+
+    section("diffusion: equivalence is PSNR against the baseline render")
+    from PIL import Image
+    def png(shade):
+        buf = io.BytesIO(); Image.new("RGB", (8, 8), (shade, shade, shade)).save(buf, "PNG"); return buf.getvalue()
+    check("identical renders are infinitely alike", D.psnr_db(png(100), png(100)) == float("inf"))
+    check("a different render is not", D.psnr_db(png(100), png(120)) < D.EQUIVALENT_PSNR_DB)
+
+    section("diffusion: the DAG gates on the sample")
+    d = json.loads((Path(_DAG).parent / "diffusion.json").read_text())
+    by = {n["id"]: n for n in d["nodes"]}
+    ctx_img = Context(fingerprint=fp, slo=SLO(ttft_p99_ms=20000, quality_budget=0.05))
+    check("a distilled model skips the guidance node",
+          not Predicate(by["guidance"]["applicable_when"]).evaluate(ctx_img))
+    ctx_vid = Context(fingerprint=fp.model_copy(update={"diffusion": video}), slo=SLO())
+    check("a guided model sweeps it", Predicate(by["guidance"]["applicable_when"]).evaluate(ctx_vid))
+    from inferopt.traverse import _value
+    check("the step sweep is relative to the customer's steps",
+          _value(by["steps"]["sweep"][1]["num_inference_steps"], ctx_vid) == 15)
+    check("frontier is terminal and everything reaches it",
+          by["frontier"]["class"] == "terminal" and by["guidance"]["on_keep"] == ["frontier"])
+
+    section("diffusion: the evaluator turns a sweep into a Trial in frames")
+    class Fake(D.DiffusionEvaluator):
+        def __init__(self, shape, run_dir):
+            self.fp = fp.model_copy(update={"diffusion": shape}); self.shape = shape
+            self.slo = SLO(ttft_p99_ms=5000, quality_budget=0.05)
+            self.engine = engines.SglangDiffusionEngine(); self.log = lambda *a: None
+            self.run_dir = Path(run_dir); self.base_url = "http://x"; self.prompts = ["a", "b"]
+            self.replay = None; self.baseline_dir = self.run_dir / "baseline_samples"
+            self.launched = []
+            class _S:
+                def score(self, prompts, pngs): return 0.21
+            self.scorer = _S()
+        @contextmanager
+        def _serve(self, config, tag):
+            self.launched.append(config); yield "m"
+        def _render_probe_set(self, config):
+            out = []
+            for i, p in enumerate(self.prompts):
+                s = D.Sample(p, i); s.done = s.start + 1.0
+                s.image_png = png(100 if config.get("quantization") != "fp8" else 140)
+                out.append(s)
+            return out
+        def _gpu_memory_gb(self): return 1.0
+
+    async def fake_loop(base_url, shape, config, prompts, concurrency, window_s, seed_base=1000,
+                        latency_target_ms=None):
+        per = 2.0 * concurrency ** 0.5
+        n = int(window_s / per) * concurrency
+        return D.summarise([sample(per) for _ in range(n)], window_s, latency_target_ms)
+    saved = D.closed_loop
+    D.closed_loop = fake_loop
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ev = Fake(shape, td)
+            t = ev.measure({"num_inference_steps": 8}, probes=["goodput"], benchmarks=[], node_id="incumbent")
+            check("goodput is frames a second at the best level", t.goodput > 0 and t.concurrency in (1, 2, 4, 8), (t.goodput, t.concurrency))
+            check("latency lands where the plot reads it: ttft is the sample, itl the frame",
+                  t.ttft_p99_ms == t.itl_p99_ms and t.diagnostics["unit"] == "frames")
+            check("the incumbent's renders are the baseline", (Path(td) / "baseline_samples" / "0.png").exists())
+            t2 = ev.measure({"enable_torch_compile": True}, probes=["goodput", "equivalence"], benchmarks=[], node_id="torch_compile")
+            check("a lossless node that renders the same has zero divergence", t2.equivalence_divergence == 0.0, t2.equivalence_divergence)
+            t3 = ev.measure({"quantization": "fp8"}, probes=["goodput", "quality"], benchmarks=["pickscore"], node_id="dit_fp8")
+            check("a lossy node is scored", t3.quality == {"pickscore": 0.21}, t3.quality)
+            check("a video clip's per frame time divides the sample",
+                  True)
+    finally:
+        D.closed_loop = saved
+
+
+# ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

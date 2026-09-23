@@ -393,7 +393,55 @@ class SglangEngine(Engine):
         }.items() if v is not None}
 
 
-ENGINES = {"vllm": VllmEngine, "sglang": SglangEngine}
+class SglangDiffusionEngine(SglangEngine):
+    """SGLang Diffusion, python/sglang/multimodal_gen, for image and video.
+
+    Same console script, `sglang serve --model-path`, which routes a diffusers
+    pipeline to the diffusion runtime by itself. Two kinds of key live in a
+    diffusion config: server flags, translated here, and per request sampling
+    parameters (steps, guidance, size, frames, seed), which are not flags at
+    all; the sample driver sends them with every request, so translate drops
+    them and the flag check never sees them.
+    """
+
+    name = "sglang-diffusion"
+    REQUEST_KEYS = frozenset({
+        "num_inference_steps", "guidance_scale", "true_cfg_scale", "width", "height",
+        "num_frames", "fps", "seed", "negative_prompt", "enable_teacache", "flow_shift",
+    })
+    REDUCE = {
+        "sglang:diffusion_num_running_reqs": "max",
+        "sglang:diffusion_num_queue_reqs": "max",
+        "sglang:diffusion_generation_batch_size": "max",
+        "sglang:diffusion_requests_total": "sum",
+    }
+    INT_FLAGS = frozenset({"tp_size", "sp_degree", "ulysses_degree", "ring_degree",
+                           "cfg_parallel_degree", "batching_max_size", "batching_delay_ms",
+                           "num_gpus"})
+
+    def translate(self, config, workdir=None) -> list[str]:
+        out: list[tuple[str, object]] = []
+        for key, value in config.items():
+            if key == "model" or key in self.REQUEST_KEYS:
+                continue
+            # cache-dit and component quantisation take a JSON document; the
+            # generic spelling already writes a dict as JSON.
+            out.append((key, value))
+        return self.generic_flags(out)
+
+    def defaults(self, fp) -> dict:
+        return {}
+
+    def derive(self, series, reduce) -> dict:
+        g = lambda *ks: next((reduce(k) for k in ks if k in series), None)
+        return {k: v for k, v in {
+            "batch_size_peak": g("sglang:diffusion_generation_batch_size"),
+            "queued_peak": g("sglang:diffusion_num_queue_reqs"),
+            "running_peak": g("sglang:diffusion_num_running_reqs"),
+        }.items() if v is not None}
+
+
+ENGINES = {"vllm": VllmEngine, "sglang": SglangEngine, "sglang-diffusion": SglangDiffusionEngine}
 
 
 def engine_for(fp=None, name: str | None = None) -> Engine:
@@ -406,7 +454,10 @@ def engine_for(fp=None, name: str | None = None) -> Engine:
     chosen = name or os.environ.get("INFEROPT_ENGINE")
     if not chosen:
         decoding = getattr(getattr(fp, "model", None), "decoding", "autoregressive")
-        chosen = "sglang" if decoding == "diffusion" else "vllm"
+        if getattr(fp, "diffusion", None) is not None or decoding == "denoising":
+            chosen = "sglang-diffusion"
+        else:
+            chosen = "sglang" if decoding == "diffusion" else "vllm"
     if chosen not in ENGINES:
         raise ValueError(f"unknown engine {chosen!r}; have {', '.join(sorted(ENGINES))}")
     return ENGINES[chosen]()

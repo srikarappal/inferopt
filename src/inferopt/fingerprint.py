@@ -499,12 +499,40 @@ class SLO(BaseModel):
         return attainment >= self.min_slo_attainment
 
 
+class DiffusionShape(BaseModel):
+    """A diffusers pipeline as the search sees it: three components and the
+    sample the workload asks for. Present only for image and video models;
+    `model` then describes the denoiser and `decoding` says "denoising"."""
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(description="model_index | image or video, from the transformer class")
+    transformer_class: str = Field(description="model_index | e.g. WanTransformer3DModel")
+    transformer_params_b: float = Field(0.0, description="safetensors | every denoiser together; Wan2.2-A14B has two")
+    text_encoder_arch: str = Field("", description="model_index | the first text encoder; an LLM run once per sample, prefill only")
+    text_encoder_params_b: float = Field(0.0, description="safetensors | every text encoder together; FLUX has two, SD3 three")
+    vae_class: str = Field("", description="model_index | the decoder")
+    weights_gb: float = Field(0.0, description="safetensors | every component, resident together")
+    components: dict[str, str] = Field(default_factory=dict, description=(
+        "model_index | every component the pipeline lists and its class: text_encoder_2, "
+        "transformer_2, image_encoder and the rest. The shape is universal, the parts are not"))
+    n_text_encoders: int = Field(1, description="model_index | how many text encoders run per sample")
+    n_denoisers: int = Field(1, description="model_index | 2 for a two expert trajectory such as Wan2.2-A14B")
+    width: int = Field(description="workload | pixels")
+    height: int = Field(description="workload | pixels")
+    frames: int = Field(1, description="workload | 1 for an image")
+    fps: int = Field(24, description="workload | video only")
+    steps: int = Field(description="workload | denoising steps the customer runs at")
+    guidance_scale: float = Field(description="workload | CFG scale; at or under 1 the model is guidance distilled and CFG is off")
+    distilled: bool = Field(False, description="derived | guidance_scale <= 1, so the guidance node has nothing to sweep")
+
+
 class Fingerprint(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: ModelFingerprint
     hw: HardwareFingerprint
     workload: WorkloadFingerprint
     lora: LoraFingerprint = Field(default_factory=LoraFingerprint)
+    diffusion: DiffusionShape | None = Field(None, description="present for an image or video pipeline")
 
     @model_validator(mode="after")
     def _cross(self):

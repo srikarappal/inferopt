@@ -1,0 +1,346 @@
+{
+  "$schema": "./schema.md",
+  "modality": "diffusion",
+  "version": 1,
+  "description": "Technique DAG for image and video diffusion pipelines served by SGLang Diffusion. Same greedy walk as llm.json: apply a node, measure, keep or revert, follow the edge; every measurement is a Pareto candidate. The unit is a frame (an image is one), goodput is frames a second whose sample met the latency target, and the SLO is p99 seconds per sample. Server side keys travel as flags; per request keys (num_inference_steps, guidance_scale, width, height, num_frames) travel with every request.",
+  "inputs": {
+    "incumbent_config": "the customer's sample on the server's defaults: their steps, guidance, size and frames",
+    "fingerprint": "fingerprint.diffusion: the three components and the sample the workload asks for",
+    "slo": "p99 seconds per sample as ttft_p99_ms; violated samples count for nothing",
+    "quality_budget": "allowed drop in the preference score against the lossless checkpoint"
+  },
+  "objective": {
+    "primary": "goodput",
+    "definition": "frames a second, counting only samples delivered inside the latency target"
+  },
+  "traversal": {
+    "strategy": "greedy_accumulate",
+    "start": "incumbent",
+    "budget_guard": {
+      "max_launches": {
+        "default": 20,
+        "multi_lora": 20
+      },
+      "max_minutes": {
+        "default": 600,
+        "multi_lora": 600
+      },
+      "on_exceed": "stop traversal, emit the frontier from what was measured, list unvisited nodes"
+    }
+  },
+  "nodes": [
+    {
+      "id": "incumbent",
+      "title": "The customer's sample on the defaults",
+      "class": "root",
+      "status": "active",
+      "requires": [],
+      "cost_launches": 0,
+      "on_keep": [
+        "attention_backend"
+      ],
+      "on_revert": [],
+      "note": "Measured by the walk itself. Its fixed seed renders become the baseline every equivalence probe compares against, and its preference score the quality baseline."
+    },
+    {
+      "id": "attention_backend",
+      "title": "Attention backend for the denoiser",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "incumbent"
+      ],
+      "applicable_when": null,
+      "rationale": "Attention is most of a DiT step. SGLang Diffusion's global backend names (read from its server args on 23 Sep 2026): fa (fa3 and fa4 alias to it), sage_attn, torch_sdpa; the text encoder falls back to torch_sdpa by itself. Which one is fastest is a property of the card and the head shape, so it is measured. A kernel that changes the render beyond float noise is caught by the equivalence probe.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "attention_backend": "fa"
+        },
+        {
+          "attention_backend": "sage_attn"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "torch_compile"
+      ],
+      "on_revert": [
+        "torch_compile"
+      ]
+    },
+    {
+      "id": "torch_compile",
+      "title": "torch.compile the denoiser",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "attention_backend"
+      ],
+      "applicable_when": null,
+      "rationale": "Fuses the elementwise work around every attention and MLP. Costs a compile at launch, which the launch deadline follows by log progress rather than wall clock.",
+      "action": {
+        "set": {
+          "enable_torch_compile": true
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "cuda_graph"
+      ],
+      "on_revert": [
+        "cuda_graph"
+      ]
+    },
+    {
+      "id": "cuda_graph",
+      "title": "CUDA graphs for the denoiser step",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "torch_compile"
+      ],
+      "applicable_when": null,
+      "rationale": "A denoising step is the same graph every time; capturing it removes launch overhead that a small DiT at a small batch is dominated by. SGLang Diffusion's flag is enable_breakable_cuda_graph.",
+      "action": {
+        "set": {
+          "enable_breakable_cuda_graph": true
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "request_batching"
+      ],
+      "on_revert": [
+        "request_batching"
+      ]
+    },
+    {
+      "id": "request_batching",
+      "title": "Batch concurrent requests through the denoiser",
+      "class": "lossless",
+      "status": "active",
+      "requires": [
+        "cuda_graph"
+      ],
+      "applicable_when": null,
+      "rationale": "Requests arriving together denoise as one batch: throughput up, latency per sample up. Whether the trade lands inside the latency target is the whole question, so the bracket is measured. batching_mode is dynamic, the only mode; the size and the delay are the knobs.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "batching_max_size": 2,
+          "batching_delay_ms": 50
+        },
+        {
+          "batching_max_size": 4,
+          "batching_delay_ms": 100
+        }
+      ],
+      "probes": [
+        "goodput",
+        "equivalence"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "lossless_complete"
+      ],
+      "on_revert": [
+        "lossless_complete"
+      ],
+      "curve_crosses": true
+    },
+    {
+      "id": "lossless_complete",
+      "title": "Lossless frontier checkpoint",
+      "class": "checkpoint",
+      "status": "active",
+      "requires": [
+        "request_batching"
+      ],
+      "cost_launches": 1,
+      "probes": [
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "pickscore"
+      ],
+      "on_keep": [
+        "dit_fp8"
+      ],
+      "on_revert": [
+        "dit_fp8"
+      ],
+      "note": "The preference score of the lossless incumbent. Every lossy node's delta is measured against it, and whatever it moved from the seed's score is the noise floor."
+    },
+    {
+      "id": "dit_fp8",
+      "title": "FP8 denoiser weights, quantised at load",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "lossless_complete"
+      ],
+      "applicable_when": "fingerprint.hw.supports_fp8",
+      "rationale": "SGLang Diffusion quantises a bf16 transformer to fp8 online (its --quantization help names fp8 and mxfp4 as the online methods), so no conversion job and no artifact. Halves the weight read per step and can move the render, hence lossy and scored.",
+      "action": {
+        "set": {
+          "quantization": "fp8"
+        }
+      },
+      "sweep": null,
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "pickscore"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "cache_dit"
+      ],
+      "on_revert": [
+        "cache_dit"
+      ]
+    },
+    {
+      "id": "cache_dit",
+      "title": "Cache-DiT: skip denoiser blocks whose residual barely moved",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "dit_fp8"
+      ],
+      "applicable_when": null,
+      "rationale": "Between adjacent steps most blocks' residuals change little; Cache-DiT reuses them and computes only the ones that moved past a threshold. SGLang calls it lossless; it changes the output, so here it is lossy and scored. The threshold is the knob and the sweep brackets it. cache_dit_config is a JSON document the server takes on its flag.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "cache_dit_config": {
+            "residual_diff_threshold": 0.08
+          }
+        },
+        {
+          "cache_dit_config": {
+            "residual_diff_threshold": 0.16
+          }
+        }
+      ],
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "pickscore"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "steps"
+      ],
+      "on_revert": [
+        "steps"
+      ],
+      "verify": "the config document's keys are cache-dit's, not read from a launch that worked; a wrong key fails the launch and is recorded, not silently ignored"
+    },
+    {
+      "id": "steps",
+      "title": "Fewer denoising steps",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "cache_dit"
+      ],
+      "applicable_when": "fingerprint.diffusion.steps > 4",
+      "rationale": "Cost is linear in steps and quality is not: the last steps refine detail the preference model may not reward. The largest lever a pipeline has and the one every customer has already guessed at, which is why it is measured rather than guessed.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "num_inference_steps": "max(2, int(fingerprint.diffusion.steps * 0.75))"
+        },
+        {
+          "num_inference_steps": "max(2, int(fingerprint.diffusion.steps * 0.5))"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "pickscore"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
+        "guidance"
+      ],
+      "on_revert": [
+        "guidance"
+      ]
+    },
+    {
+      "id": "guidance",
+      "title": "Lower classifier free guidance",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "steps"
+      ],
+      "applicable_when": "not fingerprint.diffusion.distilled",
+      "rationale": "CFG runs the denoiser twice a step, conditioned and not. A guidance distilled model (scale at or under 1) has already folded that in and this node skips itself; for the rest, lowering the scale toward the point where the second pass can be dropped is measured on the preference score.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "guidance_scale": "max(1.0, fingerprint.diffusion.guidance_scale * 0.7)"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "pickscore"
+      ],
+      "cost_launches": 1,
+      "on_keep": [
+        "frontier"
+      ],
+      "on_revert": [
+        "frontier"
+      ]
+    },
+    {
+      "id": "frontier",
+      "title": "Emit the measured frontier",
+      "class": "terminal",
+      "status": "active",
+      "requires": [
+        "guidance"
+      ],
+      "cost_launches": 0,
+      "note": "The non-dominated set over (quality, goodput, latency, memory) across every measurement taken, reverted ones included: a sample with fewer steps that missed the budget is still an operating point somebody may choose."
+    }
+  ]
+}

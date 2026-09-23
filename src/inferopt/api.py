@@ -244,6 +244,18 @@ def optimize(
     if slo is not None:
         ttft_p99_ms = ttft_p99_ms or slo.ttft_p99_ms
         itl_p99_ms = itl_p99_ms or slo.itl_p99_ms
+
+    # An image or video pipeline is a different shape of search: no tokens,
+    # no KV cache, a sample as the unit. Its trace rows carry the sample the
+    # customer runs at, and its SLO is p99 seconds per sample, which arrives
+    # here as ttft_p99_ms. dag/diffusion.json, one strategy.
+    from inferopt.diffusion import is_pipeline, optimize_pipeline
+    if is_pipeline(model):
+        rows = [json.loads(l) for l in open(trace) if l.strip()]
+        return optimize_pipeline(model=model, rows=rows, latency_p99_ms=ttft_p99_ms,
+                                 qps=qps or 1.0, allow_loss=allow_loss, run_dir=run_dir,
+                                 gpu=gpu, port=port, max_launches=max_launches,
+                                 max_minutes=max_minutes, dag=dag, log=log)
     fp, slo_ = build_fingerprint(InferOptRequest(
         model=model, trace=trace, ttft_p99_ms=ttft_p99_ms, itl_p99_ms=itl_p99_ms,
         allow_loss=allow_loss, **({"qps": qps} if qps else {})))
