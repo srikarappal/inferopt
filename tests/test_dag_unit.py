@@ -2972,6 +2972,17 @@ def test_engines():
     check("a model SGLang does not serve has no block",
           dllm_block_size_of("DreamModel", {}) == 0 and dllm_block_size_of("Qwen3ForCausalLM", {}) == 0)
 
+    section("a quantization that fails is a failed launch, not the end of the run")
+    from inferopt import evaluator as E
+    import inspect as _insp
+    src = _insp.getsource(E.VllmEvaluator._serve)
+    check("ensure_variant is wrapped into LaunchError",
+          "except Exception as failed:" in src and "quantization to {kind} failed" in src,
+          "a RuntimeError from the converter escaped the walk and killed a seven node run")
+    from inferopt import quantize as Q
+    check("the conversion job loads with the server's permission",
+          Q._JOB.count("trust_remote_code=True") >= 2)
+
     section("engines: the evaluator carries one")
     class Bare(VllmEvaluator):
         def __init__(self, fp):

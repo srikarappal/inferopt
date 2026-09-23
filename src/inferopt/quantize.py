@@ -246,8 +246,13 @@ SINGLE = {"fp8":   "FP8_DEFAULT_CFG",
           "w4a16": "W4A16_NVFP4_CFG",   # 4-bit weights, 16-bit activations
           "nvfp4": "NVFP4_DEFAULT_CFG"} # 4-bit weights AND activations
 
-tok = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+# trust_remote_code: the same permission the server is launched with. A model
+# whose config is custom code (LLaDA 2, most diffusion LMs) cannot be loaded
+# without it, and refusing here would leave the lossy branch without its
+# largest lever for exactly the models that need it.
+tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto",
+                                             trust_remote_code=True)
 
 prompts = [json.loads(l)["prompt"] for l in open(calib_path) if l.strip()]
 print(f"[job] {len(prompts)} calibration prompts from the workload trace", flush=True)
@@ -345,7 +350,7 @@ if kind.startswith("autoquant@"):
         except Exception:
             pass
         model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype="auto", device_map="auto")
+            model_id, torch_dtype="auto", device_map="auto", trust_remote_code=True)
 
         model, state = mtq.auto_quantize(
             model,

@@ -663,7 +663,16 @@ class VllmEvaluator:
             kind = f"autoquant@{float(bits)}"
         if kind:
             from inferopt.quantize import ensure_variant
-            path = ensure_variant(self.fp, kind, self.trace_path, log=self.log)
+            # A conversion that fails is a launch that fails: recorded as
+            # goodput 0 on this node and the walk moves on. Left as its own
+            # exception it escaped the walk, and a run that had measured seven
+            # nodes died at the eighth because modelopt could not load the
+            # checkpoint.
+            try:
+                path = ensure_variant(self.fp, kind, self.trace_path, log=self.log)
+            except Exception as failed:
+                raise LaunchError(f"quantization to {kind} failed: "
+                                  f"{str(failed).splitlines()[0]}", str(failed)) from failed
             if path:
                 config["model"] = path
             else:
