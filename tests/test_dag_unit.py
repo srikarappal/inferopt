@@ -2850,10 +2850,102 @@ def test_quality_gets_room():
 
 
 # ==========================================================================
+def test_engines():
+    """One object per serving engine; the DAG's vocabulary never changes."""
+    import tempfile
+    from pathlib import Path
+    from inferopt import engines
+    from inferopt.evaluator import VllmEvaluator, hardware_defaults, to_cli
+
+    section("engines: vLLM is what it always was")
+    vllm = engines.VllmEngine()
+    cfg = {"model": "m", "max_model_len": 4096, "enable_prefix_caching": True,
+           "enforce_eager": False, "max_num_seqs": 384.0,
+           "speculative_config": {"method": "ngram", "num_speculative_tokens": 3}}
+    check("the module level to_cli and the engine agree",
+          to_cli(cfg) == vllm.translate(cfg))
+    check("a float count is rounded, not passed", "384" in vllm.translate(cfg))
+    check("a False boolean is its --no- form", "--no-enforce-eager" in vllm.translate(cfg))
+
+    section("engines: SGLang spells the same config differently")
+    sgl = engines.SglangEngine()
+    with tempfile.TemporaryDirectory() as td:
+        argv = sgl.translate({
+            "model": "m", "max_model_len": 4096, "enable_prefix_caching": False,
+            "max_num_seqs": 256, "enable_chunked_prefill": True, "max_num_batched_tokens": 8192,
+            "block_size": 16, "kv_cache_dtype": "fp8", "enforce_eager": True,
+            "gpu_memory_utilization": 0.9, "tensor_parallel_size": 2,
+            "dllm_algorithm": "LowConfidence", "dllm_block_size": 32,
+            "dllm_threshold": 0.9, "dllm_fdfo": False,
+        }, workdir=Path(td))
+        text = " ".join(argv)
+        for want in ("--context-length 4096", "--disable-radix-cache",
+                     "--max-running-requests 256", "--chunked-prefill-size 8192",
+                     "--page-size 16", "--kv-cache-dtype fp8_e4m3", "--disable-cuda-graph",
+                     "--mem-fraction-static 0.9", "--tp-size 2",
+                     "--dllm-algorithm LowConfidence", "--no-dllm-fdfo"):
+            check(f"emits {want}", want in text, text)
+        check("nothing keeps the DAG's spelling", "--max-model-len" not in text
+              and "--enable-prefix-caching" not in text and "--max-num-seqs" not in text, text)
+        yaml_path = Path(td) / "dllm.yaml"
+        check("block size and threshold go in a yaml the server reads",
+              f"--dllm-algorithm-config {yaml_path}" in text
+              and yaml_path.read_text() == "block_size: 32\nthreshold: 0.9\n",
+              yaml_path.read_text() if yaml_path.exists() else "missing")
+
+    off = " ".join(sgl.translate({"enable_chunked_prefill": False, "max_num_batched_tokens": 2048}))
+    check("chunked prefill off is a -1 budget plus the prefill cap",
+          "--chunked-prefill-size -1" in off and "--max-prefill-tokens 2048" in off, off)
+    quiet = sgl.translate({"enable_prefix_caching": True, "enable_chunked_prefill": True})
+    check("the defaults SGLang already has are silence", quiet == [], quiet)
+    spec = " ".join(sgl.translate({"speculative_config": {"method": "ngram", "num_speculative_tokens": 3}}))
+    check("speculative config becomes flat flags",
+          "--speculative-algorithm NGRAM" in spec and "--speculative-num-draft-tokens 3" in spec, spec)
+    check("the flag check sees the engine's names, not the DAG's",
+          sgl.flag_names({"max_model_len": 1024, "enable_prefix_caching": False})
+          == {"context_length", "disable_radix_cache"})
+    check("serve_argv asks for metrics, which SGLang does not expose unasked",
+          "--enable-metrics" in sgl.serve_argv("m", "127.0.0.1", 8100, {}, None))
+
+    section("engines: SGLang's /metrics read into the same scalars")
+    series = {"sglang:token_usage": [({}, 0.31), ({}, 0.42)],
+              "sglang:num_retracted_requests_total": [({}, 2.0), ({}, 3.0)],
+              "sglang:spec_accept_rate": [({}, 0.7)]}
+    def red(name):
+        vals = [v for _, v in series.get(name, [])]
+        return (max(vals) if sgl.REDUCE.get(name) == "max" else sum(vals)) if vals else None
+    got = sgl.derive(series, red)
+    check("KV pressure is the peak", got["kv_cache_util"] == 0.42, got)
+    check("retractions add up as preemptions", got["preemptions"] == 5.0, got)
+    check("acceptance travels", got["spec_acceptance_rate"] == 0.7, got)
+    check("what the engine did not emit is absent, not zero", "prefix_hit_rate" not in got)
+
+    section("engines: which one runs is the fingerprint's call")
+    ctx = _ctx()
+    check("an autoregressive model stays on vLLM", engines.engine_for(ctx.fingerprint).name == "vllm")
+    ctx.fingerprint.model.decoding = "diffusion"
+    check("a diffusion LM goes to SGLang", engines.engine_for(ctx.fingerprint).name == "sglang")
+    check("hardware defaults follow the engine",
+          "gpu_memory_utilization" in hardware_defaults(ctx.fingerprint))
+    check("an explicit name wins", engines.engine_for(ctx.fingerprint, "vllm").name == "vllm")
+    check("an unknown name is refused", raises(lambda: engines.engine_for(None, "trt"), ValueError))
+
+    section("engines: the evaluator carries one")
+    class Bare(VllmEvaluator):
+        def __init__(self, fp):
+            self.fp = fp
+            self.engine = engines.engine_for(fp)
+    check("a diffusion fingerprint gives the evaluator SGLang",
+          Bare(ctx.fingerprint).engine.name == "sglang")
+    metrics = VllmEvaluator._parse_metrics(VllmEvaluator, 'vllm:kv_cache_usage_perc{engine="0"} 0.42')
+    check("unbound, the class still reads vLLM's names", metrics.get("kv_cache_util") == 0.42, metrics)
+
+
+# ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

@@ -86,6 +86,7 @@ import httpx
 
 from inferopt.calibration import STORE
 from inferopt import leaderboard
+from inferopt.engines import VllmEngine, engine_for
 from inferopt.fingerprint import SLO, Fingerprint
 from inferopt.legality import repair
 from inferopt.quality import context_needed
@@ -96,56 +97,18 @@ from inferopt.traverse import Trial
 _VLLM_CMD: list[str] | None = None
 
 
+# The vLLM engine, for the callers that still ask this module directly. The
+# resolution order that used to live here (INFEROPT_VLLM_CMD, the console
+# script on PATH, then under sys.prefix, then python -m the entry point) is
+# engines._resolve now, shared with SGLang.
+vllm_engine = VllmEngine()
+
+
 def vllm_cmd() -> list[str]:
-    """How to invoke vLLM, resolved rather than assumed.
-
-    This was the bare string "vllm", which works only when the console script
-    happens to sit on PATH or beside sys.executable. On a host where it does
-    not -- the usual cause being that `python run.py` picked up a different
-    interpreter from the one vLLM is installed under -- subprocess raises
-    FileNotFoundError: 'vllm', which says nothing about the actual problem.
-
-    Resolution order, most explicit first:
-
-      1. INFEROPT_VLLM_CMD, if the caller wants to name it exactly
-      2. the console script on PATH (child_env has already prepended the
-         interpreter's own bin directory)
-      3. the console script under sys.prefix, for a venv whose bin is not on PATH
-      4. python -m vllm.entrypoints.cli.main, using THIS interpreter
-
-    Four is the one that always works: the console script is a two-line shim
-    around exactly that entry point, so if `import vllm` succeeds the module
-    form succeeds too, and it cannot pick up a different environment than the
-    one already imported. `python -m vllm` does NOT work -- the package has no
-    __main__ -- which is why the specific entry point is named.
-    """
-    global _VLLM_CMD
-    if _VLLM_CMD is not None:
-        return _VLLM_CMD
-
-    override = os.environ.get("INFEROPT_VLLM_CMD")
-    if override:
-        _VLLM_CMD = override.split()
-        return _VLLM_CMD
-
-    found = shutil.which("vllm", path=child_env().get("PATH"))
+    """How to invoke vLLM, resolved rather than assumed. See engines._resolve."""
+    found = vllm_engine.command()
     if found:
-        _VLLM_CMD = [found]
-        return _VLLM_CMD
-
-    cand = Path(sys.prefix) / "bin" / "vllm"
-    if cand.exists():
-        _VLLM_CMD = [str(cand)]
-        return _VLLM_CMD
-
-    try:
-        import importlib.util
-        if importlib.util.find_spec("vllm.entrypoints.cli.main") is not None:
-            _VLLM_CMD = [sys.executable, "-m", "vllm.entrypoints.cli.main"]
-            return _VLLM_CMD
-    except Exception:
-        pass
-
+        return found
     raise LaunchError(
         f"cannot find vLLM.\n"
         f"  interpreter : {sys.executable}\n"
@@ -316,48 +279,25 @@ def reconcile_moe_backend(config: dict, *, log=print) -> dict:
     return config
 
 
-def hardware_defaults(fp) -> dict:
+def hardware_defaults(fp, engine=None) -> dict:
     """Flags this (model, GPU) pair REQUIRES to run at all, not tuning choices.
 
-    Lives here, in one place, because it has to apply to every path that launches
-    a server. It did not: moe_backend was set only in run.py's seed_config, so
-    the traversal got it and eval_repro did not. A stock-baseline run on
-    Qwen3-30B-A3B then went down FlashInfer's sm120 CUTLASS path and hung for 30
-    minutes JIT-compiling kernels, exactly the failure the flag exists to
-    prevent -- while the traversal beside it ran fine. A hardware fact expressed
-    in one caller is a bug waiting for the second caller.
+    Lives in one place because it has to apply to every path that launches a
+    server. It did not: moe_backend was set only in run.py's seed_config, so
+    the traversal got it and eval_repro did not, and a stock-baseline run on
+    Qwen3-30B-A3B went down FlashInfer's sm120 CUTLASS path and hung for 30
+    minutes JIT-compiling kernels. A hardware fact expressed in one caller is
+    a bug waiting for the second caller.
 
-      gpu_memory_utilization  0.75 on unified memory, where the fraction is of
-                              SYSTEM memory the CPU also competes for and 0.90
-                              runs a 122GB box into the OOM killer. 0.90 on a
-                              dedicated GPU, where 0.75 strands ~20GB.
-
-      moe_backend=triton      MoE on sm12x. vLLM defaults to FlashInfer CUTLASS,
-                              no prebuilt sm120 kernels ship, and the JIT build
-                              does not finish in any reasonable time: sm120/121
-                              has 99 KiB shared memory per block against sm100's
-                              228 KiB, so tile configs written for datacenter
-                              Blackwell cannot fit. Dense models never select a
-                              MoE kernel; sm100 has the memory CUTLASS expects.
-
-    Callers merge these UNDER their own settings, so an explicit value always
-    wins -- these are defaults, not overrides.
+    What the flags are is the engine's to say (engines.py); which engine is the
+    fingerprint's. Callers merge these UNDER their own settings, so an explicit
+    value always wins.
     """
-    out: dict[str, Any] = {
-        "gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90,
-    }
-    if not fp.model.is_dense and fp.hw.sm_major == 12:
-        if "moe_backend" in installed_flags():
-            out["moe_backend"] = "triton"
-    return out
+    return (engine or engine_for(fp)).defaults(fp)
 
 
 def _vllm_version() -> str:
-    try:
-        import vllm
-        return getattr(vllm, "__version__", "unknown")
-    except Exception:
-        return "unknown"
+    return vllm_engine.version()
 
 
 def _vllm_importable() -> bool:
@@ -453,59 +393,18 @@ def child_env(**extra: str) -> dict[str, str]:
     return {**os.environ, "PATH": path, **extra}
 
 
-_FLAGS: set[str] | None = None
-
-
 def installed_flags() -> set[str]:
-    global _FLAGS
-    if _FLAGS is None:
-        try:
-            out = subprocess.run([*vllm_cmd(), "serve", "--help=all"], env=child_env(),
-                                 capture_output=True, text=True, timeout=180).stdout
-            _FLAGS = {m.group(1).replace("-", "_") for m in re.finditer(r"--([a-z0-9][a-z0-9-]*)", out)}
-        except Exception:
-            _FLAGS = set()
-    return _FLAGS
-
-
-# vLLM flags that take an int. A float here is not a rounding preference, it is
-# a launch failure: argparse rejects "512.0" for an int-typed argument and the
-# server exits during argument parsing, before it reads a single weight.
-#
-# This is not hypothetical. dag/llm.json computed max_num_seqs as
-# `incumbent.max_num_seqs * 1.5`, which is 384.0, and BOTH retune_batching
-# nodes died on every run they were ever applicable to -- four launches per
-# lossy run, contributing nothing, for as long as the nodes have existed. The
-# failure was invisible because a dead launch is recorded as goodput 0.0 and
-# reads like a configuration that simply did not help.
-#
-# The expressions are fixed at the source. This exists so the next one cannot
-# cost a launch: a count that arrives as a float is rounded, because a
-# fractional number of sequences has no meaning to round WRONG.
-_INT_FLAGS = frozenset({
-    "max_num_seqs", "max_num_batched_tokens", "max_model_len", "block_size",
-    "max_loras", "max_cpu_loras", "max_lora_rank", "num_speculative_tokens",
-    "prompt_lookup_max", "prompt_lookup_min", "tensor_parallel_size",
-    "pipeline_parallel_size", "max_num_partial_prefills", "swap_space",
-    "max_seq_len_to_capture", "seed",
-})
+    """vLLM's flag list, from its own --help=all. See Engine.installed_flags."""
+    return vllm_engine.installed_flags(env=child_env())
 
 
 def to_cli(cfg: dict) -> list[str]:
-    args: list[str] = []
-    for k, v in cfg.items():
-        if k == "model":
-            continue
-        flag = "--" + k.replace("_", "-")
-        if isinstance(v, bool):
-            args.append(flag if v else "--no-" + k.replace("_", "-"))
-        elif isinstance(v, dict):
-            args += [flag, json.dumps(v)]
-        elif isinstance(v, float) and k in _INT_FLAGS:
-            args += [flag, str(round(v))]
-        else:
-            args += [flag, str(v)]
-    return args
+    """A config as vLLM flags. See Engine.generic_flags for the rules, and
+    VllmEngine.INT_FLAGS for why a count that arrives as a float is rounded:
+    dag/llm.json once computed max_num_seqs as 384.0 and both retune_batching
+    nodes died on every run they were applicable to, invisibly, because a dead
+    launch reads as a configuration that did not help."""
+    return vllm_engine.translate(cfg)
 
 
 # --------------------------------------------------------------------------
@@ -529,9 +428,17 @@ def to_cli(cfg: dict) -> list[str]:
 # --------------------------------------------------------------------------
 
 class VllmEvaluator:
+    """Launches a server per config, measures it, tears it down.
+
+    Named for the engine it was written against. The engine is a parameter
+    now (engines.py) and defaults to what the fingerprint needs, so a masked
+    diffusion LM lands on SGLang without the caller knowing the difference.
+    """
+
     def __init__(self, fp: Fingerprint, slo: SLO, trace_path: str, run_dir: str,
-                 gpu: str = "0", port: int = 8000, log=print):
+                 gpu: str = "0", port: int = 8000, log=print, engine=None):
         self.fp, self.slo, self.log = fp, slo, log
+        self.engine = engine or engine_for(fp)
         self.gpu, self.port, self.run_dir = gpu, port, Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.trace_path = trace_path       # AWQ/NVFP4 calibrate on this workload
@@ -762,38 +669,41 @@ class VllmEvaluator:
             else:
                 config["quantization"] = kind      # fp8: a load-time flag
 
-        reconcile_moe_backend(config, log=self.log)
+        engine = self.engine
+        if engine.name == "vllm":
+            # The MoE backend lists this reads are vLLM's own.
+            reconcile_moe_backend(config, log=self.log)
 
         model = config.get("model") or self.fp.model.id
         # THE FLAG CHECK MUST NOT DISABLE ITSELF. It used to fall back to "[]"
-        # whenever installed_flags() came back empty, which is precisely the case
-        # where it is most needed: an old vLLM whose `serve --help=all` is not
-        # recognised returns nothing, validation silently switches off, and every
-        # config is passed blind to a binary that may not accept it. The launch
-        # then dies with "exited 1 during startup" and no indication that a flag
-        # was the reason.
+        # whenever the flag list came back empty, which is precisely the case
+        # where it is most needed: an old build whose --help is not recognised
+        # returns nothing, validation silently switches off, and every config is
+        # passed blind to a binary that may not accept it. The launch then dies
+        # with "exited 1 during startup" and no indication that a flag was the
+        # reason.
         # Only demand the flag list when there is something to check against it.
         # A config with no keys beyond `model` cannot contain an unknown flag, so
-        # refusing to launch it because `--help=all` was unreadable would block a
-        # bare `vllm serve <model>` for no reason.
-        to_check = [k for k in config if k != "model"]
-        flags = installed_flags() if to_check else None
+        # refusing to launch it because --help was unreadable would block a bare
+        # `serve <model>` for no reason. The check is on the flags the engine
+        # would actually pass, after translation, not on the DAG's names.
+        to_check = engine.flag_names(config)
+        flags = engine.installed_flags(env=child_env()) if to_check else None
         if to_check and not flags and os.environ.get("INFEROPT_SKIP_FLAG_CHECK"):
             flags = None                        # explicit opt-out, launch blind
         elif to_check and not flags:
             raise LaunchError(
-                f"could not read this vLLM's flag list, so no config can be "
-                f"validated before launching.\n"
-                f"`{' '.join(vllm_cmd())} serve --help=all` produced nothing "
-                f"parseable -- older vLLM builds do not accept --help=all.\n"
-                f"Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let vLLM "
-                f"reject bad flags itself, at the cost of a failed launch per "
-                f"bad key instead of an instant error.")
-        unknown = [k for k in config if k != "model" and k not in flags] if flags else []
+                f"could not read this {engine.name}'s flag list, so no config can "
+                f"be validated before launching.\n"
+                f"`{' '.join(engine.help_argv())}` produced nothing parseable.\n"
+                f"Set INFEROPT_SKIP_FLAG_CHECK=1 to launch anyway and let the "
+                f"engine reject bad flags itself, at the cost of a failed launch "
+                f"per bad key instead of an instant error.")
+        unknown = sorted(k for k in to_check if k not in flags) if flags else []
         if unknown:
             raise LaunchError(
-                f"config keys this vLLM ({_vllm_version()}) does not accept: "
-                f"{unknown}. Flags move between releases -- 0.26 removed "
+                f"flags this {engine.name} ({engine.version()}) does not accept: "
+                f"{unknown}. Flags move between releases -- vLLM 0.26 removed "
                 f"--disable-log-requests, --swap-space and --cuda-graph-sizes, "
                 f"and older builds take speculative decoding as flat flags "
                 f"rather than --speculative-config JSON.")
@@ -810,7 +720,7 @@ class VllmEvaluator:
         d = self.run_dir / "launches" / tag
         d.mkdir(parents=True, exist_ok=True)
         err = d / "server.log"
-        cmd = [*vllm_cmd(), "serve", model, "--host", HOST, "--port", str(self.port), *to_cli(config)]
+        cmd = engine.serve_argv(model, HOST, self.port, config, workdir=d)
         env = child_env(CUDA_VISIBLE_DEVICES=self.gpu,
                         VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"))
         with open(err, "wb") as fh:
@@ -847,7 +757,7 @@ class VllmEvaluator:
                     raise LaunchError(f"exited {proc.returncode} during startup",
                                       err.read_text()[-3000:])
                 try:
-                    if httpx.get(f"{self.base_url}/health", timeout=2).status_code == 200:
+                    if httpx.get(f"{self.base_url}{engine.health_path}", timeout=2).status_code == 200:
                         break
                 except httpx.HTTPError:
                     pass
@@ -915,17 +825,9 @@ class VllmEvaluator:
     # and nonsense for a fraction -- two engines at 0.5 KV utilisation summed to
     # 1.0, reporting a full cache on a half-empty server. Nothing caught it
     # because every run so far has been single-engine, single-model.
-    _REDUCE = {
-        "vllm:kv_cache_usage_perc": "max",          # a fraction: worst pressure
-        "vllm:num_preemptions": "sum",
-        "vllm:num_preemptions_total": "sum",
-        "vllm:prefix_cache_hits": "sum",
-        "vllm:prefix_cache_hits_total": "sum",
-        "vllm:prefix_cache_queries": "sum",
-        "vllm:prefix_cache_queries_total": "sum",
-        "vllm:spec_decode_num_accepted_tokens": "sum",
-        "vllm:spec_decode_num_draft_tokens": "sum",
-    }
+    # vLLM's table, kept on the class for the callers and tests that read it
+    # unbound. An instance reads its engine's.
+    _REDUCE = VllmEngine.REDUCE
 
     @staticmethod
     def parse_prometheus(text: str) -> dict[str, list[tuple[dict, float]]]:
@@ -981,32 +883,27 @@ class VllmEvaluator:
         looking at rather than trusting.
         """
         series = self.parse_prometheus(text)
+        # getattr, not self.engine: a test calls this unbound with the class as
+        # self, and subclasses that bypass __init__ are a normal thing here.
+        engine = getattr(self, "engine", None) or vllm_engine
+        table = engine.REDUCE
 
         def red(name: str):
             vals = [v for _, v in series.get(name, [])]
             if not vals:
                 return None
-            return max(vals) if self._REDUCE.get(name) == "max" else sum(vals)
+            return max(vals) if table.get(name) == "max" else sum(vals)
 
-        g = lambda *ks: next((red(k) for k in ks if k in series), None)
-        hits, qs = g("vllm:prefix_cache_hits", "vllm:prefix_cache_hits_total"), \
-                   g("vllm:prefix_cache_queries", "vllm:prefix_cache_queries_total")
-        acc, drafts = g("vllm:spec_decode_num_accepted_tokens"), g("vllm:spec_decode_num_draft_tokens")
-        out = {k: v for k, v in {
-            "kv_cache_util": g("vllm:kv_cache_usage_perc"),
-            "preemptions": g("vllm:num_preemptions", "vllm:num_preemptions_total"),
-            "prefix_hit_rate": (hits / qs) if hits is not None and qs else None,
-            "spec_acceptance_rate": (acc / drafts) if acc is not None and drafts else None,
-        }.items() if v is not None}
+        out = engine.derive(series, red)
         # Only the metrics the scalars above are built from -- the full scrape
-        # includes every histogram bucket vLLM exposes and would bloat each
-        # trial record by orders of magnitude for data nothing reads.
+        # includes every histogram bucket the engine exposes and would bloat
+        # each trial record by orders of magnitude for data nothing reads.
         kept = {n: [{"labels": lb, "value": v} for lb, v in series[n]]
-                for n in self._REDUCE if n in series}
+                for n in table if n in series}
         if kept:
             out["series"] = kept
         multi = sorted(n for n, vs in series.items()
-                       if n in self._REDUCE and len(vs) > 1)
+                       if n in table and len(vs) > 1)
         if multi:
             out["multi_series"] = multi
         return out

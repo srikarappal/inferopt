@@ -63,6 +63,9 @@ class ModelFingerprint(BaseModel):
 
     id: str = Field(description="config | HF id or local path of the served model")
     architecture: str = Field(description="config | e.g. Qwen3ForCausalLM")
+    decoding: str = Field("autoregressive", description=(
+        "config | autoregressive, or diffusion for a masked diffusion LM (LLaDA, SDAR, "
+        "DiffusionGemma). Gates the dLLM subtree and selects the engine that can serve it"))
     is_dense: bool = Field(True, description="config | False for MoE; gates the expert-placement subtree")
     n_params_b: float = Field(description="config | parameter count in billions")
     n_layers: int = Field(description="config | num_hidden_layers")

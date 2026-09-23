@@ -781,9 +781,11 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
         active_b = _reconcile_moe(shape, n_params_b, bool(ck_bytes), req.model)
         n_experts, n_active = shape["n_routed"], shape["n_active"]
 
+    architecture = (top.get("architectures") or ["unknown"])[0]
     return ModelFingerprint(
         id=req.model,
-        architecture=(top.get("architectures") or ["unknown"])[0],
+        architecture=architecture,
+        decoding=decoding_of(architecture),
         is_dense=n_experts == 0,
         n_params_b=round(n_params_b, 2),
         n_layers=n_layers, hidden_size=c["hidden_size"],
@@ -815,6 +817,19 @@ def detect_lora(req: InferOptRequest) -> LoraFingerprint:
         n_adapters=len(req.adapters), max_rank=max(ranks),
         target_modules=sorted(targets), adapter_retained=True,
     )
+
+
+# Architectures that decode by iterative denoising over a block of masked
+# tokens rather than one token at a time. Named, not pattern matched on
+# "Diffusion": Dream's config says DreamModel, LLaDA 2's says LLaDA2MoeModelLM.
+DIFFUSION_ARCHITECTURES = ("LLaDA", "SDAR", "DiffusionGemma", "DreamModel")
+
+
+def decoding_of(architecture: str) -> str:
+    """How this model produces tokens, from its architecture name."""
+    if any(architecture.startswith(prefix) for prefix in DIFFUSION_ARCHITECTURES):
+        return "diffusion"
+    return "autoregressive"
 
 
 def build_fingerprint(req: InferOptRequest) -> tuple[Fingerprint, SLO]:
