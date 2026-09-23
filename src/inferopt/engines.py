@@ -374,6 +374,13 @@ class SglangEngine(Engine):
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_runner_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"
+        if fp.model.decoding == "diffusion":
+            # What SGLang's own LLaDA 2 tests launch with
+            # (test/registered/dllm/test_dllm_batching_fdfo.py): the model's
+            # config and tokenizer are remote code, the algorithm is not
+            # defaulted by the server, and flashinfer is the backend they test.
+            out.update({"trust_remote_code": True, "dllm_algorithm": "LowConfidence",
+                        "attention_backend": "flashinfer"})
         return out
 
     def derive(self, series, reduce) -> dict:

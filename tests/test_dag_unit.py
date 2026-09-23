@@ -2927,6 +2927,12 @@ def test_engines():
     check("a diffusion LM goes to SGLang", engines.engine_for(ctx.fingerprint).name == "sglang")
     check("hardware defaults follow the engine",
           "gpu_memory_utilization" in hardware_defaults(ctx.fingerprint))
+    dl_defaults = hardware_defaults(ctx.fingerprint)
+    check("a diffusion model launches the way SGLang's own tests launch it",
+          dl_defaults.get("dllm_algorithm") == "LowConfidence"
+          and dl_defaults.get("trust_remote_code") is True
+          and dl_defaults.get("attention_backend") == "flashinfer", dl_defaults)
+    check("...which spells out as flags", "--trust-remote-code" in engines.SglangEngine().translate(dl_defaults))
     check("an explicit name wins", engines.engine_for(ctx.fingerprint, "vllm").name == "vllm")
     check("an unknown name is refused", raises(lambda: engines.engine_for(None, "trt"), ValueError))
 
