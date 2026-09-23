@@ -79,7 +79,16 @@ async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
                "temperature": 0.0, "seed": 0, "stream": stream}
     if stream:
-        payload["stream_options"] = {"include_usage": True}
+        # continuous_usage_stats: usage in EVERY chunk, not only the last. A
+        # chunk is not a token. An autoregressive server sends one token per
+        # chunk and the two coincide; a diffusion LM commits a whole block per
+        # forward pass and SGLang streams the block as one chunk, so counting
+        # chunks read a 34 tokens/s server as 1.3. With usage per chunk each
+        # one is credited with the tokens it carried. Both vLLM and SGLang
+        # accept the field; a server that ignores it falls back to one per
+        # chunk below, which is exact for the autoregressive case.
+        payload["stream_options"] = {"include_usage": True,
+                                     "continuous_usage_stats": True}
     try:
         if not stream:
             resp = await client.post(f"{base_url}/v1/completions", json=payload, timeout=900.0)
@@ -103,16 +112,21 @@ async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
                 if body == "[DONE]":
                     break
                 ch = json.loads(body)
+                usage = ch.get("usage") or {}
                 if ch.get("choices") and ch["choices"][0].get("text"):
                     now = time.perf_counter()
                     if r.ttft is None:
                         r.ttft = now - r.start
-                    r.n_out += 1
                     r.text += ch["choices"][0]["text"]
-                    r.token_times.append(now)
-                if ch.get("usage"):
-                    r.n_out = ch["usage"].get("completion_tokens") or r.n_out
-                    r.n_in = ch["usage"].get("prompt_tokens") or r.n_in
+                    # Tokens this chunk carried: the usage delta when the
+                    # server reports usage per chunk, else one.
+                    reported = usage.get("completion_tokens")
+                    carried = (reported - r.n_out) if reported else 1
+                    r.n_out += max(1, carried)
+                    r.token_times.extend([now] * max(1, carried))
+                if usage:
+                    r.n_out = usage.get("completion_tokens") or r.n_out
+                    r.n_in = usage.get("prompt_tokens") or r.n_in
         r.latency = time.perf_counter() - r.start
         r.ok = r.ttft is not None
     except Exception as e:

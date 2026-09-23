@@ -57,6 +57,46 @@ def req(start=0.0, ttft=0.05, n_out=10, ok=True, itl=0.01, error="", n_in=100):
 
 
 # --------------------------------------------------------------------------
+def test_a_chunk_is_credited_with_the_tokens_it_carried():
+    """SGLang streams a diffusion LM one block per chunk. Counting chunks read
+    a 34 tokens/s server as 1.3; usage per chunk says what each one held."""
+    import asyncio
+    from goodput import driver
+
+    class _Resp:
+        status_code = 200
+        def __init__(self, lines): self._lines = lines
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def aiter_lines(self):
+            for line in self._lines:
+                yield line
+
+    class _Client:
+        def __init__(self, lines): self._lines = lines
+        def stream(self, *a, **k): return _Resp(self._lines)
+
+    def chunk(text, done):
+        return "data: " + json.dumps({"choices": [{"text": text}],
+                                      "usage": {"completion_tokens": done, "prompt_tokens": 7}})
+    block_stream = [chunk("a" * 32, 32), chunk("b" * 32, 64), chunk("c" * 8, 72),
+                    "data: " + json.dumps({"choices": [], "usage": {"completion_tokens": 72, "prompt_tokens": 7}}),
+                    "data: [DONE]"]
+    r = asyncio.run(driver._one(_Client(block_stream), "http://x", "m", "p", 72))
+    assert r.ok and r.n_out == 72 and r.n_in == 7
+    assert len(r.token_times) == 72, "three chunks carried 72 tokens"
+
+    # A server that reports usage only at the end: one token per chunk, exact
+    # for an autoregressive stream.
+    ar_stream = [chunk_no_usage for chunk_no_usage in (
+        "data: " + json.dumps({"choices": [{"text": "x"}]}),
+        "data: " + json.dumps({"choices": [{"text": "y"}]}),
+        "data: " + json.dumps({"choices": [], "usage": {"completion_tokens": 2, "prompt_tokens": 3}}),
+        "data: [DONE]")]
+    r = asyncio.run(driver._one(_Client(ar_stream), "http://x", "m", "p", 2))
+    assert r.n_out == 2 and len(r.token_times) == 2
+
+
 def test_meets():
     section("Req.meets: the per-request predicate goodput is built on")
     unconstrained = Latency()
