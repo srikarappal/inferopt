@@ -362,7 +362,7 @@ class DiffusionEvaluator(VllmEvaluator):
                  gpu: str = "0", port: int = 8100, log=print, engine=None):
         self.fp, self.slo, self.log = fp, slo, log
         self.shape = fp.diffusion
-        self.engine = engine or SglangDiffusionEngine()
+        self.engine = engine or SglangDiffusionEngine(model=fp.model.id)
         self.gpu, self.port, self.run_dir = gpu, port, Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.base_url = f"http://{HOST}:{port}"

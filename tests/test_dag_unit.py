@@ -3033,6 +3033,11 @@ def test_diffusion():
           and "--batching-max-size 4" in text, text)
     fp = _ctx().fingerprint.model_copy(update={"diffusion": shape})
     check("a pipeline picks the diffusion engine", engines.engine_for(fp).name == "sglang-diffusion")
+    named = engines.SglangDiffusionEngine(model="m/p")
+    check("the flag check asks the diffusion server's help, which needs the model",
+          named.help_argv()[-3:] == ["--model-path", "m/p", "--help"], named.help_argv())
+    check("no metrics flag on the diffusion path: 0.5.20 rejects it",
+          "--enable-metrics" not in named.serve_argv("m/p", "h", 1, {}))
 
     section("diffusion: goodput counts frames of samples inside the target")
     def sample(latency_s, frames=1, ok=True):

@@ -405,6 +405,27 @@ class SglangDiffusionEngine(SglangEngine):
     """
 
     name = "sglang-diffusion"
+
+    def __init__(self, model: str | None = None):
+        super().__init__()
+        # `sglang serve --help` describes the LLM path. The diffusion path's
+        # flags only appear when a pipeline is named, so the flag check needs
+        # the model to ask about the right server.
+        self.model = model
+
+    def help_argv(self) -> list[str]:
+        prefix = self._serve_prefix()
+        if self.model:
+            return [*prefix, "--model-path", self.model, "--help"]
+        return [*prefix, "--help"]
+
+    def serve_argv(self, model, host, port, config, workdir=None) -> list[str]:
+        # No --enable-metrics: 0.5.20's diffusion path rejects it at argument
+        # parsing although its help lists it (found by launching). /metrics
+        # is then absent and the evaluator records no gauges, which is honest.
+        return [*self._serve_prefix(), "--model-path", model, "--host", host,
+                "--port", str(port), *self.translate(config, workdir)]
+
     REQUEST_KEYS = frozenset({
         "num_inference_steps", "guidance_scale", "true_cfg_scale", "width", "height",
         "num_frames", "fps", "seed", "negative_prompt", "enable_teacache", "flow_shift",
