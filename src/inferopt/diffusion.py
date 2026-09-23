@@ -387,20 +387,31 @@ class DiffusionEvaluator(VllmEvaluator):
                         for i, prompt in enumerate(self._probe_prompts())]
         return asyncio.run(go())
 
-    def _equivalence_of(self, samples: list[Sample]) -> float | None:
+    def _equivalence_of(self, samples: list[Sample], tag: str) -> float | None:
         """Fraction of probe samples that do NOT match the baseline render at
-        the same seed within float noise. None until a baseline exists."""
+        the same seed within the PSNR bar. None until a baseline exists.
+
+        Every render and every PSNR is kept beside the launch log, because the
+        bar is a number that has to be set from renders people have looked at,
+        and a probe that keeps only its verdict cannot be argued with."""
         if not self.baseline_dir.exists():
             return None
-        differ, seen = 0, 0
+        keep = self.run_dir / "launches" / tag / "probe"
+        keep.mkdir(parents=True, exist_ok=True)
+        psnrs: dict[str, float] = {}
         for i, s in enumerate(samples):
             ref = self.baseline_dir / f"{i}.png"
             if not s.image_png or not ref.exists():
                 continue
-            seen += 1
-            if psnr_db(ref.read_bytes(), s.image_png) < EQUIVALENT_PSNR_DB:
-                differ += 1
-        return (differ / seen) if seen else None
+            (keep / f"{i}.png").write_bytes(s.image_png)
+            psnrs[str(i)] = round(psnr_db(ref.read_bytes(), s.image_png), 2)
+        (keep / "psnr.json").write_text(json.dumps(psnrs, indent=1))
+        if not psnrs:
+            return None
+        values = sorted(psnrs.values())
+        self.log(f"        psnr vs baseline  min {values[0]:.1f}  median "
+                 f"{values[len(values) // 2]:.1f}  max {values[-1]:.1f} dB  (bar {EQUIVALENT_PSNR_DB:.0f})")
+        return sum(1 for v in values if v < EQUIVALENT_PSNR_DB) / len(values)
 
     def _keep_baseline(self, samples: list[Sample]) -> None:
         self.baseline_dir.mkdir(parents=True, exist_ok=True)
@@ -452,7 +463,7 @@ class DiffusionEvaluator(VllmEvaluator):
                 samples = self._render_probe_set(config)
                 if node_id == "incumbent" or not self.baseline_dir.exists():
                     self._keep_baseline(samples)
-                div = self._equivalence_of(samples) if "equivalence" in probes else None
+                div = self._equivalence_of(samples, tag) if "equivalence" in probes else None
                 if div is not None:
                     self.log(f"        {el()} equivalence  {div:.0%} of fixed seed renders differ from the baseline")
                 qual: dict = {}
