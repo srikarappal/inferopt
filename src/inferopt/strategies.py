@@ -117,13 +117,15 @@ class SequentialStrategy:
     def __init__(self, dag: dict, *, lossless_only: bool = False,
                  force_benchmarks: list[str] | None = None,
                  concurrency: int | None = None,
-                 baseline=None, provenance: dict | None = None):
+                 baseline=None, provenance: dict | None = None,
+                 max_minutes: float | None = None):
         self.dag = dag
         self.lossless_only = lossless_only
         self.force_benchmarks = force_benchmarks
         self.concurrency = concurrency
         self.baseline = baseline
         self.provenance = provenance
+        self.max_minutes = max_minutes
 
     def search(self, ctx, runner, seed: dict, *,
                budget_launches: int | None = None, log=print) -> SearchResult:
@@ -145,7 +147,9 @@ class SequentialStrategy:
                        concurrency=self.concurrency,
                        provenance=self.provenance or getattr(runner, "stamp", None),
                        journal=getattr(runner, "journal", None),
-                       force_benchmarks=self.force_benchmarks)
+                       force_benchmarks=self.force_benchmarks,
+                       max_launches=budget_launches,
+                       max_minutes=self.max_minutes)
         trials = ([self.baseline] if self.baseline else []) + list(res.trials)
         kept = [t for t in res.trials if t.kept]
         ok = [t for t in trials if t.goodput]

@@ -1320,7 +1320,7 @@ def test_strategies():
          "on_keep": ["prefix_caching"]},
         {"id": "prefix_caching", "class": "lossless", "status": "active",
          "action": {"set": {"enable_prefix_caching": True}}, "probes": ["goodput"],
-         "on_keep": ["frontier"], "on_revert": ["frontier"]},
+         "cost_launches": 1, "on_keep": ["frontier"], "on_revert": ["frontier"]},
         {"id": "frontier", "class": "terminal", "status": "active"}]}
     with tempfile.TemporaryDirectory() as td:
         runner = _Runner({})
@@ -1334,6 +1334,38 @@ def test_strategies():
               plan.resuming and plan.n_trials == 2, plan.reason)
         check("stamped with the runner's identity, so resume can trust them",
               all(r["provenance"] == runner.stamp for r in plan.cache.values()))
+
+    section("strategies: the caller's budget overrides the DAG's guard")
+    said = []
+    runner = _Runner({})
+    runner.ev = _RawEvaluator({"prefix_caching": 20.0})
+    out = SequentialStrategy(dag, max_minutes=0).search(
+        _ctx(), runner, {"max_model_len": 4096}, log=said.append)
+    check("a zero minute budget stops the walk before its first node",
+          out.extra["stopped_early"] and "budget guard" in out.extra["stopped_early"],
+          out.extra.get("stopped_early"))
+    check("and the banner says whose budget it was",
+          any("[caller]" in line for line in said), said[:6])
+    out = SequentialStrategy(dag).search(
+        _ctx(), runner, {"max_model_len": 4096}, budget_launches=1, log=said.append)
+    check("one launch means the incumbent and nothing after it",
+          out.launches == 1 and out.extra["stopped_early"], out.extra.get("stopped_early"))
+    said = []
+    out = SequentialStrategy(dag).search(_ctx(), runner, {"max_model_len": 4096}, log=said.append)
+    check("unset, the DAG's own guard applies and says so",
+          out.extra["stopped_early"] is None and any("[default]" in line for line in said))
+
+    section("optimize: the budget is on the API and in the provenance")
+    import inspect as _inspect
+    from inferopt import api
+    params = _inspect.signature(api.optimize).parameters
+    check("max_launches and max_minutes are arguments",
+          "max_launches" in params and "max_minutes" in params)
+    src = _inspect.getsource(api.optimize)
+    check("the budget is written into provenance",
+          '"budget": {"max_launches": max_launches, "max_minutes": max_minutes}' in src)
+    check("and handed to every strategy the same way",
+          "budget_launches=max_launches" in src)
 
 
 class _T:

@@ -248,8 +248,16 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              concurrency: int | None = None,
              fixed_concurrency: int | None = None,
              provenance: dict | None = None,
-             force_benchmarks: list[str] | None = None) -> Result:
+             force_benchmarks: list[str] | None = None,
+             max_launches: int | None = None,
+             max_minutes: float | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
+
+    `max_launches` and `max_minutes` override the DAG's budget guard. The
+    guard is a backstop against a walk that cannot finish, sized for the
+    models this DAG was written against; a 32B on a slow card spends hours in
+    quantisation alone and would be stopped at the one node that can meet its
+    target. How long a run may take is the caller's to say, not the graph's.
 
     `journal` is a path to APPEND every Trial to as it completes; the caller
     truncates it and writes the stage 1.3 baseline first, so the file holds the
@@ -273,13 +281,20 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             'Bare StopIteration here says nothing about what is wrong.') from None
     guard = dag["traversal"]["budget_guard"]
     scenario = "multi_lora" if ctx.fingerprint.lora.multi_lora_active else "default"
-    max_launches = guard["max_launches"][scenario] if isinstance(guard["max_launches"], dict) else guard["max_launches"]
-    max_minutes = guard["max_minutes"][scenario] if isinstance(guard["max_minutes"], dict) else guard["max_minutes"]
+    def from_guard(key):
+        return guard[key][scenario] if isinstance(guard[key], dict) else guard[key]
+    budget_src = scenario
+    if max_launches is not None or max_minutes is not None:
+        budget_src = "caller"
+    if max_launches is None:
+        max_launches = from_guard("max_launches")
+    if max_minutes is None:
+        max_minutes = from_guard("max_minutes")
 
     band, band_src = STORE.accept_band(ctx.fingerprint)
     ctx.accept_band = band
     log(f"accept_band {band:.1%}  [{band_src}]")
-    log(f"budget      {max_launches} launches / {max_minutes} min  [{scenario}]\n")
+    log(f"budget      {max_launches} launches / {max_minutes:g} min  [{budget_src}]\n")
 
     jpath = Path(journal) if journal else None
     if jpath:

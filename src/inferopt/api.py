@@ -217,6 +217,8 @@ def optimize(
     port: int = 8100,
     repeats: int = 2,
     survivors: int = 3,
+    max_launches: int | None = None,
+    max_minutes: float | None = None,
     log=print,
 ) -> Result:
     """Search serving configurations and return measured operating points.
@@ -226,6 +228,11 @@ def optimize(
     1.69x on a single configuration, so a cell measured once is a coin flip
     dressed as a measurement -- and a defaulted API must not be less careful
     than the CLI it wraps.
+
+    `max_launches` and `max_minutes` bound the search. Left unset, the DAG's
+    own budget guard applies, which is a backstop sized for the models it was
+    written against and not a statement about what this run may cost. Either
+    way the budget that applied is written into the result's provenance.
     """
     from inferopt.evaluator import hardware_defaults
     from inferopt.fingerprint import Context
@@ -310,7 +317,8 @@ def optimize(
     cls = STRATEGIES[strategy]
     if strategy == "sequential":
         strat = cls(dag_json, lossless_only=lossless_only,
-                    force_benchmarks=bench if quality_every_config else None)
+                    force_benchmarks=bench if quality_every_config else None,
+                    max_minutes=max_minutes)
     else:
         from inferopt.pb_screen import factors_from_dag
         factors = factors_from_dag(dag_json, ctx)
@@ -330,14 +338,19 @@ def optimize(
     runner.stamp.update(seed_fingerprint(seed, seed_from_run))
 
     t0 = time.time()
-    out = strat.search(ctx, runner, seed, log=log)
+    out = strat.search(ctx, runner, seed, budget_launches=max_launches, log=log)
     res = Result(
         model=fp.model.id, strategy=strategy, trials=out.trials, slo=slo_,
         chosen=out.chosen, best_seen=out.best_seen, frontier=out.frontier,
         launches=out.launches or len(out.trials),
         minutes=out.minutes or (time.time() - t0) / 60,
-        run_dir=rd, predicted=predicted, provenance={**runner.stamp,
-                                "workload": fp.workload.model_dump()},
+        run_dir=rd, predicted=predicted, provenance={
+            **runner.stamp,
+            "workload": fp.workload.model_dump(),
+            # What bounded this run, or None where the DAG's guard applied. A
+            # frontier cut short by a budget should say whose budget it was.
+            "budget": {"max_launches": max_launches, "max_minutes": max_minutes},
+        },
         extra=out.extra,
     )
     res.quality_changes = _changes(res, bench)
