@@ -318,6 +318,7 @@ class PickScore:
     def __init__(self, device: str = "cpu"):
         self.device = device
         self._model = self._processor = None
+        self.last_error = ""
 
     def _load(self):
         if self._model is None:
@@ -326,27 +327,43 @@ class PickScore:
             self._model = AutoModel.from_pretrained("yuvalkirstain/PickScore_v1").eval().to(self.device)
 
     def score(self, prompts: list[str], pngs: list[bytes]) -> float | None:
+        """None on any failure. A scorer that cannot answer must not end a
+        run that has measured eight nodes, and None is read as unmeasured,
+        which zero would not be."""
         try:
             self._load()
             import torch
             from PIL import Image
-        except Exception:
+            images = [Image.open(io.BytesIO(p)).convert("RGB") for p in pngs]
+            with torch.no_grad():
+                im = self._processor(images=images, padding=True, truncation=True, max_length=77,
+                                     return_tensors="pt").to(self.device)
+                tx = self._processor(text=prompts, padding=True, truncation=True, max_length=77,
+                                     return_tensors="pt").to(self.device)
+                # transformers 5 hands back an output object; 4 handed back
+                # the tensor. Take the pooled embedding either way.
+                ie = _features(self._model.get_image_features(**im))
+                te = _features(self._model.get_text_features(**tx))
+                ie = ie / ie.norm(dim=-1, keepdim=True)
+                te = te / te.norm(dim=-1, keepdim=True)
+                scores = self._model.logit_scale.exp() * (te * ie).sum(dim=-1)
+        except Exception as failed:
+            self.last_error = f"{type(failed).__name__}: {str(failed)[:160]}"
             return None
-        images = [Image.open(io.BytesIO(p)).convert("RGB") for p in pngs]
-        with torch.no_grad():
-            im = self._processor(images=images, padding=True, truncation=True, max_length=77,
-                                 return_tensors="pt").to(self.device)
-            tx = self._processor(text=prompts, padding=True, truncation=True, max_length=77,
-                                 return_tensors="pt").to(self.device)
-            ie = self._model.get_image_features(**im)
-            te = self._model.get_text_features(**tx)
-            ie = ie / ie.norm(dim=-1, keepdim=True)
-            te = te / te.norm(dim=-1, keepdim=True)
-            scores = self._model.logit_scale.exp() * (te * ie).sum(dim=-1)
         # Mean over the set, on PickScore's own scale (about 15 to 25); the
         # walk compares deltas against the budget, so the scale only has to be
         # the same on both sides.
         return round(float(scores.mean()) / 100.0, 4)
+
+
+def _features(out):
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        return out.pooler_output
+    if hasattr(out, "image_embeds") and out.image_embeds is not None:
+        return out.image_embeds
+    if hasattr(out, "text_embeds") and out.text_embeds is not None:
+        return out.text_embeds
+    return out
 
 
 # ----------------------------------------------------------------- evaluator
@@ -472,7 +489,8 @@ class DiffusionEvaluator(VllmEvaluator):
                     prompts = [s.prompt for s in samples if s.image_png]
                     score = self.scorer.score(prompts, pngs) if pngs else None
                     qual = {b: score for b in benchmarks}
-                    self.log(f"        {el()} quality      pickscore {score}")
+                    self.log(f"        {el()} quality      pickscore {score}"
+                             + (f"  (unscored: {self.scorer.last_error})" if score is None else ""))
                 mem = self._gpu_memory_gb()
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:
