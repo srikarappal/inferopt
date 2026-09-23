@@ -223,6 +223,18 @@ def test_quality_gate():
     check("the quality gate is keyed on class == 'lossy'", "l" in kept(res),
           f"kept={kept(res)} -- documents that a mislabelled lossy node is ungated")
 
+    # A LOSSLESS NODE HAS TO BE LOSSLESS. SageAttention changed every fixed
+    # seed render; without a limit it would be kept on goodput alone.
+    d4 = mkdag([node("attn", equivalence_max_divergence=0.0,
+                     sweep=[{"attention_backend": "fa"}, {"attention_backend": "sage_attn"}])])
+    res, _ = run(d4, {"incumbent": 10.0,
+                      "attn": [{"goodput": 11.0, "equivalence_divergence": 0.0},
+                               {"goodput": 30.0, "equivalence_divergence": 1.0}]})
+    winner = next((t for t in res.trials if t.node_id == "attn" and t.kept), None)
+    check("a variant that changes the output is not a lossless candidate",
+          winner is not None and winner.config.get("attention_backend") == "fa",
+          f"kept={getattr(winner, 'config', None)} -- sage_attn was faster and not lossless")
+
     # THE BEST VARIANT THAT PASSES. dllm_threshold measured 0.8 at +235% over
     # budget and 0.9 at +80% within it; gating only the fastest reverted the
     # whole node to +0%.

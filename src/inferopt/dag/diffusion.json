@@ -73,7 +73,8 @@
       ],
       "on_revert": [
         "torch_compile"
-      ]
+      ],
+      "equivalence_max_divergence": 0.0
     },
     {
       "id": "torch_compile",
@@ -101,7 +102,8 @@
       ],
       "on_revert": [
         "cuda_graph"
-      ]
+      ],
+      "equivalence_max_divergence": 0.0
     },
     {
       "id": "cuda_graph",
@@ -129,7 +131,8 @@
       ],
       "on_revert": [
         "request_batching"
-      ]
+      ],
+      "equivalence_max_divergence": 0.0
     },
     {
       "id": "request_batching",
@@ -165,7 +168,8 @@
       "on_revert": [
         "lossless_complete"
       ],
-      "curve_crosses": true
+      "curve_crosses": true,
+      "equivalence_max_divergence": 0.0
     },
     {
       "id": "lossless_complete",

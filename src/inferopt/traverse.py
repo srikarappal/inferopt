@@ -469,7 +469,21 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             record(t)
 
         # --- keep or revert ---
-        eligible = [t for t in measured if t.slo_ok]
+        # A lossless node has to be lossless. Where the DAG says how much the
+        # equivalence probe may move (diffusion's fixed seed renders: none), a
+        # variant past that is not a candidate however fast: SageAttention
+        # changed every render and would have been kept on goodput alone.
+        limit = node.get("equivalence_max_divergence")
+        eligible = []
+        for t in measured:
+            if not t.slo_ok:
+                continue
+            if limit is not None and t.equivalence_divergence is not None \
+                    and t.equivalence_divergence > limit:
+                log(f"        not lossless: {t.equivalence_divergence:.0%} of renders differ "
+                    f"from the baseline, over the node's {limit:.0%}  [{_variant_label(t, node)}]")
+                continue
+            eligible.append(t)
         threshold = incumbent_goodput * (1 + band)
 
         def within_quality_budget(t: Trial) -> bool:
