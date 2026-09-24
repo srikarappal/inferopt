@@ -393,6 +393,76 @@ def child_env(**extra: str) -> dict[str, str]:
     return {**os.environ, "PATH": path, **extra}
 
 
+# THE PORT MUST BE OURS BEFORE THE HEALTH CHECK MEANS ANYTHING.
+#
+# A Wan2.1 walk on the GB10 spent four hours measuring one server. The runner
+# had been restarted mid-launch and the restart killed the runner, not the
+# server it had spawned (start_new_session puts it in its own group, so the
+# signal never reached it). The orphan kept port 8100. Every launch after it
+# said "healthy" within milliseconds, because /health was answered by the
+# orphan; SGLang Diffusion, finding 8100 busy, quietly moved the real server
+# to 8142 ("Port 8100 was unavailable, using port 8142 instead") where nothing
+# ever talked to it. Seven configurations, one server, differences of pure
+# noise. Three guards, in the order they would have caught it:
+#
+#   1. Refuse to launch onto a port that is already bound, and say who holds
+#      it. A stale server is also 29 GB of GPU memory nobody accounted for.
+#   2. Start the server under PR_SET_PDEATHSIG so a runner that dies without
+#      running its teardown takes the server with it. Linux only; elsewhere
+#      the first guard still refuses the next launch.
+#   3. Fail a launch whose own log says it moved ports.
+PORT_MOVED = re.compile(r"Port \d+ was unavailable, using port \d+", re.I)
+PDEATHSIG_PRELUDE = ("import ctypes, os, signal, sys; ctypes.CDLL(None).prctl(1, signal.SIGKILL); "
+                     "os.execvp(sys.argv[1], sys.argv[1:])")
+
+
+def port_holder(port: int) -> str | None:
+    """Who is bound to `port` on the loopback, or None when it is free.
+
+    A bind with SO_REUSEADDR ignores TIME_WAIT leftovers of our own previous
+    server and fails only on a live listener. The holder's identity comes from
+    /proc when we can read it, which is the case inside our own container."""
+    import socket
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((HOST, port))
+        return None
+    except OSError:
+        pass
+    finally:
+        probe.close()
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return "another process"
+    try:
+        inode = None
+        for line in (proc_root / "net" / "tcp").read_text().splitlines()[1:]:
+            fields = line.split()
+            if fields[3] == "0A" and int(fields[1].split(":")[1], 16) == port:
+                inode = fields[9]
+                break
+        if inode is not None:
+            for fd_dir in proc_root.glob("[0-9]*/fd"):
+                for fd in fd_dir.iterdir():
+                    if fd.is_symlink() and os.readlink(fd) == f"socket:[{inode}]":
+                        pid = fd_dir.parent.name
+                        cmdline = (fd_dir.parent / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                        return f"pid {pid} ({cmdline.strip()[:160]})"
+    except (OSError, ValueError, IndexError):
+        pass
+    return "another process"
+
+
+def with_parent_death_signal(cmd: list[str]) -> list[str]:
+    """On Linux, exec `cmd` under PR_SET_PDEATHSIG(SIGKILL): the kernel kills
+    it the moment the thread that launched it is gone. The prctl runs in the
+    child before exec, so it needs no preexec_fn and survives the exec."""
+    if sys.platform != "linux":
+        return cmd
+    return [sys.executable, "-c", PDEATHSIG_PRELUDE, *cmd]
+
+
 def installed_flags() -> set[str]:
     """vLLM's flag list, from its own --help=all. See Engine.installed_flags."""
     return vllm_engine.installed_flags(env=child_env())
@@ -739,8 +809,15 @@ class VllmEvaluator:
         env = child_env(CUDA_VISIBLE_DEVICES=self.gpu,
                         VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"),
                         **(engine.profile_env(self._profile_dir) if getattr(self, "profile", True) else {}))
+        holder = port_holder(self.port)
+        if holder is not None:
+            raise LaunchError(
+                f"port {self.port} is already bound by {holder}; refusing to launch. "
+                f"The health check would have measured that server instead of this "
+                f"configuration. It is most likely a server left behind by an earlier "
+                f"run: stop it and retry.")
         with open(err, "wb") as fh:
-            proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(with_parent_death_signal(cmd), stdout=fh, stderr=subprocess.STDOUT,
                                     env=env, start_new_session=True)
         try:
             # THE DEADLINE FOLLOWS PROGRESS, NOT WALL CLOCK.
@@ -772,16 +849,21 @@ class VllmEvaluator:
                 if proc.poll() is not None:
                     raise LaunchError(f"exited {proc.returncode} during startup",
                                       err.read_text()[-3000:])
+                size = err.stat().st_size if err.exists() else 0
+                if size != last_size:                 # still talking -> still working
+                    last_size = size
+                    deadline = max(deadline, now + STALL_S)
+                    moved = PORT_MOVED.search(err.read_text(errors="replace")[-20000:])
+                    if moved:
+                        raise LaunchError(
+                            f"the server moved off port {self.port} ({moved.group(0)}); "
+                            f"whatever answers {self.port} is not this configuration.",
+                            err.read_text()[-3000:])
                 try:
                     if httpx.get(f"{self.base_url}{engine.health_path}", timeout=2).status_code == 200:
                         break
                 except httpx.HTTPError:
                     pass
-
-                size = err.stat().st_size if err.exists() else 0
-                if size != last_size:                 # still talking -> still working
-                    last_size = size
-                    deadline = max(deadline, now + STALL_S)
 
                 if now > deadline or now > hard_cap:
                     why = ("stopped producing output" if now > deadline

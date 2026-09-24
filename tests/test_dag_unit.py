@@ -3190,11 +3190,45 @@ def test_profile():
     check("the profiled one is", prof["profile"] is True and prof["num_profiled_timesteps"] == 5)
 
 
+def test_port_is_ours():
+    """A launch onto a port something else holds is refused, not measured.
+
+    The Wan2.1 walk that measured one orphaned server seven times: /health was
+    answered by a stranger and SGLang moved the real server elsewhere. The
+    guard is a bind test before Popen, plus a log check for the move."""
+    import inspect, socket, sys
+    from inferopt import evaluator as E
+
+    section("port: refuse a launch onto a bound port, name the holder, and see a move")
+    free = socket.socket(); free.bind((E.HOST, 0)); port = free.getsockname()[1]; free.close()
+    check("a free port has no holder", E.port_holder(port) is None)
+    held = socket.socket(); held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    held.bind((E.HOST, port)); held.listen(1)
+    try:
+        holder = E.port_holder(port)
+        check("a listening socket is seen as a holder", holder is not None)
+        if sys.platform == "linux":
+            check("and named by pid from /proc", holder is not None and holder.startswith("pid "), holder)
+    finally:
+        held.close()
+    src = inspect.getsource(E.VllmEvaluator._serve)
+    check("the evaluator checks the port before it spawns",
+          "port_holder(self.port)" in src and src.index("port_holder(self.port)") < src.index("subprocess.Popen("))
+    check("and spawns under the parent-death wrapper", "with_parent_death_signal(cmd)" in src)
+    check("and reads the log for a move before it trusts /health",
+          "PORT_MOVED.search" in src and src.index("PORT_MOVED.search") < src.index("engine.health_path"))
+    moved = E.PORT_MOVED.search("[09-24 00:57:44] Port 8100 was unavailable, using port 8142 instead")
+    check("the move line is recognised", moved is not None)
+    wrapped = E.with_parent_death_signal(["sglang", "serve"])
+    check("the command is exec'd under a parent-death signal on linux, untouched elsewhere",
+          wrapped[-2:] == ["sglang", "serve"] and (sys.platform != "linux" or "prctl" in wrapped[2]))
+
+
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile, test_port_is_ours,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

@@ -32,6 +32,18 @@ def timed(fn, iters=20, warm=3):
     return start.elapsed_time(end) / iters
 
 
+def _publish_sglang_context():
+    """fused_experts reads SGLang's process-wide config (deterministic mode and
+    the like), which only a server publishes. Publish a minimal one so the
+    kernel runs standalone; the model path is only parsed, never loaded."""
+    from sglang.srt import runtime_context
+    if runtime_context._CONTEXT.is_config_namespace_published("exec"):
+        return
+    from sglang.srt.server_args import ServerArgs
+    role = next(iter(runtime_context.ROLE_NAMESPACE_SETS))
+    runtime_context.publish(ServerArgs(model_path="inclusionAI/LLaDA2.0-mini", trust_remote_code=True), role=role)
+
+
 def bench_moe(dev, dtype):
     # LLaDA2.0-mini: hidden 2048, expert intermediate 512, 256 experts, top 8
     K, N, E, T = 2048, 512, 256, 8
@@ -45,14 +57,18 @@ def bench_moe(dev, dtype):
         ours = timed(lambda: moe_gemv.moe_small_m(x, w1, w2, ids, wts))
         row = {"kernel": "moe_small_m", "M": M, "ours_ms": round(ours, 3)}
         try:
+            _publish_sglang_context()
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
             from sglang.srt.layers.moe.topk import StandardTopKOutput
             from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
             topk = StandardTopKOutput(topk_weights=wts, topk_ids=ids, router_logits=None)
             cfg = MoeRunnerConfig()
+            theirs = fused_experts(x, w1, w2, topk, cfg)
+            ours_out = moe_gemv.moe_small_m(x, w1, w2, ids, wts)
+            row["max_abs_diff_vs_sglang"] = round((theirs.float() - ours_out.float()).abs().max().item(), 4)
             row["sglang_fused_moe_ms"] = round(timed(lambda: fused_experts(x, w1, w2, topk, cfg)), 3)
         except Exception as e:
-            row["sglang_fused_moe_ms"] = f"n/a ({type(e).__name__})"
+            row["sglang_fused_moe_ms"] = f"n/a ({type(e).__name__}: {str(e)[:80]})"
         rows.append(row)
     return rows
 
