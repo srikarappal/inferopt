@@ -57,34 +57,36 @@ def _wrap_moe():
 
 
 def _wrap_wan_dit():
+    """The DiT's modulated norm.
+
+    Found on inspection of 0.5.20: SGLang Diffusion already fuses norm, scale
+    and shift in CUDA (sglang.kernels.ops.diffusion.fused_norm_scale_shift)
+    whenever the hidden size is a multiple of 256 up to 8192, which covers
+    Wan's 1536 and Z-Image's 3840, and it fuses the gated residual into the
+    next block's norm beside it. Item 5 of the list is theirs. Our Triton
+    version takes only the fallback, forward_native, the shapes their kernel
+    refuses; the bench decides whether it should take more.
+    """
     try:
-        from sglang.multimodal_gen.runtime.models.dits import wanvideo
+        from sglang.multimodal_gen.runtime.layers import layernorm as ln
     except Exception as e:
         return f"skipped ({type(e).__name__})"
-    # The modulated norm is whatever class norm1 is; find it by behaviour: a
-    # module whose forward takes (x, shift, scale).
-    target = None
-    for name in dir(wanvideo):
-        obj = getattr(wanvideo, name)
-        if isinstance(obj, type) and issubclass(obj, torch.nn.Module):
-            code = getattr(getattr(obj, "forward", None), "__code__", None)
-            if code and code.co_varnames[:4] == ("self", "hidden_states", "shift", "scale") \
-                    or (code and code.co_varnames[:4] == ("self", "x", "shift", "scale")):
-                target = obj
-                break
+    target = getattr(ln, "_NormScaleShift", None)
     if target is None:
-        return "skipped (no modulated norm class found)"
-    original = target.forward
+        return "skipped (no _NormScaleShift)"
+    original = target.forward_native
 
-    def forward(self, x, shift, scale):
-        affine = getattr(self, "weight", None) is not None or getattr(self, "elementwise_affine", False)
-        if x.dtype not in (torch.bfloat16, torch.float16) or affine or x.shape[-1] > 8192:
+    def forward_native(self, x, shift, scale):
+        weight = getattr(self.norm, "weight", None)
+        bias = getattr(self.norm, "bias", None)
+        if (getattr(self, "norm_type", "layer") != "layer" or weight is not None or bias is not None
+                or x.dtype not in (torch.bfloat16, torch.float16) or x.shape[-1] > 16384):
             return original(self, x, shift, scale)
         calls["modulated_layernorm"] += 1
         return dit_fusions.modulated_layernorm(x, shift, scale, eps=getattr(self, "eps", 1e-6))
 
-    target.forward = forward
-    return f"wrapped {target.__name__}.forward"
+    target.forward_native = forward_native
+    return "wrapped _NormScaleShift.forward_native (the fallback; their CUDA fusion keeps the aligned shapes)"
 
 
 def _wrap_wan_vae():
@@ -148,6 +150,19 @@ def check(device="cuda") -> dict:
         report["moe"] = {"ours_ran": calls["moe_small_m"] > before, "max_abs_err": err, "ok": err < 0.05}
     except Exception as e:
         report["moe"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+    # The DiT seam, through SGLang's own module, at a shape their CUDA kernel refuses
+    try:
+        from sglang.multimodal_gen.runtime.layers.layernorm import LayerNormScaleShift
+        norm = LayerNormScaleShift(384, eps=1e-6, elementwise_affine=False, dtype=dtype).to(device)
+        xd = torch.randn(2, 16, 384, device=device, dtype=dtype)
+        sh = torch.randn(2, 1, 384, device=device); sc = torch.randn(2, 1, 384, device=device)
+        before = calls["modulated_layernorm"]
+        got = norm(xd, sh, sc)
+        ref = dit_fusions.modulated_layernorm_reference(xd, sh, sc)
+        err = (got.float() - ref.float()).abs().max().item()
+        report["wan_dit"] = {"ours_ran": calls["modulated_layernorm"] > before, "max_abs_err": err, "ok": err < 0.1}
+    except Exception as e:
+        report["wan_dit"] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
     # Kernels alone, against their references
     x = torch.randn(2, 64, 512, device=device, dtype=dtype)
     shift = torch.randn(2, 1, 512, device=device)
