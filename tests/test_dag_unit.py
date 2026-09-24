@@ -3128,10 +3128,73 @@ def test_diffusion():
 
 
 # ==========================================================================
+def test_profile():
+    """Where the time goes, from the trace every engine writes."""
+    import gzip, tempfile
+    from pathlib import Path
+    from inferopt import profile as P, engines
+
+    section("profile: kernels summed, grouped, and the GPU's busy fraction")
+    def ev(name, ts, dur, cat="kernel"):
+        return {"ph": "X", "cat": cat, "name": name, "ts": ts, "dur": dur}
+    events = [
+        ev("flash_fwd_kernel<...>", 0, 400), ev("flash_fwd_kernel<...>", 1000, 400),
+        ev("sm90_xmma_gemm_bf16_tn", 400, 300), ev("sm90_xmma_gemm_bf16_tn", 1400, 300),
+        ev("vectorized_elementwise_kernel", 700, 50),
+        ev("Memcpy DtoD", 750, 20, cat="gpu_memcpy"),
+        {"ph": "X", "cat": "cpu_op", "name": "aten::mm", "ts": 0, "dur": 5000},   # CPU side, ignored
+        {"ph": "i", "cat": "kernel", "name": "marker", "ts": 0},                   # not a span
+    ]
+    s = P.summarise_events(events)
+    check("GPU time is the kernel sum", s["total_gpu_ms"] == 1.47, s["total_gpu_ms"])
+    check("wall is first start to last end", s["wall_ms"] == 1.7, s["wall_ms"])
+    check("busy is their ratio", abs(s["gpu_busy"] - 1.47 / 1.7) < 1e-3, s["gpu_busy"])
+    fam = s["families"]
+    check("attention leads, then gemm", list(fam)[:2] == ["attention", "gemm"], list(fam))
+    check("percentages sum to the whole", abs(sum(v["pct"] for v in fam.values()) - 100) < 0.5)
+    check("memcpy is memory", fam["memory"]["ms"] == 0.02, fam)
+    check("top op carries calls", s["top_ops"][0]["calls"] == 2 and s["top_ops"][0]["family"] == "attention")
+    check("nothing on the GPU is None, not zero", P.summarise_events([events[6]]) is None)
+
+    section("profile: the traces on disk, gz or not, merged")
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "capture_traces").mkdir()
+        with gzip.open(Path(td) / "capture_traces" / "a.pt.trace.json.gz", "wt") as fh:
+            json.dump({"traceEvents": events[:2]}, fh)
+        (Path(td) / "b.trace.json").write_text(json.dumps({"traceEvents": events[2:4]}))
+        merged = P.summarise_traces(td)
+        check("both files are read", merged["total_gpu_ms"] == 1.4 and len(merged["traces"]) == 2, merged)
+        check("an empty directory is None", P.summarise_traces(Path(td) / "nothing") is None)
+
+    section("profile: each engine arms its own switch")
+    d = Path("/tmp/p")
+    vllm = engines.VllmEngine(); vllm._flags = {"profiler_config", "max_model_len"}
+    check("vLLM takes a JSON config group",
+          vllm.profile_flags(d)[0] == "--profiler-config" and '"profiler": "torch"' in vllm.profile_flags(d)[1])
+    old = engines.VllmEngine(); old._flags = {"max_model_len"}
+    check("an older vLLM without the flag is simply not profiled", old.profile_flags(d) == [])
+    check("SGLang is armed by environment",
+          engines.SglangEngine().profile_env(d) == {"SGLANG_TORCH_PROFILER_DIR": "/tmp/p"})
+    check("SGLang Diffusion profiles per request",
+          engines.SglangDiffusionEngine().profile_request_fields(5) == {"profile": True, "num_profiled_timesteps": 5}
+          and engines.SglangDiffusionEngine().profile_window("http://x", d) is None)
+    check("the LLM engines open a window", engines.SglangEngine().profile_window("http://x", d) is not None)
+
+    section("profile: a diffusion request carries the flag only when profiling")
+    from inferopt import diffusion as D
+    from inferopt.fingerprint import DiffusionShape
+    shape = DiffusionShape(kind="image", transformer_class="X", width=8, height=8, steps=4, guidance_scale=1.0)
+    plain = D.request_body(shape, {}, "p", 1)
+    prof = D.request_body(shape, {"profile": True, "num_profiled_timesteps": 5}, "p", 1)
+    check("plain requests are not profiled", "profile" not in plain)
+    check("the profiled one is", prof["profile"] is True and prof["num_profiled_timesteps"] == 5)
+
+
+# ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

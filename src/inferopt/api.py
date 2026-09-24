@@ -219,6 +219,7 @@ def optimize(
     survivors: int = 3,
     max_launches: int | None = None,
     max_minutes: float | None = None,
+    profile: bool = True,
     log=print,
 ) -> Result:
     """Search serving configurations and return measured operating points.
@@ -233,6 +234,12 @@ def optimize(
     own budget guard applies, which is a backstop sized for the models it was
     written against and not a statement about what this run may cost. Either
     way the budget that applied is written into the result's provenance.
+
+    `profile` takes a torch profiler window on every served trial, a few
+    seconds at its operating point, and puts where the GPU's time went
+    (families, top kernels, busy fraction) on the trial's diagnostics. That is
+    the denominator stage 3 reads to look past the DAG. Off only for a run
+    that cannot afford the trace on disk.
     """
     from inferopt.evaluator import hardware_defaults
     from inferopt.fingerprint import Context
@@ -255,7 +262,7 @@ def optimize(
         return optimize_pipeline(model=model, rows=rows, latency_p99_ms=ttft_p99_ms,
                                  qps=qps or 1.0, allow_loss=allow_loss, run_dir=run_dir,
                                  gpu=gpu, port=port, max_launches=max_launches,
-                                 max_minutes=max_minutes, dag=dag, log=log)
+                                 max_minutes=max_minutes, dag=dag, profile=profile, log=log)
     fp, slo_ = build_fingerprint(InferOptRequest(
         model=model, trace=trace, ttft_p99_ms=ttft_p99_ms, itl_p99_ms=itl_p99_ms,
         allow_loss=allow_loss, **({"qps": qps} if qps else {})))
@@ -266,6 +273,7 @@ def optimize(
     runner = MethodRunner(strategy, fp, slo_, trace, rd, gpu=gpu, port=port,
                           benchmarks=bench, quality_every=quality_every_config,
                           log=log)
+    runner.ev.profile = profile
 
     # The seed. Identical across strategies, and --seed-from-run replaces it for
     # ALL THREE, not only the chaining walk.

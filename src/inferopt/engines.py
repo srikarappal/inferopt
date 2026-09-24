@@ -29,6 +29,34 @@ import sys
 from pathlib import Path
 
 
+class _HttpProfileWindow:
+    """POST /start_profile on entry, /stop_profile on exit: vLLM and SGLang
+    both speak it. Failures are swallowed on purpose; a profile is a bonus on
+    a measurement, never a reason to lose one."""
+
+    def __init__(self, base_url: str, start_body: dict):
+        self.base_url, self.start_body = base_url, start_body
+        self.armed = False
+
+    def __enter__(self):
+        import httpx
+        try:
+            r = httpx.post(f"{self.base_url}/start_profile", json=self.start_body, timeout=30)
+            self.armed = r.status_code < 300
+        except Exception:
+            self.armed = False
+        return self
+
+    def __exit__(self, *exc):
+        import httpx
+        if self.armed:
+            try:
+                httpx.post(f"{self.base_url}/stop_profile", json={}, timeout=120)
+            except Exception:
+                pass
+        return False
+
+
 class Engine:
     """What the evaluator asks of a server it launches. Subclasses fill it in."""
 
@@ -115,6 +143,26 @@ class Engine:
     def defaults(self, fp) -> dict:
         """Flags this (model, card) pair REQUIRES on this engine to run at all.
         Merged UNDER the caller's config, so an explicit value always wins."""
+        return {}
+
+    # --- profiling --------------------------------------------------------
+    # Every engine ships a torch profiler behind its own switch and writes a
+    # Chrome trace. These four say how to arm it at launch, how to open and
+    # close a window while serving, and, for an engine that profiles per
+    # request rather than per window, what to put on that request.
+
+    def profile_flags(self, directory: Path) -> list[str]:
+        return []
+
+    def profile_env(self, directory: Path) -> dict[str, str]:
+        return {}
+
+    def profile_window(self, base_url: str, directory: Path):
+        """A context manager around the requests to profile, or None when
+        this engine profiles per request instead."""
+        return None
+
+    def profile_request_fields(self, steps: int = 5) -> dict:
         return {}
 
     # --- metrics ----------------------------------------------------------
@@ -204,6 +252,18 @@ class VllmEngine(Engine):
     def translate(self, config, workdir=None) -> list[str]:
         return self.generic_flags((k, v) for k, v in config.items() if k != "model")
 
+    def profile_flags(self, directory: Path) -> list[str]:
+        # 0.29: a JSON config group; the endpoints attach only when it names
+        # a profiler. Traces land under <dir>/capture_traces. An older vLLM
+        # without the flag simply is not profiled.
+        if "profiler_config" not in self.installed_flags():
+            return []
+        return ["--profiler-config",
+                json.dumps({"profiler": "torch", "torch_profiler_dir": str(directory)})]
+
+    def profile_window(self, base_url, directory):
+        return _HttpProfileWindow(base_url, {})
+
     def defaults(self, fp) -> dict:
         # gpu_memory_utilization: 0.75 on unified memory, where the fraction is
         # of SYSTEM memory the CPU also competes for and 0.90 runs a 122 GB box
@@ -282,6 +342,13 @@ class SglangEngine(Engine):
             return getattr(sglang, "__version__", "unknown")
         except Exception:
             return "unknown"
+
+    def profile_env(self, directory: Path) -> dict[str, str]:
+        return {"SGLANG_TORCH_PROFILER_DIR": str(directory)}
+
+    def profile_window(self, base_url, directory):
+        return _HttpProfileWindow(base_url, {"output_dir": str(directory),
+                                             "activities": ["CPU", "GPU"]})
 
     # DAG key -> SGLang flag, for the keys that are a plain rename.
     RENAMES = {
@@ -456,6 +523,17 @@ class SglangDiffusionEngine(SglangEngine):
 
     def defaults(self, fp) -> dict:
         return {}
+
+    def profile_env(self, directory: Path) -> dict[str, str]:
+        return {"SGLANG_DIFFUSION_TORCH_PROFILER_DIR": str(directory)}
+
+    def profile_window(self, base_url, directory):
+        return None                      # per request, below, not a window
+
+    def profile_request_fields(self, steps: int = 5) -> dict:
+        # Profiled per request: `steps` denoising steps after warm-up, the
+        # trace written as <request id>-...trace.json.gz under the env dir.
+        return {"profile": True, "num_profiled_timesteps": steps}
 
     def derive(self, series, reduce) -> dict:
         g = lambda *ks: next((reduce(k) for k in ks if k in series), None)

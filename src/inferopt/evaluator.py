@@ -729,9 +729,16 @@ class VllmEvaluator:
         d = self.run_dir / "launches" / tag
         d.mkdir(parents=True, exist_ok=True)
         err = d / "server.log"
+        # The profiler is armed at launch, on every launch: the window is
+        # opened after the sweep for a few seconds, so a trace of where the
+        # step's time goes rides on every trial. Stage 3 reads it there.
+        self._profile_dir = d / "profile"
         cmd = engine.serve_argv(model, HOST, self.port, config, workdir=d)
+        if getattr(self, "profile", True):
+            cmd += engine.profile_flags(self._profile_dir)
         env = child_env(CUDA_VISIBLE_DEVICES=self.gpu,
-                        VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"))
+                        VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"),
+                        **(engine.profile_env(self._profile_dir) if getattr(self, "profile", True) else {}))
         with open(err, "wb") as fh:
             proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
                                     env=env, start_new_session=True)
@@ -1277,6 +1284,9 @@ class VllmEvaluator:
                     qual = {}
                     if "quality" in probes and benchmarks:
                         qual = self._score(model, config, benchmarks, tag, el)
+                    profile = self._profile(model, conc, el)
+                    if profile:
+                        diag["profile"] = profile
                     mem = self._gpu_memory_gb()
                     self.log(f"        {el()} done, tearing down")
                     return Trial(
@@ -1409,6 +1419,9 @@ class VllmEvaluator:
                 qual = {}
                 if "quality" in probes and benchmarks:
                     qual = self._score(model, config, benchmarks, tag, el)
+                profile = self._profile(model, conc, el)
+                if profile:
+                    diag["profile"] = profile
                 mem = self._gpu_memory_gb()
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:
@@ -1451,6 +1464,43 @@ class VllmEvaluator:
                                   "ttft_n": med.get("ttft_n", 0),
                                   "failure_reasons": passes[0].get("failure_reasons") or {}},
                      slo_ok=med["goodput"] > 0)
+
+    PROFILE_S = 8.0          # a short window at the operating point; steady state, not warm-up
+
+    def _profile(self, model: str, concurrency: int | None, el=lambda: "") -> dict | None:
+        """Where the time goes at this configuration's operating point.
+
+        Opens the engine's profiler window around a short closed loop at the
+        peak concurrency, waits for the trace, and reduces it to families,
+        top kernels and the GPU's busy fraction. Never fatal and never zero:
+        an engine that cannot profile leaves the field absent.
+        """
+        if not getattr(self, "profile", True):
+            return None
+        from inferopt.profile import summarise_traces
+        window = self.engine.profile_window(self.base_url, self._profile_dir)
+        if window is None:
+            return None
+        try:
+            with window:
+                asyncio.run(_closed_loop(self.base_url, model, self.prompts,
+                                         self.replay_lengths(), max(1, concurrency or 1),
+                                         0.0, self.PROFILE_S))
+            # The trace is written after /stop_profile returns, by the worker.
+            summary = None
+            for _ in range(30):
+                summary = summarise_traces(self._profile_dir)
+                if summary:
+                    break
+                time.sleep(2)
+            if summary:
+                top = summary["families"]
+                head = ", ".join(f"{f} {v['pct']:.0f}%" for f, v in list(top.items())[:4])
+                self.log(f"        {el()} profile      gpu busy {summary['gpu_busy']}  {head}")
+            return summary
+        except Exception as failed:
+            self.log(f"        {el()} profile      not taken ({type(failed).__name__}: {str(failed)[:80]})")
+            return None
 
     def _gpu_memory_gb(self) -> float:
         try:

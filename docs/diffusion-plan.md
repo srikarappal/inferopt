@@ -230,3 +230,25 @@ exist: AIConfigurator is LLM only, so the plot is measured points alone.
 4. `dag/diffusion.json`, the diffusion fingerprint, the sample driver and the
    two probes. Image first (FLUX, Qwen-Image), video on the same code with
    frames as an axis (Wan 2.2).
+
+## The profile every trial carries (for stage 3)
+
+Every served trial, LLM or diffusion, ends with a torch profiler window at its
+operating point: `--profiler-config` on vLLM, `/start_profile` on SGLang,
+`profile: true` on one SGLang Diffusion request. All three write a Chrome
+trace, and `inferopt/profile.py` reduces it to what a reader can act on:
+
+```
+diagnostics.profile
+  total_gpu_ms, wall_ms, gpu_busy      how much of the span the GPU was executing anything
+  families                             attention, gemm, moe, conv, norm, rope_embed, sampling,
+                                       memory, elementwise, allreduce, other: ms and percent
+  top_ops                              the 25 heaviest kernels by name, family, ms, percent, calls
+  traces                               the files, beside the launch log, for the whole picture
+```
+
+It rides in the journal and in result.json, so stage 3 gets, for each point on
+the frontier, not only what the configuration was but what the step was made
+of on that card. A kernel effort aimed at an op that is 40% of a step on the
+customer's hardware is a product; one aimed at what looked slow on the test
+rig is a hobby, and this is how the two are told apart.

@@ -178,6 +178,7 @@ class Sample:
 def request_body(shape: DiffusionShape, config: dict, prompt: str, seed: int) -> dict:
     """The per request half of a config, over the workload's defaults."""
     body = {"prompt": prompt, "n": 1, "seed": seed,
+            **{k: config[k] for k in ("profile", "num_profiled_timesteps") if k in config},
             "width": int(config.get("width", shape.width)),
             "height": int(config.get("height", shape.height)),
             "num_inference_steps": int(config.get("num_inference_steps", shape.steps)),
@@ -409,6 +410,36 @@ class DiffusionEvaluator(VllmEvaluator):
                 return await _one(client, self.base_url, self.shape, config, self.prompts[0], 1, False)
         return asyncio.run(go()).latency
 
+    def _profile_one(self, config: dict, el=lambda: "") -> dict | None:
+        """One sample with the engine's profiler on, reduced to where its
+        denoising steps spend the GPU. Per request, because that is how
+        SGLang Diffusion profiles; never fatal."""
+        if not getattr(self, "profile", True):
+            return None
+        from inferopt.profile import summarise_traces
+        fields = self.engine.profile_request_fields(steps=5)
+        if not fields:
+            return None
+        try:
+            async def go():
+                async with httpx.AsyncClient() as client:
+                    return await _one(client, self.base_url, self.shape, {**config, **fields},
+                                      self.prompts[0], 3, False)
+            asyncio.run(go())
+            summary = None
+            for _ in range(30):
+                summary = summarise_traces(self._profile_dir)
+                if summary:
+                    break
+                time.sleep(2)
+            if summary:
+                head = ", ".join(f"{f} {v['pct']:.0f}%" for f, v in list(summary["families"].items())[:4])
+                self.log(f"        {el()} profile      gpu busy {summary['gpu_busy']}  {head}")
+            return summary
+        except Exception as failed:
+            self.log(f"        {el()} profile      not taken ({type(failed).__name__}: {str(failed)[:80]})")
+            return None
+
     def _render_probe_set(self, config: dict) -> list[Sample]:
         """The fixed seed samples every probe reads, generated at L=1."""
         async def go():
@@ -513,6 +544,7 @@ class DiffusionEvaluator(VllmEvaluator):
                     qual = {b: score for b in benchmarks}
                     self.log(f"        {el()} quality      pickscore {score}"
                              + (f"  (unscored: {self.scorer.last_error})" if score is None else ""))
+                profile = self._profile_one(config, el)
                 mem = self._gpu_memory_gb()
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:
@@ -545,7 +577,7 @@ class DiffusionEvaluator(VllmEvaluator):
                          "completed": peak["completed"], "failed": peak["failed"],
                          "latency_p50_s": round(peak["latency_p50_s"], 2),
                          "failure_reasons": peak["failure_reasons"],
-                         "unit": "frames"},
+                         "unit": "frames", **({"profile": profile} if profile else {})},
             slo_ok=peak["goodput_frames_s"] > 0,
         )
 
@@ -588,7 +620,7 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
                       qps: float = 1.0, allow_loss: float | None = None,
                       run_dir: str | None = None, gpu: str = "0", port: int = 8100,
                       max_launches: int | None = None, max_minutes: float | None = None,
-                      dag: str | None = None, log=print):
+                      dag: str | None = None, profile: bool = True, log=print):
     """Search a diffusers pipeline's serving configurations. The diffusion
     twin of api.optimize, and what it delegates to for a model with a
     model_index.json.
@@ -627,6 +659,7 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
     log(resume.describe(plan))
     evaluator = DiffusionEvaluator(fp, slo, [r["prompt"] for r in rows], str(rd),
                                    gpu=gpu, port=port, log=log)
+    evaluator.profile = profile
     if plan.resuming:
         evaluator.replay = plan.cache
     else:
