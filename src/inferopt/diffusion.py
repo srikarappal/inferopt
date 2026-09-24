@@ -490,9 +490,12 @@ class DiffusionEvaluator(VllmEvaluator):
                     self.log(f"        {el()} L={level:<3d} goodput {med['goodput_frames_s']:7.2f} frames/s  "
                              f"p99 {med['latency_p99_s']:6.1f}s  slo {med['slo_attainment']:.0%}  "
                              f"({med['completed']} done)")
-                    # Past the peak and failing the target: more load cannot help.
-                    if len(pts) >= 2 and med["goodput_frames_s"] < pts[-2]["goodput_frames_s"] \
-                            and med["slo_attainment"] < 0.5:
+                    # Past the peak: more load cannot help. A server that does
+                    # not batch samples serialises them, so latency grows with
+                    # concurrency and goodput, once it falls, does not come
+                    # back; the next level is fifteen minutes for the same
+                    # answer.
+                    if len(pts) >= 2 and med["goodput_frames_s"] < pts[-2]["goodput_frames_s"]:
                         break
                 peak = max(pts, key=lambda m: m["goodput_frames_s"])
 
