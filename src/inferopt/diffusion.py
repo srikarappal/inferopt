@@ -41,8 +41,11 @@ from inferopt.fingerprint import (SLO, Context, DiffusionShape, Fingerprint,
 from inferopt.traverse import Trial
 
 SWEEP_LEVELS = (1, 2, 4, 8)
-WINDOW_S = 120.0            # a sample takes seconds, so a window holds few of them
-PROBE_SAMPLES = 8           # fixed seed prompts for equivalence and quality
+WINDOW_S = 120.0            # the floor; a window has to hold several samples, see measure()
+SAMPLES_PER_WINDOW = 4      # at L=1. A 74 s clip in a 120 s window completed once per level and
+                            # every level read the same number, which cannot be true
+PROBE_SAMPLES = 8           # fixed seed prompts for equivalence and quality, images
+PROBE_SAMPLES_VIDEO = 4     # clips take minutes each
 EQUIVALENT_PSNR_DB = 40.0   # above this two renders differ by float noise, not by a kernel
 POLL_S = 1.0
 
@@ -395,7 +398,16 @@ class DiffusionEvaluator(VllmEvaluator):
         return []
 
     def _probe_prompts(self) -> list[str]:
-        return self.prompts[:PROBE_SAMPLES]
+        n = PROBE_SAMPLES_VIDEO if self.shape.kind == "video" else PROBE_SAMPLES
+        return self.prompts[:n]
+
+    def _first_latency(self, config: dict) -> float:
+        """One sample, timed, when the warm-up window closed before any
+        finished: a clip can take longer than the warm-up itself."""
+        async def go():
+            async with httpx.AsyncClient() as client:
+                return await _one(client, self.base_url, self.shape, config, self.prompts[0], 1, False)
+        return asyncio.run(go()).latency
 
     def _render_probe_set(self, config: dict) -> list[Sample]:
         """The fixed seed samples every probe reads, generated at L=1."""
@@ -460,12 +472,18 @@ class DiffusionEvaluator(VllmEvaluator):
         try:
             with self._serve(config, tag) as model:
                 self.log(f"        {el()} healthy, warming up")
-                asyncio.run(closed_loop(self.base_url, self.shape, config, self.prompts, 1,
-                                        min(WARMUP_S, 60.0)))
+                # Warm-up renders at least one sample and so knows how long one
+                # takes; the measurement window is sized from that, so every
+                # level completes several samples rather than one.
+                warm = asyncio.run(closed_loop(self.base_url, self.shape, config, self.prompts, 1,
+                                               min(WARMUP_S, 60.0)))
+                one_sample_s = warm["latency_p50_s"] if warm["completed"] else self._first_latency(config)
+                window_s = max(WINDOW_S, SAMPLES_PER_WINDOW * one_sample_s)
+                self.log(f"        {el()} one sample {one_sample_s:.1f}s, window {window_s:.0f}s")
                 pts = []
                 for level in (levels or SWEEP_LEVELS):
                     med = asyncio.run(closed_loop(self.base_url, self.shape, config,
-                                                  self.prompts, level, WINDOW_S,
+                                                  self.prompts, level, window_s,
                                                   latency_target_ms=target_ms))
                     med["concurrency"] = level
                     pts.append(med)
