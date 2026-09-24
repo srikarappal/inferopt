@@ -207,6 +207,84 @@ exist: AIConfigurator is LLM only, so the plot is measured points alone.
   accepted them all, and a launch that dies is recorded as goodput 0 and the
   walk moves on, as with vLLM.
 
+## Answered by the diffusion runs (Z-Image-Turbo and Wan2.1-T2V-1.3B on the GB10, 24 Sep 2026)
+
+Both walks had the same shape: the server-side lossless branch is flat on
+this card, every gain is in the request-side lossy branch.
+
+Z-Image-Turbo, 1024x1024, 8 steps distilled, 13 launches:
+
+| node | result |
+|---|---|
+| incumbent | 0.14 img/s, PickScore 0.2336 |
+| attention_backend, torch_compile, cuda_graph, request_batching | reverted, all within noise; the server serialises samples |
+| dit_fp8 | reverted, fp8 is slower than bf16 on the GB10 |
+| cache_dit 0.40 | kept, +21% |
+| steps 4 | kept, +59%; chosen 0.27 img/s at PickScore 0.2348 |
+
+Wan2.1-T2V-1.3B, 832x480 x 33 frames, 30 steps, cfg 5.0, 14 launches:
+
+| node | result |
+|---|---|
+| incumbent | 0.45 frames/s, 72 s per clip, PickScore 0.2097 |
+| attention_backend | reverted: fa falls back to SDPA on sm121 (bit-identical, +0%); sage_attn 37.6 dB median against a 40 dB bar |
+| torch_compile | reverted: 38.0 dB against the bar, and flat on speed |
+| cuda_graph, request_batching | reverted, +0% and +2.2% |
+| dit_fp8 | reverted at +4.4%, under the 5% band; PickScore 0.2109 |
+| cache_dit 0.40 | kept, 1.13 frames/s, +151%; PickScore 0.2028 |
+| steps 15 | kept, 1.68 frames/s, +49%; PickScore 0.2028 |
+| guidance 3.5 | reverted, +0% (a scale costs the same compute) |
+
+Chosen: 15 steps with Cache-DiT 0.40, 3.7x the seed, a clip in about 20 s.
+Two candidates landed at 38 dB: the 40 dB bar may be too strict for a
+30-step video sampler, where a reordering of floating point is amplified
+through the trajectory; worth measuring against a perceptual metric before
+it rejects a real win.
+
+Two measurement faults found on the way, both fixed in the evaluator:
+
+- A restarted runner left its server alive on port 8100; SGLang Diffusion
+  moved every later server to another port ("Port 8100 was unavailable,
+  using port 8142 instead") and the health check kept passing against the
+  orphan. Seven launches measured one server. Now a bound port refuses the
+  launch and names the holder, a launch whose log says it moved ports fails,
+  and the server runs under PR_SET_PDEATHSIG so a dead runner takes it along
+  (`d5b25ee`).
+- Frames over the clock window quantised: a 74 s clip in a 297 s window
+  completes 3 or 4 times by phase, and one server read 0.34 then 0.44
+  frames/s. The rate is now over the span to the last completion (`7aced5a`).
+
+SGLang exposes a request `quality` field that decides whether its own
+kernel fusions (the Wan VAE RMSNorm+SiLU among them) may run; the DAG does
+not sweep it yet.
+
+## Custom kernels: what the bench said (`vi_kernels`, GB10, 24 Sep 2026)
+
+Four Triton kernels, each compiled and verified against a reference on the
+card, benchmarked on an idle GPU (`python -m vi_kernels.bench`):
+
+| kernel | ours | what is already there | verdict |
+|---|---|---|---|
+| MoE small-M (LLaDA2 shape, M=1/4/8/16) | 0.25 / 0.92 / 1.66 / 2.84 ms | SGLang `fused_experts` 0.24 / 0.87 / 1.65 / 2.77 ms | no win, 1 to 5% slower; outputs agree |
+| dLLM block attention, 32-row block | 0.092 ms full block, 0.023 ms at 2 active rows | SDPA 0.034 ms | slower unless under 8 rows are still active |
+| DiT modulated LayerNorm and gated residual (Wan 480p) | 0.92 / 1.37 ms | eager 8.2 / 8.7 ms; SGLang has a CUDA fusion for widths that are multiples of 256 up to 8192 | upstream already; ours takes only the shapes theirs refuses |
+| Wan VAE channel RMSNorm+SiLU (decoder mid stage) | 5.0 ms | eager 21.7 ms; SGLang has a Triton fusion gated on request `quality` and channels_last_3d | 4.3x on the op, under 1% of a clip; ours takes the eager path |
+
+The adapter (`vi_kernels.sglang_adapter`) wraps `fused_experts`,
+`_NormScaleShift.forward_native`, `FusedWanRMSNormSiLU`'s off path and
+`WanRMS_norm`; its self-check drives each through SGLang's own entry point
+and confirms ours ran. An SGLang server runs its kernels in a spawned
+process, so the wrap is applied by an import hook that a `.pth` line arms
+when `VI_KERNELS=1` is in the environment (`vi_kernels.autoload`), which is
+also how a DAG node would switch it on per launch. Verified on live servers
+(`bench/pickup.py`): a LLaDA2.0-mini server answered a chat request with
+`moe_small_m` taking its first call in the scheduler process, and a Wan2.1
+server decoded a clip with `channel_rmsnorm_silu` taking its first call in
+its scheduler; the DiT wrap stayed idle there, as it should at width 1536
+where SGLang's own CUDA fusion runs. Picked up, and by the bench, not worth
+switching on for these models: the MoE and attention kernels are slower
+than what SGLang ships and the two fusions are already upstream.
+
 ## What has to be verified on a machine before it is believed
 
 - SGLang wheels on the DGX (aarch64, sm121). The target is x86 H100 and
