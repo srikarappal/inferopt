@@ -71,7 +71,7 @@ def launch(engine, model: str, port: int, config: dict, log_path: Path) -> subpr
     holder = port_holder(port)
     if holder is not None:
         sys.exit(f"port {port} is already bound by {holder}; stop it or pass --port")
-    cmd = engine.serve_argv(model, HOST, port, config, workdir=str(log_path.parent))
+    cmd = engine.serve_argv(model, HOST, port, config, workdir=log_path.parent)
     print(f"launching: {' '.join(cmd)}", flush=True)
     fh = open(log_path, "wb")
     return subprocess.Popen(with_parent_death_signal(cmd), stdout=fh, stderr=subprocess.STDOUT,

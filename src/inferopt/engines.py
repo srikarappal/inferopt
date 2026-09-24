@@ -428,7 +428,7 @@ class SglangEngine(Engine):
         settings = {k: v for k, v in (("block_size", block_size), ("threshold", threshold))
                     if v is not None}
         if settings:
-            target = (workdir or Path(".")) / "dllm.yaml"
+            target = Path(workdir or ".") / "dllm.yaml"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("".join(f"{k}: {v}\n" for k, v in settings.items()))
             out.append(("dllm_algorithm_config", str(target)))
