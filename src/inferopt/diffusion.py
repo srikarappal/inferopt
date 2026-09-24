@@ -248,7 +248,8 @@ async def closed_loop(base_url: str, shape: DiffusionShape, config: dict, prompt
     """
     cursor = [0]
     finished: list[Sample] = []
-    stop = time.perf_counter() + window_s
+    opened = time.perf_counter()
+    stop = opened + window_s
 
     async def worker(client):
         while time.perf_counter() < stop:
@@ -261,12 +262,27 @@ async def closed_loop(base_url: str, shape: DiffusionShape, config: dict, prompt
 
     async with httpx.AsyncClient() as client:
         await asyncio.gather(*(worker(client) for _ in range(concurrency)))
-    return summarise(finished, window_s, latency_target_ms)
+    return summarise(finished, span_of(finished, opened, window_s), latency_target_ms)
 
 
-def summarise(samples: list[Sample], window_s: float,
+def span_of(finished: list[Sample], opened: float, window_s: float) -> float:
+    """The time the completed work took: window open to the last completion.
+
+    Frames over the clock window quantises: a 74 s clip in a 297 s window
+    completes 3 or 4 times depending on phase, and the same server read 0.34
+    then 0.44 frames/s on consecutive launches, a 25% swing against a 5%
+    accept band. Over the span to the last completion, 3 clips in 222 s and
+    4 in 297 s are the same rate. The window still bounds how long we wait;
+    it is no longer the denominator. Nothing completed: the window stands,
+    and the rate is zero either way."""
+    done = [s.done for s in finished if s.done is not None]
+    return max(done) - opened if done else window_s
+
+
+def summarise(samples: list[Sample], span_s: float,
               latency_target_ms: float | None = None) -> dict:
-    """Goodput is frames of samples that met the target, over the window."""
+    """Goodput is frames of samples that met the target, over the span the
+    completed work took (see span_of)."""
     ok = [s for s in samples if s.ok]
     lat = sorted(s.latency for s in ok)
     p = lambda q: (lat[min(len(lat) - 1, int(math.ceil(q * len(lat))) - 1)] if lat else float("inf"))
@@ -274,8 +290,9 @@ def summarise(samples: list[Sample], window_s: float,
     return {
         "completed": len(ok), "failed": len(samples) - len(ok),
         "latency_p50_s": p(0.5), "latency_p99_s": p(0.99),
-        "throughput_frames_s": sum(s.frames for s in ok) / window_s,
-        "goodput_frames_s": sum(s.frames for s in met) / window_s,
+        "span_s": round(span_s, 1),
+        "throughput_frames_s": sum(s.frames for s in ok) / span_s,
+        "goodput_frames_s": sum(s.frames for s in met) / span_s,
         "slo_attainment": (len(met) / len(ok)) if ok else 0.0,
         "failure_reasons": {s.error[:60]: 1 for s in samples if not s.ok},
     }

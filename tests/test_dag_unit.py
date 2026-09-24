@@ -3057,6 +3057,20 @@ def test_diffusion():
     vmed = D.summarise([sample(30.0, frames=81)], 120.0, 60000)
     check("a clip counts its frames", abs(vmed["goodput_frames_s"] - 81 / 120) < 1e-9, vmed)
 
+    section("diffusion: the rate is over the span to the last completion, not the clock window")
+    def clip(done_at, opened, frames=33):
+        s = D.Sample("p", 1); s.frames = frames; s.start = opened; s.done = opened + done_at
+        return s
+    opened = 1000.0
+    three = [clip(t, opened) for t in (74.3, 148.6, 222.9)]
+    four = [clip(t, opened) for t in (74.3, 148.6, 222.9, 297.2)]
+    r3 = D.summarise(three, D.span_of(three, opened, 297.0))["goodput_frames_s"]
+    r4 = D.summarise(four, D.span_of(four, opened, 297.0))["goodput_frames_s"]
+    check("3 clips in 223 s and 4 in 297 s read the same rate", abs(r3 - r4) / r4 < 0.01, (r3, r4))
+    check("and it is the clip rate", abs(r3 - 33 / 74.3) < 1e-6, r3)
+    check("nothing completed: the window stands", D.span_of([], opened, 297.0) == 297.0)
+    check("the span is recorded", "span_s" in D.summarise(three, D.span_of(three, opened, 297.0)))
+
     section("diffusion: equivalence is PSNR against the baseline render")
     from PIL import Image
     def png(shade):
