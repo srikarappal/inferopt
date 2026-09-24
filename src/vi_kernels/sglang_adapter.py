@@ -23,12 +23,22 @@ own process gets it without a fork of SGLang.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import torch
 
 from vi_kernels import dit_fusions, moe_gemv, vae_norm
 
 calls = {"moe_small_m": 0, "modulated_layernorm": 0, "gated_residual": 0, "channel_rmsnorm_silu": 0}
 installed: dict[str, str] = {}
+
+
+def _note(kernel: str) -> None:
+    """Count a call; announce the first one so a server log shows the pickup."""
+    calls[kernel] += 1
+    if calls[kernel] == 1:
+        print(f"vi_kernels: {kernel} took its first call  [pid {os.getpid()}]", file=sys.stderr)
 
 
 def _wrap_moe():
@@ -47,7 +57,7 @@ def _wrap_moe():
                  and getattr(moe_runner_config, "activation", "silu") == "silu")
         if not plain:
             return original(hidden_states, w1, w2, topk_output, moe_runner_config, *args, **kwargs)
-        calls["moe_small_m"] += 1
+        _note("moe_small_m")
         out = moe_gemv.moe_small_m(hidden_states, w1, w2, topk_output.topk_ids, topk_output.topk_weights)
         scaling = getattr(moe_runner_config, "routed_scaling_factor", None)
         return out * scaling if scaling and scaling != 1.0 else out
@@ -82,42 +92,75 @@ def _wrap_wan_dit():
         if (getattr(self, "norm_type", "layer") != "layer" or weight is not None or bias is not None
                 or x.dtype not in (torch.bfloat16, torch.float16) or x.shape[-1] > 16384):
             return original(self, x, shift, scale)
-        calls["modulated_layernorm"] += 1
+        _note("modulated_layernorm")
         return dit_fusions.modulated_layernorm(x, shift, scale, eps=getattr(self, "eps", 1e-6))
 
     target.forward_native = forward_native
     return "wrapped _NormScaleShift.forward_native (the fallback; their CUDA fusion keeps the aligned shapes)"
 
 
+_vae_seams_done: set[str] = set()
+
+
+def _wrap_norm_forward(cls, silu: bool, label: str) -> bool:
+    """Wrap `cls.forward(self, x)` where the class computes
+    F.normalize(x, dim=1) * scale * gamma + bias, optionally followed by SiLU.
+    Ours takes channel-first contiguous 5D input in bf16/fp16/fp32; anything
+    else goes to the original."""
+    if label in _vae_seams_done:
+        return False
+    original = cls.forward
+
+    def forward(self, x):
+        gamma = getattr(self, "gamma", None)
+        bias = getattr(self, "bias", None)
+        gate = getattr(self, "_sgl_gate", None)
+        theirs_would_run = gate is not None and gate.enabled and x.is_contiguous(memory_format=torch.channels_last_3d)
+        if (gamma is None or x.ndim != 5 or not x.is_contiguous() or theirs_would_run
+                or x.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+                or torch.compiler.is_compiling()):
+            return original(self, x)
+        _note("channel_rmsnorm_silu")
+        b = bias.reshape(-1) if isinstance(bias, torch.Tensor) else None
+        return vae_norm.channel_rmsnorm_silu(x, gamma.reshape(-1), b, silu=silu)
+
+    cls.forward = forward
+    _vae_seams_done.add(label)
+    return True
+
+
 def _wrap_wan_vae():
-    candidates = []
+    """The Wan VAE's RMS norm, in SGLang's own decoder.
+
+    Found on inspection of 0.5.20: SGLang Diffusion already fuses RMSNorm+SiLU
+    in the Wan decoder (wan_vae_cuda_opt.FusedWanRMSNormSiLU, a Triton kernel)
+    but only when the request's `quality` allows kernel fusions AND the tensor
+    is channels_last_3d; the default request runs the eager chain. Ours takes
+    the eager cases: the fused class's off path (norm+SiLU), the attention
+    block's bare norm (WanRMS_norm, no SiLU) and diffusers' WanRMS_norm for a
+    diffusers-backend pipeline. Called once per module as each is imported."""
+    done = []
     try:
-        from diffusers.models.autoencoders import autoencoder_kl_wan as m
-        candidates.append(m)
+        from sglang.multimodal_gen.runtime.models.vaes import wan_vae_cuda_opt as opt
+        if _wrap_norm_forward(opt.FusedWanRMSNormSiLU, silu=True, label="sglang fused off-path"):
+            done.append("sglang FusedWanRMSNormSiLU off-path")
     except Exception:
         pass
     try:
-        from sglang.multimodal_gen.runtime.models.vaes import wanvae as m2
-        candidates.append(m2)
+        from sglang.multimodal_gen.runtime.models.vaes import wanvae
+        if _wrap_norm_forward(wanvae.WanRMS_norm, silu=False, label="sglang bare norm"):
+            done.append("sglang WanRMS_norm")
     except Exception:
         pass
-    for module in candidates:
-        cls = getattr(module, "WanRMS_norm", None)
-        if cls is None:
-            continue
-        original = cls.forward
-
-        def forward(self, x, _original=original):
-            if x.dtype not in (torch.bfloat16, torch.float16) or not getattr(self, "channel_first", True):
-                return _original(self, x)
-            gamma = self.gamma
-            bias = self.bias if isinstance(getattr(self, "bias", None), torch.Tensor) else None
-            calls["channel_rmsnorm_silu"] += 1
-            return vae_norm.channel_rmsnorm_silu(x, gamma, bias, silu=False)
-
-        cls.forward = forward
-        return f"wrapped {module.__name__}.WanRMS_norm.forward"
-    return "skipped (no WanRMS_norm found)"
+    try:
+        from diffusers.models.autoencoders import autoencoder_kl_wan as dwan
+        if _wrap_norm_forward(dwan.WanRMS_norm, silu=False, label="diffusers bare norm"):
+            done.append("diffusers WanRMS_norm")
+    except Exception:
+        pass
+    if done:
+        return "wrapped " + ", ".join(done)
+    return "already wrapped" if _vae_seams_done else "skipped (no Wan VAE norm class importable)"
 
 
 def install() -> dict[str, str]:
@@ -179,6 +222,27 @@ def check(device="cuda") -> dict:
           - vae_norm.channel_rmsnorm_silu_reference(v, g, b).float()).abs().max().item()
     report["dit_fusions"] = {"modulated_layernorm_err": e1, "gated_residual_err": e2, "ok": e1 < 0.1 and e2 < 0.05}
     report["vae_norm"] = {"err": e3, "ok": e3 < 0.1}
+    # The VAE seam through SGLang's own classes: the fused class with its gate
+    # off (the default request) and the bare norm of the attention block.
+    try:
+        from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
+        from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import FusedWanRMSNormSiLU
+        from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
+        norm = WanRMS_norm(96, images=False).to(device)
+        fused = FusedWanRMSNormSiLU(norm, VaeFastPathGate()).to(device)
+        xv = torch.randn(1, 96, 3, 16, 24, device=device, dtype=dtype)
+        before = calls["channel_rmsnorm_silu"]
+        got_bare = norm(xv)
+        got_fused = fused(xv)
+        ref_bare = torch.nn.functional.normalize(xv.float(), dim=1) * norm.scale * norm.gamma.float()
+        ref_fused = torch.nn.functional.silu(ref_bare)
+        err_bare = (got_bare.float() - ref_bare).abs().max().item()
+        err_fused = (got_fused.float() - ref_fused).abs().max().item()
+        report["wan_vae"] = {"ours_ran": calls["channel_rmsnorm_silu"] - before == 2,
+                             "bare_err": err_bare, "fused_off_path_err": err_fused,
+                             "ok": err_bare < 0.1 and err_fused < 0.1}
+    except Exception as e:
+        report["wan_vae"] = {"error": f"{type(e).__name__}: {str(e)[:160]}"}
     report["installed"] = dict(installed)
     report["calls"] = dict(calls)
     return report

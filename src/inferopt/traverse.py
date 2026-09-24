@@ -475,13 +475,16 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # changed every render and would have been kept on goodput alone.
         limit = node.get("equivalence_max_divergence")
         eligible = []
+        dropped: dict[str, int] = {}       # why each ineligible variant fell out, for the revert line
         for t in measured:
             if not t.slo_ok:
+                dropped["missed the SLO"] = dropped.get("missed the SLO", 0) + 1
                 continue
             if limit is not None and t.equivalence_divergence is not None \
                     and t.equivalence_divergence > limit:
                 log(f"        not lossless: {t.equivalence_divergence:.0%} of renders differ "
                     f"from the baseline, over the node's {limit:.0%}  [{_variant_label(t, node)}]")
+                dropped["not lossless"] = dropped.get("not lossless", 0) + 1
                 continue
             eligible.append(t)
         threshold = incumbent_goodput * (1 + band)
@@ -532,6 +535,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             if within_quality_budget(candidate):
                 best = candidate
                 break
+            dropped["over the quality budget"] = dropped.get("over the quality budget", 0) + 1
         keep = bool(best) and (incumbent_goodput == 0 or best.goodput > threshold)
 
         if best and node.get("class") == "checkpoint" and best.quality:
@@ -618,7 +622,11 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                     concurrency = best.concurrency
         else:
             ctx.measurements[cur] = NodeMeasurement(kept=False)
-            log(f"  revert {cur:32s} no variant satisfied the SLO")
+            # Name the gate that emptied the node: torch_compile once reverted as
+            # "no variant satisfied the SLO" when every variant met the SLO and
+            # failed the equivalence probe.
+            why = ", ".join(f"{n} {r}" for r, n in dropped.items()) or "no variant measured"
+            log(f"  revert {cur:32s} no variant passed: {why}")
 
         last_kept = keep
         nxt = node.get("on_keep") if keep else node.get("on_revert")

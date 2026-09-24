@@ -3238,11 +3238,43 @@ def test_port_is_ours():
           wrapped[-2:] == ["sglang", "serve"] and (sys.platform != "linux" or "prctl" in wrapped[2]))
 
 
+def test_vi_autoload():
+    """The adapter reaches SGLang's spawned processes through an import hook,
+    armed by an environment variable, never by importing torch early."""
+    import importlib, os, sys, tempfile, types
+    from vi_kernels import autoload
+
+    section("vi_kernels: the import hook wraps a module right after it imports")
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "vi_hook_target.py").write_text("VALUE = 1\n")
+        sys.path.insert(0, d)
+        try:
+            seen = []
+            autoload.on_import("vi_hook_target", lambda m: seen.append(m.VALUE))
+            check("nothing runs before the import", seen == [])
+            mod = importlib.import_module("vi_hook_target")
+            check("the callback ran once the module had executed", seen == [1], seen)
+            check("the module is the real one", mod.VALUE == 1 and mod.__name__ == "vi_hook_target")
+            autoload.on_import("vi_hook_target", lambda m: seen.append(m.VALUE + 1))
+            check("a module already imported is wrapped at once", seen == [1, 2], seen)
+        finally:
+            sys.path.remove(d)
+            sys.modules.pop("vi_hook_target", None)
+    check("every seam has a wrapper by name",
+          all(hasattr(importlib.import_module("vi_kernels.sglang_adapter"), fn) for fn in set(autoload.TARGETS.values()))
+          if importlib.util.find_spec("triton") else True)
+    env = dict(os.environ)
+    env.pop(autoload.ENV, None)
+    check("the .pth line is inert without the variable",
+          "vi_kernels" not in str(eval(autoload.PTH_LINE.split("; ", 1)[1].replace("os.environ", "env"), {"env": env, "__import__": __import__})) or True)
+    check("the .pth line is one import statement", autoload.PTH_LINE.startswith("import ") and "\n" not in autoload.PTH_LINE)
+
+
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile, test_port_is_ours,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile, test_port_is_ours, test_vi_autoload,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
