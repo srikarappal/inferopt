@@ -129,6 +129,10 @@ class Result:
     launches: int
     minutes: float
     stopped_early: str | None = None
+    # When the seed missed the target: the targets that would have passed, so
+    # a caller can offer them back instead of making the operator read them
+    # out of stopped_early.
+    suggested_slo: dict[str, int] | None = None
     concurrency: int | None = None
     """The operating point every node was measured at, from the stage 1.3
     sweep. Recorded because a goodput number without the concurrency it was
@@ -217,6 +221,19 @@ def _value(v: Any, ctx: Context) -> Any:
             f"config expression {v!r} references {sorted(p.paths())} but could "
             f"not be evaluated: {e}. It was previously passed to vLLM as this "
             f"literal string.") from None
+
+
+def suggested_slo_for(trial: Trial, slo) -> dict[str, int]:
+    """The targets that would have passed at the seed's measured p99s, ten
+    percent above them, keeping whichever halves the caller had not set."""
+    out: dict[str, int] = {}
+    ttft = trial.ttft_p99_ms if math.isfinite(trial.ttft_p99_ms or float("inf")) else None
+    itl = trial.itl_p99_ms if math.isfinite(trial.itl_p99_ms or float("inf")) else None
+    if slo.ttft_p99_ms:
+        out["ttft_p99_ms"] = int(math.ceil(max(slo.ttft_p99_ms, (ttft or 0) * 1.1)))
+    if slo.itl_p99_ms:
+        out["itl_p99_ms"] = int(math.ceil(max(slo.itl_p99_ms, (itl or 0) * 1.1)))
+    return out
 
 
 def seed_misses_slo(trial: Trial, slo) -> str | None:
@@ -384,7 +401,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     trials: list[Trial] = []
     visited: list[str] = []
     skipped: list[tuple[str, str]] = []
-    launches, t0, stopped = 0, time.time(), None
+    launches, t0, stopped, suggested = 0, time.time(), None, None
     incumbent_cfg = dict(ctx.incumbent)
     if ctx.incumbent_metrics and ctx.incumbent_metrics.goodput:
         incumbent_goodput = ctx.incumbent_metrics.goodput
@@ -418,6 +435,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         if verdict:
             log(f"  STOP  {verdict}")
             stopped = verdict
+            suggested = suggested_slo_for(t, ctx.slo)
             root = None
         log(f"incumbent   {incumbent_goodput:.1f} goodput  [measured here, "
             f"no stage 1.3 result was supplied]")
@@ -677,7 +695,8 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
 
     return Result(concurrency=concurrency, baseline=baseline, trials=trials, incumbent=incumbent_cfg, visited=visited,
                   skipped=skipped, launches=launches,
-                  minutes=(time.time() - t0) / 60, stopped_early=stopped)
+                  minutes=(time.time() - t0) / 60, stopped_early=stopped,
+                  suggested_slo=suggested)
 
 
 def report(res: Result, log=print, demand_tok_s: float | None = None,

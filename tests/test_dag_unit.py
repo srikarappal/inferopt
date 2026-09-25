@@ -3020,6 +3020,8 @@ def test_engines():
     check("the walk stops after the seed instead of measuring every node against zero",
           ev.calls == 1 and res.launches == 1 and "slo unreachable at the seed" in (res.stopped_early or ""),
           (ev.calls, res.launches, res.stopped_early))
+    check("and carries the targets that would have passed",
+          res.suggested_slo == {"ttft_p99_ms": 9624, "itl_p99_ms": 250}, res.suggested_slo)
 
     class _W:
         class model: decoding = "diffusion"; dllm_block_size = 256

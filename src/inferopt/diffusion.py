@@ -766,7 +766,8 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
         provenance={**stamp, "diffusion": shape.model_dump(),
                     "budget": {"max_launches": max_launches, "max_minutes": max_minutes}},
         extra={"incumbent": res.incumbent, "visited": res.visited, "skipped": res.skipped,
-               "stopped_early": res.stopped_early, "unit": "frames"},
+               "stopped_early": res.stopped_early, "suggested_slo": res.suggested_slo,
+               "unit": "frames"},
     )
     out.save()
     return out

@@ -162,7 +162,8 @@ class SequentialStrategy:
             launches=res.launches,
             minutes=res.minutes if res.minutes else (time.time() - t0) / 60,
             extra={"incumbent": res.incumbent, "visited": res.visited,
-                   "skipped": res.skipped, "stopped_early": res.stopped_early},
+                   "skipped": res.skipped, "stopped_early": res.stopped_early,
+                   "suggested_slo": res.suggested_slo},
         )
 
 
