@@ -821,9 +821,15 @@ class VllmEvaluator:
                 f"The health check would have measured that server instead of this "
                 f"configuration. It is most likely a server left behind by an earlier "
                 f"run: stop it and retry.")
+        # The server's working directory is its launch directory. SGLang
+        # Diffusion writes every render it serves under ./outputs and every
+        # upload under ./inputs, relative to wherever it was started; three
+        # walks left 233 MB of jpg and mp4 beside the run directories. Inside
+        # the launch directory those files belong to the run that made them
+        # and go when it goes.
         with open(err, "wb") as fh:
             proc = subprocess.Popen(with_parent_death_signal(cmd), stdout=fh, stderr=subprocess.STDOUT,
-                                    env=env, start_new_session=True)
+                                    env=env, start_new_session=True, cwd=str(d))
         try:
             # THE DEADLINE FOLLOWS PROGRESS, NOT WALL CLOCK.
             #
