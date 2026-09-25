@@ -69,6 +69,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -1068,6 +1069,60 @@ class VllmEvaluator:
                     out[k] = max(0.0, float(v) - first[k])
             stop.wait(period)
 
+    def _calibrate(self, model, el=lambda: "") -> dict:
+        """A closed loop over a stratified slice of the trace, on the seed.
+
+        Two rows from every cell of the input x output length grid, in
+        flight `self.conc` at a time, measured as requests rather than as a
+        window so a slow model still completes the whole slice. Returns the
+        overall p99s, the p99 first-token by cell and whether the target was
+        missed, which is what seed_misses_slo reads."""
+        from goodput import strata
+        cells = strata.cells_of(self.in_tokens, self.out_tokens)
+        order = strata.stratified_order(self.in_tokens, self.out_tokens)
+        take = order[:max(1, min(len(order), 2 * len(cells)))]
+        lengths = self.replay_lengths()
+        self.log(f"        {el()} calibrating on {len(take)} requests across "
+                 f"{len(cells)} strata ({strata.describe(cells)})")
+
+        async def run():
+            sem = asyncio.Semaphore(max(1, int(self.conc or 1)))
+            async with httpx.AsyncClient(limits=httpx.Limits(max_connections=32)) as client:
+                async def one(index):
+                    async with sem:
+                        return index, await _one(client, self.base_url, model,
+                                                 self.prompts[index], lengths[index])
+                return await asyncio.gather(*(one(i) for i in take))
+
+        results = asyncio.run(run())
+        reqs = [r for _, r in results]
+        ok = [r for r in reqs if r.ok]
+        ttfts = sorted(r.ttft * 1e3 for r in ok if r.ttft is not None)
+        itls = sorted((r.latency - r.ttft) / (r.n_out - 1) * 1e3 for r in ok
+                      if r.ttft is not None and r.n_out > 1)
+        p99 = lambda xs: xs[min(len(xs) - 1, int(math.ceil(0.99 * len(xs))) - 1)] if xs else float("inf")
+        by_cell = {}
+        for cell, rows in sorted(cells.items()):
+            mine = [r.ttft * 1e3 for i, r in results if i in rows and r.ok and r.ttft is not None]
+            if mine:
+                by_cell[strata.label(cell)] = round(max(mine), 1)
+        summary = {
+            "requests": len(take), "completed": len(ok), "failed": len(reqs) - len(ok),
+            "ttft_p99_ms": round(p99(ttfts), 1), "itl_p99_ms": round(p99(itls), 2) if itls else 0.0,
+            "ttft_p99_ms_by_cell": by_cell,
+            "failure_reasons": _reasons(reqs),
+        }
+        misses = []
+        if ok and self.slo.ttft_p99_ms and summary["ttft_p99_ms"] > self.slo.ttft_p99_ms:
+            misses.append("ttft")
+        if ok and self.slo.itl_p99_ms and itls and summary["itl_p99_ms"] > self.slo.itl_p99_ms:
+            misses.append("itl")
+        summary["misses"] = misses
+        self.log(f"        {el()} calibration  p99 first token {summary['ttft_p99_ms']:.0f} ms"
+                 f"  between tokens {summary['itl_p99_ms']:.1f} ms  ({len(ok)}/{len(take)} served)"
+                 + (f"  by cell: {by_cell}" if by_cell else ""))
+        return summary
+
     def serving_metrics(self, model, concurrency: int, *, el=lambda: "",
                         cursor: list[int] | None = None, warmup: bool = True):
         """THE serving measurement. One implementation, used by everything.
@@ -1332,6 +1387,23 @@ class VllmEvaluator:
                 asyncio.run(_load(self.base_url, model, self.prompts,
                                   self.replay_lengths(), self.qps, self.conc, WARMUP_S,
                                   cursor=cursor))
+
+                if node_id == "incumbent":
+                    # THE SEED SPEAKS FOR THE RUN. Before its window, a closed
+                    # loop over a stratified slice of the trace (short and long
+                    # inputs, short and long outputs, drawn round-robin), so
+                    # the verdict on whether the target is reachable rests on
+                    # the trace's shape and not on whichever rows came first.
+                    calibration = self._calibrate(model, el)
+                    if calibration.get("misses"):
+                        return Trial(
+                            node_id=node_id, config=dict(config), goodput=0.0,
+                            ttft_p99_ms=calibration["ttft_p99_ms"],
+                            itl_p99_ms=calibration["itl_p99_ms"], memory_gb=0.0,
+                            slo_ok=False, concurrency=self.conc,
+                            diagnostics={"completed": calibration["completed"],
+                                         "failed": calibration["failed"],
+                                         "calibration": calibration})
 
                 if fixed_concurrency:
                     # RUN-FOUR REPRODUCTION MODE.

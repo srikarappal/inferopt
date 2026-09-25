@@ -3028,6 +3028,49 @@ def test_engines():
           API.workload_warnings(_W()) and "256-token canvas" in API.workload_warnings(_W())[0])
     _W.workload.mean_output_tokens = 180.0
     check("a realistic one is not", API.workload_warnings(_W()) == [])
+    from goodput import strata as ST
+    ins = [40, 45, 50, 400, 450, 500, 4000, 4500, 5000]
+    outs = [8, 300, 900, 8, 300, 900, 8, 300, 900]
+    cells = ST.cells_of(ins, outs)
+    check("a 3x3 grid over input and output lengths", len(cells) == 9, sorted(cells))
+    order = ST.stratified_order(ins, outs)
+    check("every row once", sorted(order) == list(range(9)), order)
+    check("the first pass over the cells covers the grid",
+          len({(ins[i] >= 400) + (ins[i] >= 4000) for i in order[:9]}) == 3
+          and len({(outs[i] >= 300) + (outs[i] >= 900) for i in order[:9]}) == 3)
+    check("a uniform trace is one cell, not nine empty ones", len(ST.cells_of([100] * 6, [10] * 6)) == 1)
+    check("cells are labelled for a log line", "short in / long out" in ST.describe(cells))
+
+    # the calibration pass: stratified, closed loop, verdict on the target
+    import goodput.driver as GD
+    from inferopt import evaluator as EV
+    class _R:
+        def __init__(self, ttft, latency, n_out): self.ttft, self.latency, self.n_out, self.ok, self.error = ttft, latency, n_out, True, ""
+    async def fake_one(client, base_url, model, prompt, max_tokens, stream=True):
+        # long inputs are slow, everything else fast
+        return _R(8.7 if "LONG" in prompt else 0.9, 9.0 if "LONG" in prompt else 1.5, 20)
+    ev = EV.VllmEvaluator.__new__(EV.VllmEvaluator)
+    ev.prompts = ["short"] * 3 + ["mid"] * 3 + ["LONG"] * 3
+    ev.in_tokens, ev.out_tokens = ins, outs
+    ev.replay_lengths = lambda: outs
+    ev.slo = _SLO(ttft_p99_ms=5000, itl_p99_ms=250)
+    ev.conc, ev.base_url, ev.log = 2, "http://x", lambda *a, **k: None
+    saved = EV._one
+    EV._one = fake_one
+    try:
+        cal = ev._calibrate("m")
+    finally:
+        EV._one = saved
+    check("the calibration covers the grid and finds the slow stratum",
+          cal["completed"] == 9 and cal["ttft_p99_ms"] == 8700.0 and cal["misses"] == ["ttft"]
+          and cal["ttft_p99_ms_by_cell"].get("long in / long out") == 8700.0, cal)
+    ev.slo = _SLO(ttft_p99_ms=15000, itl_p99_ms=250)
+    EV._one = fake_one
+    try:
+        cal = ev._calibrate("m")
+    finally:
+        EV._one = saved
+    check("a reachable target passes calibration", cal["misses"] == [], cal["misses"])
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)
