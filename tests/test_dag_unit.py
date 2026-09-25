@@ -2969,6 +2969,10 @@ def test_engines():
         Path(d, "config.json").write_text("{}")
         check("a repo with a config.json beside it is a language model, not a pipeline (DiffusionGemma ships both)",
               not D.is_pipeline(d))
+    shape = R._moe_shape({"num_experts": 128, "top_k_experts": 8, "hidden_size": 2048,
+                          "moe_intermediate_size": 704, "num_hidden_layers": 30}, 30)
+    check("DiffusionGemma's top_k_experts is read as the active count",
+          shape.get("n_routed") == 128 and shape.get("n_active") == 8, shape)
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)

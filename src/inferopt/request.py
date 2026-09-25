@@ -534,10 +534,13 @@ def _moe_shape(c: dict, n_layers: int) -> dict:
                 or c.get("n_routed_experts") or 0)
     if not n_routed:
         return {}
-    n_active = c.get("num_experts_per_tok") or 0
+    # Five spellings of the active count: Mixtral, Qwen and DeepSeek say
+    # num_experts_per_tok, DiffusionGemma top_k_experts, a few num_experts_per_token.
+    n_active = (c.get("num_experts_per_tok") or c.get("top_k_experts")
+                or c.get("num_experts_per_token") or 0)
     if not n_active:
         raise MoEReconciliationError(
-            f"{n_routed} experts but no num_experts_per_tok. Without it there is no "
+            f"{n_routed} experts but no num_experts_per_tok (or top_k_experts). Without it there is no "
             f"active parameter count, and the roofline cannot be computed.")
 
     hidden = c["hidden_size"]

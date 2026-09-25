@@ -24,6 +24,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -76,10 +77,20 @@ def engine_defaults(engine, model: str, arch: str) -> dict:
     dLLM's batch cap. Best effort; a bare `vllm serve` is what you get when
     the card cannot be read."""
     try:
-        hw = req.detect_hardware(req.InferOptRequest(model=model, trace="unused"))
+        # The request validates that its trace exists; the hardware probe
+        # never reads it, so an empty file satisfies it.
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            trace = fh.name
+        hw = req.detect_hardware(req.InferOptRequest(model=model, trace=trace))
+        dense = True
+        if arch:
+            config = req._hf_config(model)
+            text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+            dense = not any(k in config or k in text
+                            for k in ("num_experts", "num_local_experts", "n_routed_experts"))
         fp = SimpleNamespace(
             hw=hw, diffusion=None,
-            model=SimpleNamespace(is_dense=True, decoding=req.decoding_of(arch) if arch else "denoising"))
+            model=SimpleNamespace(is_dense=dense, decoding=req.decoding_of(arch) if arch else "denoising"))
         return dict(engine.defaults(fp))
     except Exception as why:
         print(f"no engine defaults applied ({type(why).__name__}: {why})", flush=True)
