@@ -46,6 +46,10 @@ SAMPLES_PER_WINDOW = 4      # at L=1. A 74 s clip in a 120 s window completed on
                             # every level read the same number, which cannot be true
 PROBE_SAMPLES = 8           # fixed seed prompts for equivalence and quality, images
 PROBE_SAMPLES_VIDEO = 4     # clips take minutes each
+# The seed's calibration: how many samples, one at a time, speak for whether
+# the per-sample target is reachable before the sweep is spent on it.
+CALIBRATION_SAMPLES = 4
+CALIBRATION_SAMPLES_VIDEO = 3
 EQUIVALENT_PSNR_DB = 40.0   # above this two renders differ by float noise, not by a kernel
 POLL_S = 1.0
 
@@ -419,6 +423,42 @@ class DiffusionEvaluator(VllmEvaluator):
         n = PROBE_SAMPLES_VIDEO if self.shape.kind == "video" else PROBE_SAMPLES
         return self.prompts[:n]
 
+    def _calibrate(self, config: dict, el=lambda: "") -> dict:
+        """A few samples one at a time on the seed, held to the per-sample
+        target. Returns the p99 (the slowest, at this count), the count and
+        whether the target was missed, which is what seed_misses_slo reads.
+        The per-frame share rides on itl for a clip, as it does on a trial."""
+        count = min(len(self.prompts), CALIBRATION_SAMPLES_VIDEO if self.shape.kind == "video"
+                    else CALIBRATION_SAMPLES)
+        prompts = self.prompts[:count]
+        self.log(f"        {el()} calibrating on {count} {self.shape.kind} samples, one at a time")
+
+        async def go():
+            async with httpx.AsyncClient() as client:
+                done = []
+                for index, prompt in enumerate(prompts):
+                    done.append(await _one(client, self.base_url, self.shape, config, prompt,
+                                           5000 + index, False))
+                return done
+
+        samples = asyncio.run(go())
+        ok = [s for s in samples if s.ok]
+        latencies = sorted(s.latency for s in ok)
+        frames = max(1, int(config.get("num_frames", self.shape.frames)))
+        p99_s = latencies[-1] if latencies else float("inf")
+        target_ms = self.slo.ttft_p99_ms
+        summary = {
+            "requests": count, "completed": len(ok), "failed": len(samples) - len(ok),
+            "ttft_p99_ms": round(p99_s * 1000, 1),
+            "itl_p99_ms": round(p99_s * 1000 / frames, 2),
+            "latencies_s": [round(x, 1) for x in latencies],
+            "failure_reasons": {s.error[:60]: 1 for s in samples if not s.ok},
+            "misses": ["ttft"] if ok and target_ms and p99_s * 1000 > target_ms else [],
+        }
+        self.log(f"        {el()} calibration  p99 per sample {p99_s:.1f}s"
+                 f"  ({len(ok)}/{count} served" + (f", target {target_ms / 1000:g}s" if target_ms else "") + ")")
+        return summary
+
     def _first_latency(self, config: dict) -> float:
         """One sample, timed, when the warm-up window closed before any
         finished: a clip can take longer than the warm-up itself."""
@@ -528,6 +568,23 @@ class DiffusionEvaluator(VllmEvaluator):
                 one_sample_s = warm["latency_p50_s"] if warm["completed"] else self._first_latency(config)
                 window_s = max(WINDOW_S, SAMPLES_PER_WINDOW * one_sample_s)
                 self.log(f"        {el()} one sample {one_sample_s:.1f}s, window {window_s:.0f}s")
+                if node_id == "incumbent":
+                    # THE SEED SPEAKS FOR THE RUN, for a pipeline too. The
+                    # sample is fixed by the job, so a request's cost barely
+                    # varies with the prompt and there is no length grid to
+                    # stratify over: the first few prompts, one at a time,
+                    # held to the per-sample target. A miss returns before
+                    # the sweep and the walk stops with the numbers.
+                    calibration = self._calibrate(config, el)
+                    if calibration.get("misses"):
+                        return Trial(
+                            node_id=node_id, config=dict(config), goodput=0.0,
+                            ttft_p99_ms=calibration["ttft_p99_ms"],
+                            itl_p99_ms=calibration["itl_p99_ms"], memory_gb=0.0,
+                            slo_ok=False, concurrency=1,
+                            diagnostics={"completed": calibration["completed"],
+                                         "failed": calibration["failed"],
+                                         "calibration": calibration, "unit": "frames"})
                 pts = []
                 for level in (levels or SWEEP_LEVELS):
                     med = asyncio.run(closed_loop(self.base_url, self.shape, config,

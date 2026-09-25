@@ -3071,6 +3071,35 @@ def test_engines():
     finally:
         EV._one = saved
     check("a reachable target passes calibration", cal["misses"] == [], cal["misses"])
+    # the same calibration for a pipeline: the first few prompts, one at a time, against the per-sample p99
+    from inferopt import diffusion as DF
+    class _Sample:
+        def __init__(self, latency): self.latency, self.ok, self.error, self.frames = latency, True, "", 33
+    async def fake_pipe_one(client, base_url, shape, config, prompt, seed, want_content):
+        return _Sample(74.0)
+    class _Shape:
+        kind = "video"; frames = 33
+    dev = DF.DiffusionEvaluator.__new__(DF.DiffusionEvaluator)
+    dev.shape, dev.prompts, dev.base_url, dev.log = _Shape(), [f"p{i}" for i in range(10)], "http://x", lambda *a, **k: None
+    dev.slo = _SLO(ttft_p99_ms=60_000, itl_p99_ms=None)
+    saved_pipe = DF._one
+    DF._one = fake_pipe_one
+    try:
+        cal = dev._calibrate({"num_frames": 33})
+    finally:
+        DF._one = saved_pipe
+    check("a video seed calibrates on three clips and misses a 60 s target at 74 s",
+          cal["requests"] == 3 and cal["completed"] == 3 and cal["ttft_p99_ms"] == 74000.0 and cal["misses"] == ["ttft"], cal)
+    check("its per-frame share rides on itl", abs(cal["itl_p99_ms"] - 74000.0 / 33) < 0.1, cal["itl_p99_ms"])
+    dev.slo = _SLO(ttft_p99_ms=240_000, itl_p99_ms=None)
+    DF._one = fake_pipe_one
+    try:
+        check("and passes a 240 s one", dev._calibrate({"num_frames": 33})["misses"] == [])
+    finally:
+        DF._one = saved_pipe
+    verdict = TR.seed_misses_slo(TR.Trial(node_id="incumbent", config={}, goodput=0.0, ttft_p99_ms=74000.0, itl_p99_ms=2242.4,
+                                          memory_gb=0.0, slo_ok=False, diagnostics={"completed": 3}), _SLO(ttft_p99_ms=60_000, itl_p99_ms=None))
+    check("the walk's verdict reads a pipeline's per-sample miss the same way", verdict is not None and "74000 ms against 60000 ms" in verdict, verdict)
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)
