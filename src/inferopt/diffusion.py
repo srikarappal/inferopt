@@ -602,9 +602,19 @@ class DiffusionEvaluator(VllmEvaluator):
 # --------------------------------------------------------------------- entry
 
 def is_pipeline(model: str) -> bool:
-    """A diffusers pipeline has a model_index.json at its root; a language
-    model has a config.json there instead."""
+    """A diffusers pipeline has a model_index.json at its root and no
+    config.json. A language model has a config.json, and may ALSO ship a
+    model_index.json: DiffusionGemma does, naming a transformers model and a
+    block refinement scheduler, and it is tokens out on the LLM path."""
     from huggingface_hub import hf_hub_download
+    local = Path(model)
+    if local.is_dir():
+        return (local / "model_index.json").exists() and not (local / "config.json").exists()
+    try:
+        hf_hub_download(model, "config.json")
+        return False
+    except Exception:
+        pass
     try:
         hf_hub_download(model, "model_index.json")
         return True

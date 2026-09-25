@@ -2961,6 +2961,14 @@ def test_engines():
     vl.fingerprint.model.architecture = "DiffusionGemmaForBlockDiffusion"
     vl.fingerprint.model.dllm_block_size = 256
     vl.fingerprint.model.dllm_max_steps = 64
+    import tempfile
+    from inferopt import diffusion as D
+    with tempfile.TemporaryDirectory() as d:
+        Path(d, "model_index.json").write_text("{}")
+        check("a bare model_index.json is a pipeline", D.is_pipeline(d))
+        Path(d, "config.json").write_text("{}")
+        check("a repo with a config.json beside it is a language model, not a pipeline (DiffusionGemma ships both)",
+              not D.is_pipeline(d))
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)

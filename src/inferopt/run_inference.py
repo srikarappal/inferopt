@@ -62,7 +62,7 @@ def pick_engine(model: str, name: str | None):
         kind = "sglang-diffusion"
     else:
         arch = (req._hf_config(model).get("architectures") or ["unknown"])[0]
-        kind = "sglang" if req.decoding_of(arch) == "diffusion" else "vllm"
+        kind = req.serving_engine_of(arch)
     engine = SglangDiffusionEngine(model=model) if kind == "sglang-diffusion" else ENGINES[kind]()
     return kind, engine
 
