@@ -2986,6 +2986,12 @@ def test_engines():
     seed = RUN.seed_config(seed_ctx.fingerprint)
     check("the seed of a dLLM on vLLM keeps the engine's batch cap", seed.get("max_num_seqs") == 4, seed)
     check("an autoregressive seed still starts at 256", RUN.seed_config(_ctx().fingerprint).get("max_num_seqs") == 256)
+    from inferopt.predicates import Predicate as _P
+    unreached = _ctx()
+    check("a measurement of a node the walk never reached reads as not kept",
+          _P("measurements.spec_decode_ngram.kept or measurements.spec_decode_draft.kept").evaluate(unreached) is False)
+    check("an unknown key under another root is still an error",
+          raises(lambda: _P("preconditions.nonesuch.kept").evaluate(unreached), Exception))
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)

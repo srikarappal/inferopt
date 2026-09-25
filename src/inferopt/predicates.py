@@ -225,6 +225,14 @@ class _Eval:
         base = self.visit(n.value)
         if isinstance(base, dict):
             if n.attr not in base:
+                if base is getattr(self.ctx, "measurements", None):
+                    # A node the walk never reached on this path was not kept.
+                    # The validator already checked the name is a node in the
+                    # DAG; asking about it mid-walk is a question, not an error
+                    # (spec_decode_depth asks about spec_decode_draft on a path
+                    # that skipped the whole speculation branch).
+                    from inferopt.traverse import NodeMeasurement
+                    return NodeMeasurement(kept=False)
                 raise PredicateError(f"no key {n.attr!r} in {list(base)[:6]}")
             return base[n.attr]
         if not hasattr(base, n.attr):
