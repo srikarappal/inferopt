@@ -74,10 +74,25 @@ def _mt(max_tokens, idx: int) -> int:
     return int(max_tokens)
 
 
+# Greedy and seeded, so two servers given the same prompt can be compared token
+# for token. Not every server takes it: vLLM refuses temperature and seed on a
+# diffusion LM (DiffusionGemma) outright, and the evaluator clears this before
+# launching one. Module state rather than an argument, because the four load
+# paths and their callers would otherwise all have to carry it.
+SAMPLING: dict = {"temperature": 0.0, "seed": 0}
+
+
+def use_sampling(engine: str, decoding: str) -> dict:
+    """The sampling parameters a server of this engine and decoding accepts."""
+    global SAMPLING
+    SAMPLING = {} if (engine == "vllm" and decoding == "diffusion") else {"temperature": 0.0, "seed": 0}
+    return SAMPLING
+
+
 async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
     r = Req(start=time.perf_counter())
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
-               "temperature": 0.0, "seed": 0, "stream": stream}
+               **SAMPLING, "stream": stream}
     if stream:
         # continuous_usage_stats: usage in EVERY chunk, not only the last. A
         # chunk is not a token. An autoregressive server sends one token per

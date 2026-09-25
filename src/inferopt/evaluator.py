@@ -90,6 +90,7 @@ from inferopt.engines import VllmEngine, engine_for
 from inferopt.fingerprint import SLO, Fingerprint
 from inferopt.legality import repair
 from inferopt.quality import context_needed
+import goodput.driver as load_driver
 from goodput.driver import Req, _closed_loop, _load, _mt, _one
 from goodput.metrics import _reasons, summarize
 from inferopt.traverse import Trial
@@ -809,6 +810,9 @@ class VllmEvaluator:
         env = child_env(CUDA_VISIBLE_DEVICES=self.gpu,
                         VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"),
                         **(engine.profile_env(self._profile_dir) if getattr(self, "profile", True) else {}))
+        # What the load may ask of this server: greedy and seeded everywhere
+        # except a diffusion LM on vLLM, which refuses both parameters.
+        load_driver.use_sampling(engine.name, getattr(self.fp.model, "decoding", "autoregressive"))
         holder = port_holder(self.port)
         if holder is not None:
             raise LaunchError(

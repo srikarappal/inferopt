@@ -2974,6 +2974,11 @@ def test_engines():
                           "moe_intermediate_size": 704, "num_hidden_layers": 30}, 30)
     check("DiffusionGemma's top_k_experts is read as the active count",
           shape.get("n_routed") == 128 and shape.get("n_active") == 8, shape)
+    import goodput.driver as gd
+    check("the load driver is greedy and seeded by default", gd.SAMPLING == {"temperature": 0.0, "seed": 0})
+    check("and sends neither to a diffusion LM on vLLM, which refuses them",
+          gd.use_sampling("vllm", "diffusion") == {} and gd.use_sampling("sglang", "diffusion") != {}
+          and gd.use_sampling("vllm", "autoregressive") == {"temperature": 0.0, "seed": 0})
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)

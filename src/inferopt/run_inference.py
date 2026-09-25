@@ -139,15 +139,19 @@ def stop(proc) -> None:
             proc.wait(timeout=30)
 
 
-def run_llm(base_url: str, model: str, prompts: list[str], max_tokens: int) -> None:
+def run_llm(base_url: str, model: str, prompts: list[str], max_tokens: int, sampling: dict) -> None:
     for prompt in prompts:
         started = time.perf_counter()
         first = None
         text, tokens = [], 0
         with httpx.stream("POST", f"{base_url}/v1/chat/completions", timeout=3600, json={
-                "model": model, "max_tokens": max_tokens, "temperature": 0, "stream": True,
+                "model": model, "max_tokens": max_tokens, **sampling, "stream": True,
                 "stream_options": {"include_usage": True, "continuous_usage_stats": True},
                 "messages": [{"role": "user", "content": prompt}]}) as r:
+            if r.status_code != 200:
+                r.read()
+                print(f"\n>>> {prompt}\nHTTP {r.status_code}: {r.text[:400]}", flush=True)
+                continue
             for line in r.iter_lines():
                 if not line.startswith("data: ") or line == "data: [DONE]":
                     continue
@@ -253,7 +257,10 @@ def main(argv=None) -> int:
         if kind == "sglang-diffusion":
             run_diffusion(base_url, model, config, prompts, out, args.seed)
         else:
-            run_llm(base_url, model, prompts, args.max_tokens)
+            # Greedy where the server takes it; vLLM refuses temperature and
+            # seed on a diffusion LM.
+            greedy = not (kind == "vllm" and arch and req.decoding_of(arch) == "diffusion")
+            run_llm(base_url, model, prompts, args.max_tokens, {"temperature": 0} if greedy else {})
         if args.keep:
             print("\nserver left running; Ctrl-C to stop", flush=True)
             proc.wait()
