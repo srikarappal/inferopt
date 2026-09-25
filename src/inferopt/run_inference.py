@@ -165,9 +165,13 @@ def run_llm(base_url: str, model: str, prompts: list[str], max_tokens: int, samp
                 tokens = max(tokens, usage.get("completion_tokens") or 0)
         elapsed = time.perf_counter() - started
         ttft = (first - started) if first else elapsed
-        rate = tokens / (elapsed - ttft) if tokens and elapsed > ttft else 0.0
+        # Over the whole request, not after the first token: a diffusion LM
+        # commits a whole canvas at once, so nearly all of its tokens arrive
+        # with the first chunk and a decode-only rate would read as infinite.
+        rate = tokens / elapsed if tokens and elapsed else 0.0
         print(f"\n>>> {prompt}\n{''.join(text).strip()}\n"
-              f"[{tokens} tokens, TTFT {ttft * 1000:.0f} ms, {rate:.1f} tok/s]", flush=True)
+              f"[{tokens} tokens in {elapsed:.1f} s, TTFT {ttft * 1000:.0f} ms, "
+              f"{rate:.1f} tok/s end to end]", flush=True)
 
 
 def run_diffusion(base_url: str, model: str, config: dict, prompts: list[str], out: Path, seed: int) -> None:
