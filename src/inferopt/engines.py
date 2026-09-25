@@ -290,11 +290,25 @@ class VllmEngine(Engine):
         # against sm100's 228 KiB, so tile configs written for datacenter
         # Blackwell cannot fit.
         out = {"gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90}
-        # A dLLM's denoising state is per sequence and large: vLLM's own
-        # DiffusionGemma recipe caps the batch at 4 to stay out of OOM. The
-        # incumbent starts there; the batching nodes may push it and find out.
+        # A dLLM on vLLM (DiffusionGemma, 0.29), as measured on the GB10:
+        #   max_num_seqs 4      the denoising state is per sequence and large;
+        #                       vLLM's own recipe caps the batch there.
+        #   attention TRITON    the model hands attention a per-request causal
+        #                       tensor; vLLM's FlashInfer builder does
+        #                       `causal or ...` on it and dies, and vLLM still
+        #                       picked FlashInfer for one attention group
+        #                       despite its own exclusion. The flag applies to
+        #                       every group; the Triton builder declares
+        #                       supports_non_causal.
+        #   enforce_eager       graph capture reached the same builder. The
+        #                       graph_capture node measures graphs later and
+        #                       keeps them if the Triton path captures cleanly.
+        # The incumbent starts here; the walk's nodes move each of them.
         if getattr(fp.model, "decoding", "autoregressive") == "diffusion":
             out["max_num_seqs"] = 4
+            out["enforce_eager"] = True
+            if "attention_backend" in self.installed_flags():
+                out["attention_backend"] = "TRITON_ATTN"
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"

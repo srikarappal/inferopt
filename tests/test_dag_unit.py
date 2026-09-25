@@ -3341,8 +3341,14 @@ def test_vllm_dllm_route():
         decoding = "diffusion"; is_dense = True; serving_engine = "vllm"
     class DFP:
         hw = HW(); model = D()
-    check("a dLLM on vLLM launches with the batch the recipe caps at",
-          vllm.defaults(DFP()).get("max_num_seqs") == 4, vllm.defaults(DFP()))
+    dl_defaults = vllm.defaults(DFP())
+    check("a dLLM on vLLM launches with the batch the recipe caps at, eager, on the Triton attention path",
+          dl_defaults.get("max_num_seqs") == 4 and dl_defaults.get("enforce_eager") is True
+          and ("attention_backend" not in vllm.installed_flags() or dl_defaults.get("attention_backend") == "TRITON_ATTN"),
+          dl_defaults)
+    check("an autoregressive model gets none of that",
+          not any(k in vllm.defaults(type("F", (), {"hw": HW(), "model": type("M", (), {"decoding": "autoregressive", "is_dense": True})()})())
+                  for k in ("max_num_seqs", "enforce_eager", "attention_backend")))
 
     from inferopt._paths import default_dag
     dag = json.loads(Path(default_dag("llm")).read_text())
