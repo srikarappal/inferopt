@@ -144,6 +144,11 @@ async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
                     r.n_in = usage.get("prompt_tokens") or r.n_in
         r.latency = time.perf_counter() - r.start
         r.ok = r.ttft is not None
+        if not r.ok and not r.error:
+            # The server answered and nothing came back before the stream
+            # closed: a canvas that committed no token, a max_tokens of 0, an
+            # empty completion. Named, or it reads as a failure without cause.
+            r.error = "no tokens streamed"
     except Exception as e:
         # The reason, not just the fact. Every failure mode -- a 400 from an
         # over-length generation, a dropped connection, a server that died --

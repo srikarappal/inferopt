@@ -166,7 +166,13 @@ def seed_config(fp) -> dict:
     # them -- see evaluator.hardware_defaults. They go UNDER the seed, so
     # anything set above wins.
     from inferopt.evaluator import hardware_defaults
-    cfg = {**hardware_defaults(fp), **cfg}
+    defaults = hardware_defaults(fp)
+    # A diffusion LM on vLLM cannot take 256 sequences: its denoising state is
+    # per sequence and the engine default caps it at what the card survives.
+    # The seed keeps the engine's cap; the batching nodes raise it and see.
+    if "max_num_seqs" in defaults:
+        cfg["max_num_seqs"] = min(cfg["max_num_seqs"], defaults["max_num_seqs"])
+    cfg = {**defaults, **cfg}
     return cfg
 
 

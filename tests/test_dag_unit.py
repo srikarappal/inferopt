@@ -2979,6 +2979,13 @@ def test_engines():
     check("and sends neither to a diffusion LM on vLLM, which refuses them",
           gd.use_sampling("vllm", "diffusion") == {} and gd.use_sampling("sglang", "diffusion") != {}
           and gd.use_sampling("vllm", "autoregressive") == {"temperature": 0.0, "seed": 0})
+    from inferopt import run as RUN
+    seed_ctx = _ctx()
+    seed_ctx.fingerprint.model.decoding = "diffusion"
+    seed_ctx.fingerprint.model.architecture = "DiffusionGemmaForBlockDiffusion"
+    seed = RUN.seed_config(seed_ctx.fingerprint)
+    check("the seed of a dLLM on vLLM keeps the engine's batch cap", seed.get("max_num_seqs") == 4, seed)
+    check("an autoregressive seed still starts at 256", RUN.seed_config(_ctx().fingerprint).get("max_num_seqs") == 256)
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)
