@@ -26,7 +26,7 @@ def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
     started = [r for r in reqs if t0 <= r.start < t1]
     done = [r for r in started if r.ok]
     ttfts = sorted(r.ttft for r in done if r.ttft is not None)
-    itls = sorted((r.latency - r.ttft) / (r.n_out - 1)
+    itls = sorted(r.itl_s()
                   for r in done if r.ttft is not None and r.n_out > 1)
     pct = lambda xs, q: (xs[min(len(xs) - 1, int(q * (len(xs) - 1)))] if xs else float("nan"))
     # Two units, because the field uses both and they are not interchangeable.

@@ -49,6 +49,23 @@ class Req:
     text: str = ""
     token_times: list[float] = field(default_factory=list)
 
+    def itl_s(self) -> float:
+        """Seconds per output token after the first.
+
+        The gap between streamed tokens, as ITL has always meant, except when
+        there is no gap to measure: a block-diffusion server (DiffusionGemma
+        on vLLM) commits its whole canvas at once, so every token arrives with
+        the first and the gap reads as microseconds. 1000 / that gave "6,700
+        tokens a second per user" for a model doing 25. Under a millisecond a
+        token, the amortised time per token over the whole request is what
+        the customer experiences and what an ITL target can be held to."""
+        if self.n_out <= 1 or self.ttft is None:
+            return 0.0
+        gap = (self.latency - self.ttft) / (self.n_out - 1)
+        if gap < 0.001:
+            return self.latency / self.n_out
+        return gap
+
     def meets(self, slo: SLO) -> bool:
         """Per-request SLO satisfaction -- the definition goodput rests on."""
         if not self.ok or self.ttft is None:
@@ -56,7 +73,7 @@ class Req:
         if slo.ttft_p99_ms and self.ttft * 1e3 > slo.ttft_p99_ms:
             return False
         if slo.itl_p99_ms and self.n_out > 1:
-            itl = (self.latency - self.ttft) / (self.n_out - 1) * 1e3
+            itl = self.itl_s() * 1e3
             if itl > slo.itl_p99_ms:
                 return False
         return True

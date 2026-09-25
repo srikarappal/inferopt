@@ -3102,6 +3102,12 @@ def test_engines():
     verdict = TR.seed_misses_slo(TR.Trial(node_id="incumbent", config={}, goodput=0.0, ttft_p99_ms=74000.0, itl_p99_ms=2242.4,
                                           memory_gb=0.0, slo_ok=False, diagnostics={"completed": 3}), _SLO(ttft_p99_ms=60_000, itl_p99_ms=None))
     check("the walk's verdict reads a pipeline's per-sample miss the same way", verdict is not None and "74000 ms against 60000 ms" in verdict, verdict)
+    burst = GD.Req(start=0.0, ttft=10.0, latency=10.0, n_out=256, ok=True)
+    check("a canvas that arrives at once reads as amortised time per token, not a microsecond gap",
+          abs(burst.itl_s() - 10.0 / 256) < 1e-9, burst.itl_s())
+    streamed = GD.Req(start=0.0, ttft=0.5, latency=5.5, n_out=101, ok=True)
+    check("a streamed response keeps the gap between tokens", abs(streamed.itl_s() - 0.05) < 1e-9, streamed.itl_s())
+    check("one token has no inter-token latency", GD.Req(start=0.0, ttft=1.0, latency=1.0, n_out=1, ok=True).itl_s() == 0.0)
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)
