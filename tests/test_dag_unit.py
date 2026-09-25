@@ -3351,7 +3351,7 @@ def test_vllm_dllm_route():
     class HW:
         unified_memory = False; sm_major = 9
     class D:
-        decoding = "diffusion"; is_dense = True; serving_engine = "vllm"
+        decoding = "diffusion"; is_dense = True; serving_engine = "vllm"; dllm_block_size = 256
     class DFP:
         hw = HW(); model = D()
     dl_defaults = vllm.defaults(DFP())
@@ -3359,6 +3359,11 @@ def test_vllm_dllm_route():
           dl_defaults.get("max_num_seqs") == 4 and dl_defaults.get("enforce_eager") is True
           and ("attention_backend" not in vllm.installed_flags() or dl_defaults.get("attention_backend") == "TRITON_ATTN"),
           dl_defaults)
+    check("the model's own canvas rides along, so a steps-only node still names one",
+          dl_defaults.get("dllm_block_size") == 256, dl_defaults)
+    steps_argv = vllm.translate({**dl_defaults, "dllm_max_steps": 24})
+    steps_cfg = json.loads(steps_argv[steps_argv.index("--diffusion-config") + 1])
+    check("...and vLLM sees both fields", steps_cfg == {"canvas_length": 256, "max_denoising_steps": 24}, steps_cfg)
     check("an autoregressive model gets none of that",
           not any(k in vllm.defaults(type("F", (), {"hw": HW(), "model": type("M", (), {"decoding": "autoregressive", "is_dense": True})()})())
                   for k in ("max_num_seqs", "enforce_eager", "attention_backend")))

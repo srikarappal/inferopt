@@ -309,6 +309,14 @@ class VllmEngine(Engine):
             out["enforce_eager"] = True
             if "attention_backend" in self.installed_flags():
                 out["attention_backend"] = "TRITON_ATTN"
+            # The model's own canvas, always present, because vLLM's
+            # DiffusionConfig requires canvas_length whenever the flag is
+            # given at all: a config that set only the step count launched
+            # `--diffusion-config '{"max_denoising_steps": 24}'` and the
+            # server exited during startup on the missing field.
+            canvas = int(getattr(fp.model, "dllm_block_size", 0) or 0)
+            if canvas > 0:
+                out["dllm_block_size"] = canvas
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"
