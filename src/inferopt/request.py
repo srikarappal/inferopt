@@ -58,6 +58,7 @@ from huggingface_hub import hf_hub_download
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from inferopt.fingerprint import (
+    VLLM_DLLM_ARCHITECTURES,
     DTYPE_BYTES,
     SLO,
     Fingerprint,
@@ -787,6 +788,7 @@ def detect_model(req: InferOptRequest) -> ModelFingerprint:
         architecture=architecture,
         decoding=decoding_of(architecture),
         dllm_block_size=dllm_block_size_of(architecture, c),
+        dllm_max_steps=dllm_max_steps_of(req.model, architecture),
         is_dense=n_experts == 0,
         n_params_b=round(n_params_b, 2),
         n_layers=n_layers, hidden_size=c["hidden_size"],
@@ -841,6 +843,28 @@ def decoding_of(architecture: str) -> str:
     if any(architecture.startswith(prefix) for prefix in DIFFUSION_ARCHITECTURES):
         return "diffusion"
     return "autoregressive"
+
+
+def serving_engine_of(architecture: str) -> str:
+    """vllm, unless this is a masked diffusion LM vLLM has no model for."""
+    if decoding_of(architecture) != "diffusion":
+        return "vllm"
+    return "vllm" if architecture.startswith(VLLM_DLLM_ARCHITECTURES) else "sglang"
+
+
+def dllm_max_steps_of(model: str, architecture: str) -> int:
+    """Denoising passes per block the checkpoint ships with, from
+    generation_config.json (max_denoising_steps). 0 when not a dLLM or not
+    stated: vLLM then reads the same file itself, and the steps node stays off
+    rather than sweeping around a number nobody read."""
+    if decoding_of(architecture) != "diffusion":
+        return 0
+    try:
+        local = Path(model) / "generation_config.json"
+        path = local if local.exists() else Path(hf_hub_download(model, "generation_config.json"))
+        return int(json.loads(path.read_text()).get("max_denoising_steps") or 0)
+    except Exception:
+        return 0
 
 
 def dllm_block_size_of(architecture: str, config: dict) -> int:

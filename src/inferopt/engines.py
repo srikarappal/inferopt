@@ -249,8 +249,23 @@ class VllmEngine(Engine):
         except Exception:
             return "unknown"
 
+    # The DAG's dLLM vocabulary, on vLLM. Its DiffusionConfig (0.29) has two
+    # fields, the canvas and the passes per canvas, sent as one JSON flag;
+    # SGLang's algorithm, threshold and scheduling knobs have no counterpart
+    # and are dropped here, the DAG having skipped their nodes already.
+    DLLM_MAP = {"dllm_block_size": "canvas_length", "dllm_max_steps": "max_denoising_steps"}
+    DLLM_DROP = frozenset({"dllm_algorithm", "dllm_threshold", "dllm_fdfo", "dllm_algorithm_config"})
+
     def translate(self, config, workdir=None) -> list[str]:
-        return self.generic_flags((k, v) for k, v in config.items() if k != "model")
+        cfg = dict(config)
+        cfg.pop("model", None)
+        diffusion = {self.DLLM_MAP[k]: int(cfg.pop(k)) for k in list(cfg) if k in self.DLLM_MAP}
+        for k in self.DLLM_DROP:
+            cfg.pop(k, None)
+        out = self.generic_flags(cfg.items())
+        if diffusion:
+            out += ["--diffusion-config", json.dumps(diffusion)]
+        return out
 
     def profile_flags(self, directory: Path) -> list[str]:
         # 0.29: a JSON config group; the endpoints attach only when it names
@@ -275,6 +290,11 @@ class VllmEngine(Engine):
         # against sm100's 228 KiB, so tile configs written for datacenter
         # Blackwell cannot fit.
         out = {"gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90}
+        # A dLLM's denoising state is per sequence and large: vLLM's own
+        # DiffusionGemma recipe caps the batch at 4 to stay out of OOM. The
+        # incumbent starts there; the batching nodes may push it and find out.
+        if getattr(fp.model, "decoding", "autoregressive") == "diffusion":
+            out["max_num_seqs"] = 4
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"
@@ -556,11 +576,16 @@ def engine_for(fp=None, name: str | None = None) -> Engine:
     """
     chosen = name or os.environ.get("INFEROPT_ENGINE")
     if not chosen:
-        decoding = getattr(getattr(fp, "model", None), "decoding", "autoregressive")
+        model = getattr(fp, "model", None)
+        decoding = getattr(model, "decoding", "autoregressive")
         if getattr(fp, "diffusion", None) is not None or decoding == "denoising":
             chosen = "sglang-diffusion"
+        elif decoding == "diffusion":
+            # The fingerprint says which engine has a model for this dLLM:
+            # vLLM for DiffusionGemma, SGLang for the rest (request.serving_engine_of).
+            chosen = getattr(model, "serving_engine", None) or "sglang"
         else:
-            chosen = "sglang" if decoding == "diffusion" else "vllm"
+            chosen = "vllm"
     if chosen not in ENGINES:
         raise ValueError(f"unknown engine {chosen!r}; have {', '.join(sorted(ENGINES))}")
     return ENGINES[chosen]()

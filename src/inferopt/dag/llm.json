@@ -537,7 +537,7 @@
       "requires": [
         "graph_capture"
       ],
-      "applicable_when": "fingerprint.model.decoding == \"diffusion\"",
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\" and fingerprint.model.serving_engine == \"sglang\"",
       "rationale": "A masked diffusion LM denoises a block of tokens over several forward passes, and requests in a batch finish their blocks at different passes. SGLang's default, first-done-first-out, hands a finished block back and refills the slot; synchronous scheduling waits for the whole batch. Which wins depends on how uneven the workload's block completion is, so it is measured rather than assumed. The incumbent carries the default, so this node measures the other setting.",
       "action": {
         "set": {
@@ -556,7 +556,7 @@
       "on_revert": [
         "lossless_complete"
       ],
-      "engine_note": "dllm_* keys are emitted only by the SGLang engine; vLLM does not serve a diffusion LM, so the fingerprint routes these models to SGLang before any node runs."
+      "engine_note": "An SGLang knob. vLLM's dLLM path (DiffusionGemma) has a canvas and a step count and nothing else, so this node is skipped there rather than sent as a flag vLLM would refuse."
     },
     {
       "id": "lossless_complete",
@@ -782,7 +782,7 @@
         "retune_batching_after_weight",
         "lora_unmerge_for_weight_quant"
       ],
-      "applicable_when": "fingerprint.model.decoding == \"diffusion\"",
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\" and fingerprint.model.serving_engine == \"sglang\"",
       "rationale": "Each denoising pass commits the masked positions whose confidence clears a threshold, 0.95 by default. Lowering it commits more tokens per pass, so a block finishes in fewer passes and the forward cost per token falls; it also commits tokens the model was less sure of, so quality can move. That is the trade the lossy branch exists to measure, and it is the largest single lever a dLLM has.",
       "action": {
         "set": {
@@ -810,7 +810,8 @@
       ],
       "on_revert": [
         "dllm_block_size"
-      ]
+      ],
+      "engine_note": "An SGLang knob. vLLM's dLLM path (DiffusionGemma) has a canvas and a step count and nothing else, so this node is skipped there rather than sent as a flag vLLM would refuse."
     },
     {
       "id": "dllm_block_size",
@@ -842,12 +843,49 @@
       ],
       "cost_launches": 2,
       "on_keep": [
+        "dllm_denoising_steps"
+      ],
+      "on_revert": [
+        "dllm_denoising_steps"
+      ],
+      "sweep_note": "fingerprint.model.dllm_block_size is the checkpoint's own default, read the way SGLang reads it, so the sweep brackets what the model shipped with. On vLLM the same key becomes the DiffusionConfig canvas_length."
+    },
+    {
+      "id": "dllm_denoising_steps",
+      "title": "dLLM denoising steps per block",
+      "class": "lossy",
+      "status": "active",
+      "requires": [
+        "dllm_block_size"
+      ],
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\" and fingerprint.model.serving_engine == \"vllm\" and fingerprint.model.dllm_max_steps > 0",
+      "rationale": "vLLM denoises a block over at most max_denoising_steps passes, read from the checkpoint's generation_config.json. Fewer passes commit more positions per pass, so a block finishes sooner and the forward cost per token falls; it is the same trade as a diffusion image's step count, and like it the loss is measured on the benchmark rather than assumed. Half and a quarter of what the model shipped with bracket it.",
+      "action": {
+        "set": {}
+      },
+      "sweep": [
+        {
+          "dllm_max_steps": "max(1, int(fingerprint.model.dllm_max_steps * 0.5))"
+        },
+        {
+          "dllm_max_steps": "max(1, int(fingerprint.model.dllm_max_steps * 0.25))"
+        }
+      ],
+      "probes": [
+        "goodput",
+        "quality"
+      ],
+      "quality_benchmarks": [
+        "math_500"
+      ],
+      "cost_launches": 2,
+      "on_keep": [
         "dllm_algorithm"
       ],
       "on_revert": [
         "dllm_algorithm"
       ],
-      "sweep_note": "fingerprint.model.dllm_block_size is the checkpoint's own default, read the way SGLang reads it, so the sweep brackets what the model shipped with."
+      "engine_note": "vLLM only: dllm_max_steps is emitted as DiffusionConfig max_denoising_steps. SGLang's equivalent lever is dllm_threshold, measured by its own node."
     },
     {
       "id": "dllm_algorithm",
@@ -857,7 +895,7 @@
       "requires": [
         "dllm_block_size"
       ],
-      "applicable_when": "fingerprint.model.decoding == \"diffusion\"",
+      "applicable_when": "fingerprint.model.decoding == \"diffusion\" and fingerprint.model.serving_engine == \"sglang\"",
       "rationale": "JointThreshold commits on confidence and then allows a bounded number of post-edit passes to revise committed tokens, against LowConfidence which commits once. Same budget, different behaviour under a lowered threshold; measured last so it runs on whatever threshold and block the walk kept.",
       "action": {
         "set": {
@@ -878,7 +916,8 @@
       ],
       "on_revert": [
         "frontier"
-      ]
+      ],
+      "engine_note": "An SGLang knob. vLLM's dLLM path (DiffusionGemma) has a canvas and a step count and nothing else, so this node is skipped there rather than sent as a flag vLLM would refuse."
     },
     {
       "id": "frontier",

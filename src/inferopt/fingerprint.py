@@ -58,6 +58,11 @@ DTYPE_BYTES = {"float32": 4, "bfloat16": 2, "float16": 2, "fp8": 1, "int8": 1, "
 # model
 # --------------------------------------------------------------------------
 
+# Masked diffusion LMs vLLM serves natively (0.29: DiffusionGemma, through its
+# DiffusionConfig). Every other dLLM is served by SGLang.
+VLLM_DLLM_ARCHITECTURES = ("DiffusionGemma",)
+
+
 class ModelFingerprint(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
@@ -69,6 +74,19 @@ class ModelFingerprint(BaseModel):
     dllm_block_size: int = Field(0, description=(
         "config | positions denoised together, the checkpoint's own default as SGLang "
         "reads it: LLaDA 2 32, SDAR 4, DiffusionGemma its canvas_length. 0 when not a dLLM"))
+    dllm_max_steps: int = Field(0, description=(
+        "generation_config | denoising passes per block the checkpoint ships with "
+        "(max_denoising_steps). vLLM's one dLLM knob besides the canvas; 0 when unknown"))
+
+    @computed_field(description=(
+        "derived | the engine the walk launches: vllm, or sglang for a masked diffusion LM "
+        "vLLM has no model for. DiffusionGemma is native to vLLM 0.29 and stays there. "
+        "Gates the dLLM nodes whose knobs exist on one engine only"))
+    @property
+    def serving_engine(self) -> str:
+        if self.decoding != "diffusion":
+            return "vllm"
+        return "vllm" if self.architecture.startswith(VLLM_DLLM_ARCHITECTURES) else "sglang"
     is_dense: bool = Field(True, description="config | False for MoE; gates the expert-placement subtree")
     n_params_b: float = Field(description="config | parameter count in billions")
     n_layers: int = Field(description="config | num_hidden_layers")

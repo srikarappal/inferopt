@@ -2941,8 +2941,9 @@ def test_engines():
     dag = json.loads(_DAG.read_text())
     by_id = {n["id"]: n for n in dag["nodes"]}
     dllm_nodes = [i for i in by_id if i.startswith("dllm_")]
-    check("four dLLM nodes", sorted(dllm_nodes) == ["dllm_algorithm", "dllm_block_size",
+    check("five dLLM nodes", sorted(dllm_nodes) == ["dllm_algorithm", "dllm_block_size", "dllm_denoising_steps",
                                                     "dllm_fdfo", "dllm_threshold"], dllm_nodes)
+    sglang_nodes = ["dllm_algorithm", "dllm_block_size", "dllm_fdfo", "dllm_threshold"]
     ar = _ctx()
     check("every one skips an autoregressive model",
           not any(Predicate(by_id[i]["applicable_when"]).evaluate(ar) for i in dllm_nodes))
@@ -2951,8 +2952,20 @@ def test_engines():
     dl = _ctx()
     dl.fingerprint.model.decoding = "diffusion"
     dl.fingerprint.model.dllm_block_size = 32
-    check("every one applies to a diffusion model with a known block",
-          all(Predicate(by_id[i]["applicable_when"]).evaluate(dl) for i in dllm_nodes))
+    check("every SGLang one applies to a diffusion model with a known block",
+          all(Predicate(by_id[i]["applicable_when"]).evaluate(dl) for i in sglang_nodes))
+    check("and the vLLM steps node does not, on an SGLang-served model",
+          not Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(dl))
+    vl = _ctx()
+    vl.fingerprint.model.decoding = "diffusion"
+    vl.fingerprint.model.architecture = "DiffusionGemmaForBlockDiffusion"
+    vl.fingerprint.model.dllm_block_size = 256
+    vl.fingerprint.model.dllm_max_steps = 64
+    check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
+          Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
+          and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)
+          and not any(Predicate(by_id[i]["applicable_when"]).evaluate(vl)
+                      for i in ("dllm_algorithm", "dllm_fdfo", "dllm_threshold")))
     dl.fingerprint.model.dllm_block_size = 0
     check("an unknown block gates only the block node off",
           not Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(dl)
@@ -3270,11 +3283,65 @@ def test_vi_autoload():
     check("the .pth line is one import statement", autoload.PTH_LINE.startswith("import ") and "\n" not in autoload.PTH_LINE)
 
 
+def test_vllm_dllm_route():
+    """A masked diffusion LM vLLM serves natively stays on vLLM, with its two
+    knobs spelt as vLLM spells them; every other dLLM still goes to SGLang."""
+    from inferopt import engines, request as R
+    from inferopt.fingerprint import Fingerprint, HardwareFingerprint, LoraFingerprint, ModelFingerprint, WorkloadFingerprint
+
+    section("dLLM on vLLM: DiffusionGemma is routed to vLLM, LLaDA to SGLang")
+    check("DiffusionGemma is a dLLM", R.decoding_of("DiffusionGemmaForBlockDiffusion") == "diffusion")
+    check("and vLLM serves it", R.serving_engine_of("DiffusionGemmaForBlockDiffusion") == "vllm")
+    check("LLaDA still goes to SGLang", R.serving_engine_of("LLaDA2MoeModelLM") == "sglang")
+    check("an autoregressive model is vLLM", R.serving_engine_of("Qwen3ForCausalLM") == "vllm")
+    check("its block is the canvas", R.dllm_block_size_of("DiffusionGemmaForBlockDiffusion", {"canvas_length": 128}) == 128)
+
+    class M:  # the engine choice reads only these
+        def __init__(self, decoding, engine): self.decoding, self.serving_engine = decoding, engine
+    class FP:
+        diffusion = None
+        def __init__(self, m): self.model = m
+    check("engine_for follows the fingerprint's engine for a dLLM",
+          engines.engine_for(FP(M("diffusion", "vllm"))).name == "vllm"
+          and engines.engine_for(FP(M("diffusion", "sglang"))).name == "sglang"
+          and engines.engine_for(FP(M("autoregressive", "vllm"))).name == "vllm")
+
+    vllm = engines.VllmEngine()
+    argv = vllm.translate({"max_num_seqs": 4, "dllm_block_size": 256, "dllm_max_steps": 64,
+                           "dllm_threshold": 0.9, "dllm_algorithm": "LowConfidence", "dllm_fdfo": False})
+    check("block and steps become one --diffusion-config", "--diffusion-config" in argv, argv)
+    cfg = json.loads(argv[argv.index("--diffusion-config") + 1]) if "--diffusion-config" in argv else {}
+    check("spelt as vLLM spells them", cfg == {"canvas_length": 256, "max_denoising_steps": 64}, cfg)
+    check("SGLang's knobs are not sent to vLLM",
+          not any(a.startswith("--dllm") for a in argv), argv)
+    check("a config without dLLM keys emits no diffusion config",
+          "--diffusion-config" not in vllm.translate({"max_num_seqs": 4}))
+
+    class HW:
+        unified_memory = False; sm_major = 9
+    class D:
+        decoding = "diffusion"; is_dense = True; serving_engine = "vllm"
+    class DFP:
+        hw = HW(); model = D()
+    check("a dLLM on vLLM launches with the batch the recipe caps at",
+          vllm.defaults(DFP()).get("max_num_seqs") == 4, vllm.defaults(DFP()))
+
+    from inferopt._paths import default_dag
+    dag = json.loads(Path(default_dag("llm")).read_text())
+    by = {n["id"]: n for n in dag["nodes"]}
+    check("the SGLang-only nodes say so",
+          all('serving_engine == "sglang"' in by[n]["applicable_when"] for n in ("dllm_fdfo", "dllm_threshold", "dllm_algorithm")))
+    check("the steps node is vLLM only and sits after the block node",
+          'serving_engine == "vllm"' in by["dllm_denoising_steps"]["applicable_when"]
+          and by["dllm_block_size"]["on_keep"] == ["dllm_denoising_steps"]
+          and by["dllm_denoising_steps"]["on_revert"] == ["dllm_algorithm"])
+
+
 # ==========================================================================
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile, test_port_is_ours, test_vi_autoload,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
