@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
@@ -56,15 +57,33 @@ def load_config(args) -> tuple[str, dict]:
 
 
 def pick_engine(model: str, name: str | None):
+    arch = ""
+    if not is_pipeline(model):
+        arch = (req._hf_config(model).get("architectures") or ["unknown"])[0]
     if name:
         kind = name
-    elif is_pipeline(model):
+    elif not arch:
         kind = "sglang-diffusion"
     else:
-        arch = (req._hf_config(model).get("architectures") or ["unknown"])[0]
         kind = req.serving_engine_of(arch)
     engine = SglangDiffusionEngine(model=model) if kind == "sglang-diffusion" else ENGINES[kind]()
-    return kind, engine
+    return kind, engine, arch
+
+
+def engine_defaults(engine, model: str, arch: str) -> dict:
+    """What the walk would put under a config on this card: the memory
+    fraction a unified-memory box survives, the MoE backend sm12x needs, a
+    dLLM's batch cap. Best effort; a bare `vllm serve` is what you get when
+    the card cannot be read."""
+    try:
+        hw = req.detect_hardware(req.InferOptRequest(model=model, trace="unused"))
+        fp = SimpleNamespace(
+            hw=hw, diffusion=None,
+            model=SimpleNamespace(is_dense=True, decoding=req.decoding_of(arch) if arch else "denoising"))
+        return dict(engine.defaults(fp))
+    except Exception as why:
+        print(f"no engine defaults applied ({type(why).__name__}: {why})", flush=True)
+        return {}
 
 
 def launch(engine, model: str, port: int, config: dict, log_path: Path) -> subprocess.Popen:
@@ -188,7 +207,10 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     model, config = load_config(args)
-    kind, engine = pick_engine(model, args.engine)
+    kind, engine, arch = pick_engine(model, args.engine)
+    # The walk's defaults for this card go UNDER the config: an explicit key
+    # wins, and a bare --model still launches the way a trial would.
+    config = {**engine_defaults(engine, model, arch), **config}
     prompts = list(args.prompt or [])
     if args.prompts:
         for line in Path(args.prompts).read_text().splitlines():
