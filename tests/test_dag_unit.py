@@ -2992,6 +2992,42 @@ def test_engines():
           _P("measurements.spec_decode_ngram.kept or measurements.spec_decode_draft.kept").evaluate(unreached) is False)
     check("an unknown key under another root is still an error",
           raises(lambda: _P("preconditions.nonesuch.kept").evaluate(unreached), Exception))
+    # the seed as calibration: a served seed that misses the target stops the walk
+    from inferopt import traverse as TR, api as API
+    from inferopt.fingerprint import SLO as _SLO
+    slow = TR.Trial(node_id="incumbent", config={}, goodput=0.0, ttft_p99_ms=8748.8, itl_p99_ms=0.15,
+                    memory_gb=1.0, slo_ok=False, concurrency=1, diagnostics={"completed": 3, "failed": 3})
+    why = TR.seed_misses_slo(slow, _SLO(ttft_p99_ms=5000, itl_p99_ms=250))
+    check("a served seed that misses the target is named, with the target that would pass",
+          why is not None and "8749 ms against 5000 ms" in why and "9624 ms would pass" in why, why)
+    dead = TR.Trial(node_id="incumbent", config={}, goodput=0.0, ttft_p99_ms=float("inf"), itl_p99_ms=float("inf"),
+                    memory_gb=0.0, slo_ok=False, diagnostics={"launch_error": "exited 1"})
+    check("a launch that never served is not a calibration verdict", TR.seed_misses_slo(dead, _SLO(ttft_p99_ms=5000, itl_p99_ms=250)) is None)
+    fine = TR.Trial(node_id="incumbent", config={}, goodput=40.0, ttft_p99_ms=900.0, itl_p99_ms=30.0, memory_gb=1.0, slo_ok=True)
+    check("a seed that meets the target walks on", TR.seed_misses_slo(fine, _SLO(ttft_p99_ms=5000, itl_p99_ms=250)) is None)
+
+    class _SlowSeed:
+        replay = None
+        def __init__(self): self.calls = 0
+        def measure(self, config, *, probes, benchmarks, node_id, **_):
+            self.calls += 1
+            return TR.Trial(node_id=node_id, config=dict(config), goodput=0.0, ttft_p99_ms=8748.8, itl_p99_ms=0.15,
+                            memory_gb=1.0, slo_ok=False, concurrency=1, diagnostics={"completed": 3, "failed": 3})
+    walk_ctx = _ctx()
+    walk_ctx.slo = _SLO(ttft_p99_ms=5000, itl_p99_ms=250)
+    ev = _SlowSeed()
+    res = TR.traverse(json.loads(_DAG.read_text()), walk_ctx, ev, log=lambda *a, **k: None)
+    check("the walk stops after the seed instead of measuring every node against zero",
+          ev.calls == 1 and res.launches == 1 and "slo unreachable at the seed" in (res.stopped_early or ""),
+          (ev.calls, res.launches, res.stopped_early))
+
+    class _W:
+        class model: decoding = "diffusion"; dllm_block_size = 256
+        class workload: mean_output_tokens = 6.0
+    check("a short-answer trace on a canvas model is called out before a launch",
+          API.workload_warnings(_W()) and "256-token canvas" in API.workload_warnings(_W())[0])
+    _W.workload.mean_output_tokens = 180.0
+    check("a realistic one is not", API.workload_warnings(_W()) == [])
     check("a vLLM-served dLLM gets the block and steps nodes and not SGLang's",
           Predicate(by_id["dllm_block_size"]["applicable_when"]).evaluate(vl)
           and Predicate(by_id["dllm_denoising_steps"]["applicable_when"]).evaluate(vl)

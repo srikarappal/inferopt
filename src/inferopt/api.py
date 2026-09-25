@@ -38,6 +38,33 @@ from inferopt._paths import default_dag, runs as _runs
 from inferopt.provenance import seed_fingerprint
 
 
+def workload_warnings(fp) -> list[str]:
+    """What is wrong with this workload for this model, said before a launch.
+
+    A masked diffusion LM fills a whole canvas per request whatever the
+    answer length, so a trace derived from short expected answers (MATH-500's
+    are 3 to 32 tokens) measures a workload nobody serves: every request costs
+    a full canvas and throughput in tokens reads as nothing. The trace is the
+    caller's to fix; the least this can do is say so where the run's log is
+    read, before three hours are spent on it."""
+    model = getattr(fp, "model", None)
+    workload = getattr(fp, "workload", None)
+    if model is None or workload is None or getattr(model, "decoding", "") != "diffusion":
+        return []
+    canvas = int(getattr(model, "dllm_block_size", 0) or 0)
+    mean_out = float(getattr(workload, "mean_output_tokens", 0) or 0)
+    floor = max(16, canvas // 8) if canvas else 16
+    if mean_out >= floor:
+        return []
+    return [
+        "WORKLOAD    answers average "
+        f"{mean_out:.0f} tokens against a {canvas or 'block'}-token canvas: a diffusion LM "
+        "denoises the whole canvas per request whatever the answer length, so this trace "
+        "measures throughput nobody serves. Supply a trace with the response lengths you "
+        "actually see, or let the launcher measure them on the host.",
+    ]
+
+
 @dataclass
 class Result:
     """What comes back. Every number here was measured, or is absent."""
@@ -267,6 +294,8 @@ def optimize(
         model=model, trace=trace, ttft_p99_ms=ttft_p99_ms, itl_p99_ms=itl_p99_ms,
         allow_loss=allow_loss, **({"qps": qps} if qps else {})))
     ctx = Context(fingerprint=fp, slo=slo_)
+    for line in workload_warnings(fp):
+        log(line)
 
     rd = run_dir or str(_runs(f"{model.split('/')[-1].lower()}-{strategy}"))
     bench = benchmarks if benchmarks is not None else ["math_500"]

@@ -219,6 +219,38 @@ def _value(v: Any, ctx: Context) -> Any:
             f"literal string.") from None
 
 
+def seed_misses_slo(trial: Trial, slo) -> str | None:
+    """Why a walk cannot start from this seed, or None when it can.
+
+    The seed measured here IS the calibration: it served requests (a launch
+    that never served is a different problem, reported as such) and none of
+    them met the target. Nothing lossless makes a model faster than its own
+    forward pass, so every later node would compare against zero. The
+    message carries the measured p99s and the target that would pass, which
+    is what the caller needs to relaunch with a reachable one."""
+    if trial.goodput or not trial.slo_ok is False:
+        return None
+    diag = trial.diagnostics or {}
+    if diag.get("launch_error") or not diag.get("completed"):
+        return None
+    ttft = trial.ttft_p99_ms if math.isfinite(trial.ttft_p99_ms or float("inf")) else None
+    itl = trial.itl_p99_ms if math.isfinite(trial.itl_p99_ms or float("inf")) else None
+    misses = []
+    if slo.ttft_p99_ms and ttft and ttft > slo.ttft_p99_ms:
+        misses.append(f"p99 first token (per sample for a pipeline) {ttft:.0f} ms against {slo.ttft_p99_ms:.0f} ms;"
+                      f" a target of {ttft * 1.1:.0f} ms would pass at this concurrency")
+    if slo.itl_p99_ms and itl and itl > slo.itl_p99_ms:
+        misses.append(f"p99 between tokens {itl:.1f} ms against {slo.itl_p99_ms:.0f} ms;"
+                      f" a target of {itl * 1.1:.0f} ms would pass")
+    if not misses:
+        return None
+    return ("slo unreachable at the seed: " + "  ".join(misses) + ". The seed served "
+            f"{diag.get('completed')} requests and none met the target; no lossless change "
+            "lowers a model's own forward pass, so the walk stops here rather than measure "
+            "every node against zero. Relaunch with a reachable target, or accept quality loss "
+            "and lower the work per request (steps, canvas, threshold).")
+
+
 def _variant_label(t: Trial, node: dict) -> str:
     """The keys a sweep varied, with this trial's values, for a log line."""
     keys = sorted({k for entry in (node.get("sweep") or []) for k in entry})
@@ -376,6 +408,17 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         launches += 1
         trials.append(t)
         incumbent_goodput = t.goodput
+        # THE SEED IS THE CALIBRATION. It served and every request missed the
+        # target: no lossless node can make a model faster than its own
+        # forward pass, so the walk would spend every launch comparing
+        # against zero (DiffusionGemma: 13 launches, 166 minutes, frontier 0,
+        # against a 5 s first-token target its 10 s canvas could never meet).
+        # Say what was measured and what target would pass, and stop here.
+        verdict = seed_misses_slo(t, ctx.slo)
+        if verdict:
+            log(f"  STOP  {verdict}")
+            stopped = verdict
+            root = None
         log(f"incumbent   {incumbent_goodput:.1f} goodput  [measured here, "
             f"no stage 1.3 result was supplied]")
     cur, last_kept = root, True
