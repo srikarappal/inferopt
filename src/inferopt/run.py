@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 from inferopt.calibration import STORE
+from inferopt.finalists import ladder_for
 from inferopt.fingerprint import NodeMeasurement
 from inferopt.request import InferOptRequest, build_fingerprint
 from inferopt.traverse import report, traverse
@@ -554,7 +555,8 @@ def cmd_optimize(args) -> int:
         for t in finalists:
             print(f"    {t.node_id}")
             try:
-                c, pk = ev.capacity(t.config, f"finalist-{t.node_id}")
+                c, pk = ev.capacity(t.config, f"finalist:{t.node_id}",
+                                    levels=ladder_for(fp, t.config))
                 finalist_curves[t.node_id] = {"curve": c, "peak": pk}
                 t.curve = c
                 t.concurrency = pk["concurrency"]

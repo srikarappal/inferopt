@@ -1250,7 +1250,7 @@ class VllmEvaluator:
         """
         return max(curve, key=lambda m: m["goodput"])
 
-    def capacity(self, config: dict, tag: str) -> tuple[list[dict], dict]:
+    def capacity(self, config: dict, tag: str, levels=None) -> tuple[list[dict], dict]:
         """Launch `config` and sweep it across the full range.
 
         Used for the frontier finalists, where the winner's own curve is what
@@ -1258,9 +1258,10 @@ class VllmEvaluator:
         the sweep, the peak selection and the extension logic have exactly one
         implementation -- there used to be a second inline copy here, which is
         how two independently-derived operating points could disagree.
+        `levels` is the ladder; stage 2.1 passes the dense one (finalists.py).
         """
         t = self.measure(config, probes=["goodput"], benchmarks=[],
-                         node_id=tag, levels=SWEEP_LEVELS)
+                         node_id=tag, levels=levels or SWEEP_LEVELS)
         curve = t.curve or []
         # peak(), not a second copy of it. This function's own docstring warns
         # that a duplicated operating-point selection is how two answers come to

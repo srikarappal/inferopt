@@ -131,7 +131,7 @@ over the deadline, and those points cost time to learn nothing.
 | 1.3b | seed config → finds **L\***, the operating point | ~10 min, once |
 | traversal | every node measured at L\* | unchanged |
 | crossing nodes | also at L\*/2 and 2·L\* | ~+1 min each |
-| finalists | full sweep on the top frontier configs | ~15 min each |
+| 2.1 finalists | dense ladder on the top frontier configs plus the incumbent, past the first miss, profile at the peak (16 levels LLM, 8 dLLM, 6 pipeline) | ~20 min each LLM, ~1 h dLLM |
 
 ### Why not sweep every node
 

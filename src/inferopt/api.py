@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from inferopt._paths import default_dag, runs as _runs
+from inferopt.finalists import sweep_finalists
 from inferopt.provenance import seed_fingerprint
 
 
@@ -248,6 +249,7 @@ def optimize(
     max_minutes: float | None = None,
     profile: bool = True,
     chat_prompts: bool = True,
+    finalists: int = 3,
     log=print,
 ) -> Result:
     """Search serving configurations and return measured operating points.
@@ -256,6 +258,12 @@ def optimize(
     model's chat template (prompting.py). Off for a trace of real traffic,
     whose text is already what the customer sends; a model with no template
     is unaffected either way.
+
+    `finalists` is stage 2.1: how many frontier configurations (plus the
+    incumbent, which ships) are launched once more after the walk and swept
+    densely across concurrency, past the first miss, with the profiler window
+    at the peak. The walk ranks at one operating point; this draws the curve
+    of what would be deployed. 0 skips it.
 
     `repeats` is LAUNCHES per cell or design row, and defaults to 2 to match
     yolo_run.py's CLI rather than to 1. Across-launch spread was measured at
@@ -295,7 +303,8 @@ def optimize(
         return optimize_pipeline(model=model, rows=rows, latency_p99_ms=ttft_p99_ms,
                                  qps=qps or 1.0, allow_loss=allow_loss, run_dir=run_dir,
                                  gpu=gpu, port=port, max_launches=max_launches,
-                                 max_minutes=max_minutes, dag=dag, profile=profile, log=log)
+                                 max_minutes=max_minutes, dag=dag, profile=profile,
+                                 finalists=finalists, log=log)
     fp, slo_ = build_fingerprint(InferOptRequest(
         model=model, trace=trace, ttft_p99_ms=ttft_p99_ms, itl_p99_ms=itl_p99_ms,
         allow_loss=allow_loss, **({"qps": qps} if qps else {})))
@@ -408,6 +417,13 @@ def optimize(
         },
         extra=out.extra,
     )
+    # STAGE 2.1. After the walk, before anything is reported: the finalists'
+    # dense curves land on their trials, so the frontier and the plot carry the
+    # measured curve of what ships rather than a bracket around one point.
+    res.extra["finalists"] = sweep_finalists(
+        runner.ev, fp, res.trials, res.frontier,
+        res.chosen.node_id if res.chosen is not None else None,
+        n=finalists, journal=runner.journal, log=log)
     res.quality_changes = _changes(res, bench)
     res.save()
     return res

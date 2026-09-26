@@ -35,6 +35,7 @@ import httpx
 
 from inferopt.engines import SglangDiffusionEngine
 from inferopt.evaluator import HOST, VllmEvaluator, WARMUP_S
+from inferopt.finalists import sweep_finalists
 from inferopt.fingerprint import (SLO, Context, DiffusionShape, Fingerprint,
                                   LoraFingerprint, ModelFingerprint,
                                   WorkloadFingerprint)
@@ -704,7 +705,8 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
                       qps: float = 1.0, allow_loss: float | None = None,
                       run_dir: str | None = None, gpu: str = "0", port: int = 8100,
                       max_launches: int | None = None, max_minutes: float | None = None,
-                      dag: str | None = None, profile: bool = True, log=print):
+                      dag: str | None = None, profile: bool = True, finalists: int = 3,
+                      log=print):
     """Search a diffusers pipeline's serving configurations. The diffusion
     twin of api.optimize, and what it delegates to for a model with a
     model_index.json.
@@ -769,5 +771,11 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
                "stopped_early": res.stopped_early, "suggested_slo": res.suggested_slo,
                "unit": "frames"},
     )
+    # Stage 2.1, as for a language model: the finalists' dense curves, one
+    # sample stream to six, land on their trials before anything is reported.
+    out.extra["finalists"] = sweep_finalists(
+        evaluator, fp, out.trials, out.frontier,
+        out.chosen.node_id if out.chosen is not None else None,
+        n=finalists, journal=rd / "trials.jsonl", log=log)
     out.save()
     return out

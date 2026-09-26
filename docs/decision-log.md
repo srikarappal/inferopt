@@ -143,6 +143,16 @@ them everywhere. **Except** `chunked_prefill` and the speculative-decoding famil
 which cross by construction and in opposite directions. Those get two extra
 levels; everything else is measured once at L\*.
 
+**Stage 2.1 (September 2026).** The finalists' sweep is the dense one: sixteen
+levels for an autoregressive LLM, eight for a diffusion LM, six for an image or
+video pipeline, log spaced with a half step, capped at the configuration's own
+max_num_seqs and run past the first miss. It goes through the same measure()
+as a walk trial, so each finalist gets the profile window at its peak and a
+journal row (`finalist:<node>`, replayed on resume), and stage 3 reads the same
+diagnostics for a finalist as for any node. Two to four points per config was
+enough to choose; it was not a curve, and the curve is what sets capacity.
+`optimize(finalists=N)`, `finalists.py`.
+
 ### graph_capture runs last
 
 `torch.compile` is keyed on shapes, so a cache warmed at one `max_num_seqs` is
