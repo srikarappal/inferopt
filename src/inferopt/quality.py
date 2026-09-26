@@ -87,6 +87,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+from inferopt import prompting
 from inferopt._paths import data as _data, home as _home, package_file
 HERE = _home()
 DATA = _data()
@@ -95,16 +96,15 @@ TRAVERSAL_N = 100
 # Said once per process: a caveat repeated 21 times in a ladder is noise.
 _WARNED: set[str] = set()
 
-# Chat templates, cached per model. Building one costs a tokenizer load.
-_TEMPLATES: dict[str, object] = {}
-
 
 def _chat_wrapper(prompt: Callable, model: str | None) -> Callable:
     """Wrap a prompt builder so its text is sent as a chat turn, not a raw completion.
 
     The evaluator talks to /v1/completions, which does NOT apply a chat
-    template. For MATH-500 that is fine and is what every number in this project
-    was measured with.
+    template. MATH-500 was measured raw for a long time on the grounds that it
+    was fine; on DiffusionGemma it was not (366 of 500 prompts came back as one
+    token), so every benchmark now goes through the template, the same one the
+    trace replay uses (prompting.py).
 
     WHY IT IS ON FOR CODE, measured rather than assumed. The reason first written
     here was that an instruct model asked to continue a bare docstring would
@@ -135,31 +135,20 @@ def _chat_wrapper(prompt: Callable, model: str | None) -> Callable:
     every other row in the table. `enable_thinking` is Qwen-specific; other
     templates ignore an unknown kwarg, and if one raises we retry without it.
     """
-    if not model:
+    formatter = prompting.chat_formatter(model)
+    if formatter is None:
         return prompt
-    if model not in _TEMPLATES:
-        try:
-            from transformers import AutoTokenizer
-            _TEMPLATES[model] = AutoTokenizer.from_pretrained(
-                model, trust_remote_code=True)
-        except Exception as e:
-            print(f"        no chat template for {model} ({type(e).__name__}); "
-                  f"sending raw text")
-            _TEMPLATES[model] = None
-    tok = _TEMPLATES[model]
-    if tok is None or not getattr(tok, "chat_template", None):
-        return prompt
+    return _ChatPrompt(prompt, formatter)
 
-    def wrapped(r):
-        msgs = [{"role": "user", "content": prompt(r)}]
-        for kw in ({"enable_thinking": False}, {}):
-            try:
-                return tok.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True, **kw)
-            except Exception:
-                continue
-        return prompt(r)
-    return wrapped
+
+class _ChatPrompt:
+    """A prompt builder whose text goes out as the model's chat turn."""
+
+    def __init__(self, build: Callable, formatter: prompting.ChatFormat):
+        self.build, self.formatter = build, formatter
+
+    def __call__(self, row) -> str:
+        return self.formatter(self.build(row))
 
 
 class Generate(Protocol):
@@ -372,7 +361,7 @@ class Benchmark:
     improvement, and wer and pass@1 move opposite ways."""
     n_full: int
     max_tokens: int
-    chat: bool = False
+    chat: bool = True
     """Whether to send the prompt through the model's chat template.
 
     False for math_500 on purpose. Every accuracy number this project
@@ -440,8 +429,7 @@ BENCHMARKS: dict[str, Benchmark] = {
     # target. It matters most if a model with no chat template falls back to raw
     # completion, where nothing emits a stop token and every generation runs to
     # the cap.
-    "mbpp_plus": Benchmark(_judge_mbpp_plus, _mbpp_plus_prompt, "pass@1", 378, 512,
-                           chat=True),
+    "mbpp_plus": Benchmark(_judge_mbpp_plus, _mbpp_plus_prompt, "pass@1", 378, 512),
     "humaneval_plus": Benchmark(_judge_humaneval_plus, _raw_prompt, "pass@1", 164, 512),
 }
 

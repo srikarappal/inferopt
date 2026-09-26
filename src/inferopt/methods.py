@@ -59,6 +59,7 @@ class MethodRunner:
                  quality_every: bool = True,
                  sweep: bool = True,
                  restart: bool = False,
+                 chat_prompts: bool = True,
                  log=print):
         from inferopt.evaluator import VllmEvaluator
         from inferopt.provenance import trial_stamp
@@ -74,7 +75,8 @@ class MethodRunner:
         self.log = log
         self.stamp = trial_stamp(fp, trace, slo)
         self.ev = VllmEvaluator(fp, slo, trace, str(self.run_dir),
-                                gpu=gpu, port=free_port(port))
+                                gpu=gpu, port=free_port(port),
+                                chat_prompts=chat_prompts)
         self.trials: list[Trial] = []
         self.journal = self.run_dir / "trials.jsonl"
         self.plan = resume.plan(self.run_dir, self.stamp)

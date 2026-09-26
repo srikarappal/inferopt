@@ -86,7 +86,7 @@ from typing import Any
 import httpx
 
 from inferopt.calibration import STORE
-from inferopt import leaderboard
+from inferopt import leaderboard, prompting
 from inferopt.engines import VllmEngine, engine_for
 from inferopt.fingerprint import SLO, Fingerprint
 from inferopt.legality import repair
@@ -508,7 +508,8 @@ class VllmEvaluator:
     """
 
     def __init__(self, fp: Fingerprint, slo: SLO, trace_path: str, run_dir: str,
-                 gpu: str = "0", port: int = 8000, log=print, engine=None):
+                 gpu: str = "0", port: int = 8000, log=print, engine=None,
+                 chat_prompts: bool = True):
         self.fp, self.slo, self.log = fp, slo, log
         self.engine = engine or engine_for(fp)
         self.gpu, self.port, self.run_dir = gpu, port, Path(run_dir)
@@ -522,6 +523,15 @@ class VllmEvaluator:
                 f"{trace_path} has no 'prompt' field. The fingerprint can be built from "
                 f"token counts alone, but the benchmark needs the actual text to replay."
             )
+        # The trace carries the question; the model is sent the chat turn. Off
+        # (chat_prompts=False) for a trace of real traffic, whose text is
+        # already whatever the customer sends. See prompting.py for the numbers.
+        formatter = prompting.chat_formatter(fp.model.id) if chat_prompts else None
+        if formatter is not None:
+            self.prompts = [formatter(p) for p in self.prompts]
+            self.log("  prompts   sent as chat turns, through the model's template")
+        else:
+            self.log("  prompts   sent as written" + ("" if chat_prompts else "  [raw requested]"))
         # The MEAN is still the right number for sizing -- settle length, the
         # equivalence probe, anything that needs one figure. It was the wrong
         # number to serve, and serving it is what this replaces.

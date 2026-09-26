@@ -247,9 +247,15 @@ def optimize(
     max_launches: int | None = None,
     max_minutes: float | None = None,
     profile: bool = True,
+    chat_prompts: bool = True,
     log=print,
 ) -> Result:
     """Search serving configurations and return measured operating points.
+
+    `chat_prompts` sends every trace prompt as one user turn through the
+    model's chat template (prompting.py). Off for a trace of real traffic,
+    whose text is already what the customer sends; a model with no template
+    is unaffected either way.
 
     `repeats` is LAUNCHES per cell or design row, and defaults to 2 to match
     yolo_run.py's CLI rather than to 1. Across-launch spread was measured at
@@ -301,7 +307,7 @@ def optimize(
     bench = benchmarks if benchmarks is not None else ["math_500"]
     runner = MethodRunner(strategy, fp, slo_, trace, rd, gpu=gpu, port=port,
                           benchmarks=bench, quality_every=quality_every_config,
-                          log=log)
+                          chat_prompts=chat_prompts, log=log)
     runner.ev.profile = profile
 
     # The seed. Identical across strategies, and --seed-from-run replaces it for

@@ -386,7 +386,8 @@ def cmd_optimize(args) -> int:
     print(banner(meta, run_dir / "run_meta.json"))
     if port != args.port:
         print(f"  port      {args.port} is taken; using {port}")
-    ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port)
+    ev = VllmEvaluator(fp, slo, args.trace, str(run_dir), gpu=args.gpu, port=port,
+                       chat_prompts=not args.raw_prompts)
     if plan.resuming:
         ev.replay = plan.cache
 
@@ -702,6 +703,10 @@ def main() -> int:
                         "The frontier still includes everything measured.")
     o.add_argument("--skip-stage13", action="store_true",
                    help="skip measuring the seed; the first node is then kept unconditionally")
+    o.add_argument("--raw-prompts", action="store_true",
+                   help="send trace prompts as written instead of as chat turns through "
+                        "the model's template. For a trace of real traffic, whose text "
+                        "is already what the customer sends.")
     o.set_defaults(fn=cmd_optimize)
 
     args = ap.parse_args()
