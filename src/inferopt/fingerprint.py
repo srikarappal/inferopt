@@ -151,8 +151,8 @@ class ModelFingerprint(BaseModel):
     # quantization, and benchmarking someone else's would measure their
     # conversion job rather than ours.
     can_quantize_fp8: bool = Field(False, description="capability | vLLM can quantize weights to FP8 at load time (no artifact)")
-    can_quantize_int4_awq: bool = Field(False, description="capability | llmcompressor can produce an INT4-AWQ checkpoint here")
-    can_quantize_nvfp4: bool = Field(False, description="capability | llmcompressor can produce an NVFP4 checkpoint here")
+    can_quantize_int4_awq: bool = Field(False, description="capability | the quantizer (NVIDIA ModelOpt) can produce a 4-bit weight-only checkpoint here")
+    can_quantize_nvfp4: bool = Field(False, description="capability | the quantizer (NVIDIA ModelOpt) can produce an NVFP4 checkpoint here")
     has_compatible_draft: bool = Field(False, description="registry | a draft model sharing this tokenizer exists")
     draft_model: str | None = Field(None, description="registry | its id")
 

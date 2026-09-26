@@ -236,6 +236,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import modelopt.torch.quantization as mtq
 from modelopt.torch.export import export_hf_checkpoint
+from inferopt.prompting import as_chat_turns
 
 # W4A16_NVFP4, not INT4_AWQ. Both are 4-bit weight-only, but vLLM's modelopt
 # loader accepts only FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO, NVFP4,
@@ -254,7 +255,11 @@ tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto",
                                              trust_remote_code=True)
 
-prompts = [json.loads(l)["prompt"] for l in open(calib_path) if l.strip()]
+# The workload's prompts, as the served model sees them: through the chat
+# template when there is one, the same text the replay and the quality gate
+# send. Activation scales calibrated on bare questions would be scales for a
+# distribution the server never receives.
+prompts = as_chat_turns(model_id, [json.loads(l)["prompt"] for l in open(calib_path) if l.strip()])
 print(f"[job] {len(prompts)} calibration prompts from the workload trace", flush=True)
 
 batches = []

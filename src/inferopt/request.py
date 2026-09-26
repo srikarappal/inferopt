@@ -655,9 +655,9 @@ def detect_quantization_capability(sm_major: int, *, log=print) -> dict[str, boo
       fp8       no producer needed. vLLM quantizes bf16 weights to FP8 during
                 model load with `--quantization fp8` -- no artifact, no
                 calibration, no conversion time. Needs cc >= 8.9.
-      int4_awq  needs llmcompressor to run activation-aware calibration and
+      int4_awq  needs ModelOpt to run activation-aware calibration and
                 write a checkpoint. awq_marlin kernels need cc >= 8.0.
-      nvfp4     Blackwell-native FP4; needs cc >= 10.0 and llmcompressor.
+      nvfp4     Blackwell-native FP4; needs cc >= 10.0 and ModelOpt.
     """
     from inferopt.quantize import producer_available
     have_producer = producer_available()

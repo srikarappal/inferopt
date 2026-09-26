@@ -84,7 +84,19 @@ class MethodRunner:
             self.plan = resume.Plan("fresh")
             self.log("  resume    --restart given, discarding any recorded trials")
         elif self.plan.conflict:
-            raise SystemExit(f"  {self.plan.reason}")
+            # The journal belongs to another workload: same directory, a
+            # different trace, model, card or engine. A library must not exit
+            # over it; the control plane hands one directory per job and the
+            # trace legitimately changes when it is re-measured. The old rows
+            # are kept beside the journal for the record and the run starts
+            # fresh, which is what --restart would have done.
+            kept = self.journal.with_name(
+                f"trials.{time.strftime('%Y%m%dT%H%M%S')}.superseded.jsonl")
+            self.journal.rename(kept)
+            self.log(f"  resume    {self.plan.reason.strip()}")
+            self.log(f"  resume    those measurements are another workload's; kept as "
+                     f"{kept.name}, starting fresh")
+            self.plan = resume.Plan("fresh")
         self.log(resume.describe(self.plan))
         if self.plan.resuming:
             # Replayed trials are already IN the journal. Truncating here is what
