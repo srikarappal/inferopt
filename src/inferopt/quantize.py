@@ -229,14 +229,19 @@ _JOB = r'''
 import json, sys
 from pathlib import Path
 model_id, kind, out_dir, calib_path, ignore_json = sys.argv[1:6]
+# How the model decodes and how wide its canvas is: a diffusion LM is
+# calibrated by denoising (inferopt.dllm_calibration), not by a causal forward.
+decoding = sys.argv[6] if len(sys.argv) > 6 else "autoregressive"
+canvas_length = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 ignore = json.loads(ignore_json)
 CALIB_MAX_TOKENS = 2048
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 import modelopt.torch.quantization as mtq
 from modelopt.torch.export import export_hf_checkpoint
 from inferopt.prompting import as_chat_turns
+from inferopt.dllm_calibration import calibration_forwards, load_model, scoring_batch
 
 # W4A16_NVFP4, not INT4_AWQ. Both are 4-bit weight-only, but vLLM's modelopt
 # loader accepts only FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO, NVFP4,
@@ -252,8 +257,7 @@ SINGLE = {"fp8":   "FP8_DEFAULT_CFG",
 # without it, and refusing here would leave the lossy branch without its
 # largest lever for exactly the models that need it.
 tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto",
-                                             trust_remote_code=True)
+model = load_model(model_id, decoding)
 
 # The workload's prompts, as the served model sees them: through the chat
 # template when there is one, the same text the replay and the quality gate
@@ -266,6 +270,13 @@ batches = []
 for p in prompts:
     enc = tok(p, return_tensors="pt", truncation=True, max_length=CALIB_MAX_TOKENS)
     batches.append({k: v.to(model.device) for k, v in enc.items()})
+if decoding == "diffusion":
+    # Eight denoising forwards per prompt, so the prompt count is what keeps
+    # the calibration at the same budget as an autoregressive model's.
+    batches = batches[:64]
+# What AutoQuantize's KL scoring can call m(**b) on: a canvas or a mask block
+# beside the prompt for a diffusion LM, the prompt alone otherwise.
+scoring = [scoring_batch(model, b, decoding, canvas_length) for b in batches]
 
 if kind.startswith("autoquant@"):
     bits = float(kind.split("@", 1)[1])
@@ -290,7 +301,7 @@ if kind.startswith("autoquant@"):
             model,
             constraints={"effective_bits": bits},
             quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
-            data_loader=batches,
+            data_loader=scoring,
             forward_step=lambda m, b: m(**b).logits,
             method="kl_div",
             disabled_layers=ignore or None,
@@ -354,14 +365,13 @@ if kind.startswith("autoquant@"):
             _t.cuda.empty_cache()
         except Exception:
             pass
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype="auto", device_map="auto", trust_remote_code=True)
+        model = load_model(model_id, decoding)
 
         model, state = mtq.auto_quantize(
             model,
             constraints={"effective_bits": achieved},
             quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
-            data_loader=batches,
+            data_loader=scoring,
             forward_step=lambda m, b: m(**b).logits,
             method="kl_div",
             disabled_layers=ignore or None,
@@ -384,11 +394,11 @@ elif kind in SINGLE:
     print(f"[job] {SINGLE[kind]}; additionally disabling {ignore}", flush=True)
 
     def forward_loop(m):
-        for i, b in enumerate(batches):
-            with torch.no_grad():
-                m(**b)
-            if (i + 1) % 32 == 0:
-                print(f"[job] calibrated {i+1}/{len(batches)}", flush=True)
+        # The plain forward for an autoregressive model; a denoising pass per
+        # prompt for a diffusion LM, the forward the server actually runs.
+        ran = calibration_forwards(m, batches, decoding, canvas_length,
+                                   log=lambda line: print(line, flush=True))
+        print(f"[job] {ran} calibration forwards over {len(batches)} prompts", flush=True)
 
     if ignore:
         import copy
@@ -456,8 +466,15 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
 
     job = out.parent / f"{out.name}.job.py"
     job.write_text(_JOB)
+    # How the model decodes and its canvas width travel with the job: a
+    # diffusion LM is calibrated through its denoising forward, not a causal
+    # one (dllm_calibration.py).
+    decoding = getattr(fp.model, "decoding", "autoregressive")
+    canvas = int(getattr(fp.model, "dllm_block_size", 0) or 0)
+    if decoding == "diffusion":
+        log(f"            diffusion LM: calibrating by denoising, canvas {canvas}")
     r = subprocess.run([sys.executable, str(job), model_id, kind, str(out),
-                        str(calib), json.dumps(ignore)],
+                        str(calib), json.dumps(ignore), decoding, str(canvas)],
                        env=_child_env(), capture_output=True, text=True)
     if r.returncode != 0 or not (out / "config.json").exists():
         shutil.rmtree(out, ignore_errors=True)
