@@ -56,7 +56,31 @@ POLL_S = 1.0
 
 VIDEO_TRANSFORMERS = ("WanTransformer3DModel", "HunyuanVideoTransformer3DModel",
                       "LTXVideoTransformer3DModel", "CosmosTransformer3DModel",
-                      "SanaVideoTransformer3DModel")
+                      "SanaVideoTransformer3DModel", "MiniMaxH3Transformer3DModel",
+                      "MiniMaxH3DiTModel")
+# Components an index names that no server loads beside the others. MiniMax
+# H3's root index lists the Ref2VA denoiser next to the FL2VA one and
+# --model-variant picks one, so it is neither resident nor counted.
+ALTERNATE_COMPONENTS = ("transformer_ref",)
+
+# MiniMax H3 speaks its own contract on /v1/videos: a task, ordered conditions
+# and a target of short edge, aspect ratio and seconds; the server resolves the
+# aligned canvas and frame count at its one frame rate. Joint video and audio,
+# CFG distilled, served by SGLang with --model-variant.
+H3_FPS = 24
+H3_ASPECT_RATIOS = {"21:9": 21 / 9, "16:9": 16 / 9, "4:3": 4 / 3, "1:1": 1.0, "3:4": 3 / 4, "9:16": 9 / 16}
+H3_FLOW_SHIFT = 12.0          # FL2VA/model_index.json sigma_shift_scales.video
+H3_AUDIO_FLOW_SHIFT = 3.0     # and .audio
+
+
+def is_h3(shape: DiffusionShape) -> bool:
+    return shape.transformer_class.startswith("MiniMaxH3")
+
+
+def h3_aspect_ratio(width: int, height: int) -> str:
+    """The nearest of the ratios H3 accepts for a text-to-video target."""
+    ratio = width / max(1, height)
+    return min(H3_ASPECT_RATIOS, key=lambda label: abs(H3_ASPECT_RATIOS[label] - ratio))
 
 
 # ---------------------------------------------------------------- fingerprint
@@ -92,9 +116,13 @@ def pipeline_shape(model: str, workload_row: dict) -> DiffusionShape | None:
     # Every component the index lists, by its directory name. The shape is
     # universal (encoders, denoiser, VAE); the count of each is not: FLUX has
     # two text encoders, SD3 three, Wan2.2-A14B two denoisers.
+    # A spec is [library, class]; a modular index adds a loading spec as a
+    # third element. Alternates are named but never loaded beside the rest.
     components = {name: spec[1] for name, spec in index.items()
-                  if isinstance(spec, list) and len(spec) == 2 and spec[1]
-                  and name not in ("scheduler", "tokenizer") and not name.startswith("tokenizer")}
+                  if isinstance(spec, list) and len(spec) >= 2 and spec[1]
+                  and not name.startswith("_") and name not in ALTERNATE_COMPONENTS
+                  and "scheduler" not in name and not name.startswith("tokenizer")
+                  and name != "processor"}
     encoders = [n for n in components if n.startswith("text_encoder")]
     denoisers = [n for n in components if n.startswith("transformer") or n.startswith("unet")]
     transformer_class = components.get("transformer") or (components[denoisers[0]] if denoisers else "")
@@ -102,7 +130,10 @@ def pipeline_shape(model: str, workload_row: dict) -> DiffusionShape | None:
     vae = components.get("vae", "")
     files = [{"path": s.path, "size": getattr(s, "size", 0)}
              for s in HfApi().list_repo_tree(model, recursive=True)]   # folders have no size
-    total_bytes = sum((f["size"] or 0) for f in files if f["path"].endswith(".safetensors"))
+    # Only the components' own directories: a repository can hold more than
+    # one server loads (MiniMax H3 ships its weights three times).
+    total_bytes = sum((f["size"] or 0) for f in files
+                      if f["path"].endswith(".safetensors") and f["path"].split("/", 1)[0] in components)
 
     kind = "video" if transformer_class in VIDEO_TRANSFORMERS or "3D" in transformer_class else "image"
     guidance = float(workload_row.get("guidance_scale", 1.0))
@@ -180,8 +211,37 @@ class Sample:
         return self.done is not None and not self.error
 
 
+def h3_request_body(shape: DiffusionShape, config: dict, prompt: str, seed: int) -> dict:
+    """MiniMax H3's canonical request, from the same sample every other
+    pipeline states as a canvas and a frame count: the short edge and aspect
+    ratio stand for width and height, seconds for frames over fps. Text to
+    video and audio only; guidance is not a knob on a distilled model."""
+    width = int(config.get("width", shape.width))
+    height = int(config.get("height", shape.height))
+    fps = int(config.get("fps", shape.fps)) or H3_FPS
+    seconds = round(int(config.get("num_frames", shape.frames)) / fps, 3)
+    return {"prompt": prompt, "seed": seed, "task": "t2va", "conditions": [],
+            "target": {"short_edge": min(width, height), "aspect_ratio": h3_aspect_ratio(width, height),
+                       "duration_seconds": seconds},
+            "seconds": int(seconds) if seconds == int(seconds) else seconds,
+            "num_inference_steps": int(config.get("num_inference_steps", shape.steps)),
+            "flow_shift": float(config.get("flow_shift", H3_FLOW_SHIFT)),
+            "audio_flow_shift": float(config.get("audio_flow_shift", H3_AUDIO_FLOW_SHIFT)),
+            **{k: config[k] for k in ("profile", "num_profiled_timesteps", "negative_prompt",
+                                      "enable_cache_dit", "cache_dit_params") if k in config}}
+
+
+def frames_in(body: dict) -> int:
+    """How many frames a video request asks for, whichever way it says so."""
+    if body.get("num_frames"):
+        return int(body["num_frames"])
+    return int(round(float(body["target"]["duration_seconds"]) * H3_FPS))
+
+
 def request_body(shape: DiffusionShape, config: dict, prompt: str, seed: int) -> dict:
     """The per request half of a config, over the workload's defaults."""
+    if is_h3(shape):
+        return h3_request_body(shape, config, prompt, seed)
     body = {"prompt": prompt, "n": 1, "seed": seed,
             **{k: config[k] for k in ("profile", "num_profiled_timesteps") if k in config},
             "width": int(config.get("width", shape.width)),
@@ -221,7 +281,7 @@ async def _one(client: httpx.AsyncClient, base_url: str, shape: DiffusionShape,
             s.error = f"HTTP {r.status_code}: {r.text[:200]}"
             return s
         s.video_id = r.json().get("id")
-        s.frames = body["num_frames"]
+        s.frames = frames_in(body)
         while True:
             await asyncio.sleep(POLL_S)
             j = (await client.get(f"{base_url}/v1/videos/{s.video_id}", timeout=60)).json()
@@ -698,6 +758,9 @@ def seed_config(shape: DiffusionShape) -> dict:
            "width": shape.width, "height": shape.height}
     if shape.kind == "video":
         cfg.update({"num_frames": shape.frames, "fps": shape.fps})
+    if is_h3(shape):
+        # A server flag, not a request key: which partition SGLang loads.
+        cfg["model_variant"] = "fl2va"
     return cfg
 
 

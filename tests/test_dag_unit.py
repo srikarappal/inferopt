@@ -3180,6 +3180,21 @@ def test_diffusion():
     vbody = D.request_body(video, {}, "a cat", 7)
     check("video: frames and fps travel, no b64",
           vbody["num_frames"] == 81 and vbody["fps"] == 16 and "response_format" not in vbody, vbody)
+    h3 = video.model_copy(update={"transformer_class": "MiniMaxH3Transformer3DModel", "width": 864,
+                                  "height": 480, "frames": 96, "fps": 24, "steps": 20,
+                                  "guidance_scale": 1.0, "distilled": True})
+    hbody = D.request_body(h3, {"num_inference_steps": 10}, "a cat", 7)
+    check("minimax h3: a task and a target stand in for canvas and frames",
+          hbody["task"] == "t2va" and hbody["conditions"] == []
+          and hbody["target"] == {"short_edge": 480, "aspect_ratio": "16:9", "duration_seconds": 4.0}
+          and hbody["seconds"] == 4 and hbody["num_inference_steps"] == 10
+          and hbody["flow_shift"] == 12.0 and "width" not in hbody and "num_frames" not in hbody
+          and "guidance_scale" not in hbody, hbody)
+    check("minimax h3: the frame count is read back from the target",
+          D.frames_in(hbody) == 96 and D.frames_in(vbody) == 81)
+    check("minimax h3: the seed carries the partition flag, other pipelines do not",
+          D.seed_config(h3).get("model_variant") == "fl2va" and "model_variant" not in D.seed_config(video))
+    check("minimax h3: a portrait canvas becomes 9:16", D.h3_aspect_ratio(480, 864) == "9:16")
     eng = engines.SglangDiffusionEngine()
     argv = eng.translate({"model": "m", "num_inference_steps": 4, "guidance_scale": 1.0,
                           "enable_torch_compile": True, "quantization": "fp8",
