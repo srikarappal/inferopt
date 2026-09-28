@@ -433,6 +433,15 @@ def _write_calibration(trace_path: str, dest: Path, n: int = N_CALIB) -> int:
     return len(picked)
 
 
+def quantize_timeout_s() -> float:
+    """How long one conversion may take before it is stopped and its variant
+    skipped. A search has a wall-clock budget and the budget is only checked
+    between steps, so an unbounded step was an unbounded search: ModelOpt's
+    AutoQuantize on Qwen3-1.7B ran past half an hour on an RTX 4090 (28 Sep
+    2026), CPU bound feeding small kernels, with the rented host billing."""
+    return float(os.environ.get("INFEROPT_QUANTIZE_TIMEOUT_S") or 1800)
+
+
 def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
     """Path to a quantized checkpoint of `model_id`, producing it if needed.
 
@@ -473,9 +482,16 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
     canvas = int(getattr(fp.model, "dllm_block_size", 0) or 0)
     if decoding == "diffusion":
         log(f"            diffusion LM: calibrating by denoising, canvas {canvas}")
-    r = subprocess.run([sys.executable, str(job), model_id, kind, str(out),
-                        str(calib), json.dumps(ignore), decoding, str(canvas)],
-                       env=_child_env(), capture_output=True, text=True)
+    try:
+        r = subprocess.run([sys.executable, str(job), model_id, kind, str(out),
+                            str(calib), json.dumps(ignore), decoding, str(canvas)],
+                           env=_child_env(), capture_output=True, text=True,
+                           timeout=quantize_timeout_s())
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(out, ignore_errors=True)
+        raise RuntimeError(
+            f"{kind} conversion did not finish in {quantize_timeout_s() / 60:.0f} minutes "
+            f"and was stopped; this variant is skipped (INFEROPT_QUANTIZE_TIMEOUT_S)")
     if r.returncode != 0 or not (out / "config.json").exists():
         shutil.rmtree(out, ignore_errors=True)
         tail = "\n".join((r.stderr or r.stdout).strip().splitlines()[-15:])
