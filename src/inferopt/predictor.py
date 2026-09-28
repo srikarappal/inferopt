@@ -55,19 +55,15 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from inferopt import cards
 from inferopt.fingerprint import SLO, Fingerprint
 
-# Unsupported GPU -> nearest supported member of the same architecture family.
-# Same tensor-core generation and kernel shapes, so the RANKING transfers; the
-# memory system does not, which is what the roofline correction is for.
-PROXY_SYSTEM = {
-    "NVIDIA GB10": ("b200_sxm", "same Blackwell tensor cores; GB10's unified LPDDR5X "
-                                "is ~29x slower than B200 HBM3e, so only the ranking transfers"),
-    "NVIDIA GH200": ("h200_sxm", "same Hopper generation"),
-    "NVIDIA RTX PRO 6000": ("b200_sxm", "same Blackwell generation"),
-}
-NATIVE_SYSTEMS = {"h100_sxm", "h200_sxm", "b200_sxm", "gb200", "a100_sxm",
-                  "h100_pcie", "a100_pcie", "l4", "a30"}
+# A card AIConfigurator has not measured is predicted at speed-of-light on its
+# own datasheet (inferopt.cards) and scaled down by the efficiency its donor, a
+# measured card of the same generation, reaches on the same model and traffic.
+# This replaced ranking on a proxy and rescaling by bandwidth, which put the
+# GB10 on a B200 and read its frontier off a machine 29x faster.
+ESTIMATE_BACKEND, ESTIMATE_VERSION = "vllm", "estimate"
 
 
 @dataclass
@@ -75,6 +71,11 @@ class Prediction:
     system_used: str
     is_proxy: bool
     proxy_note: str = ""
+    # "measured": AIConfigurator's kernel data for this very system.
+    # "estimate": this card at speed-of-light x its donor's measured efficiency.
+    basis: str = "measured"
+    donor: str = ""
+    efficiency: float = 1.0
     seed_config: dict = field(default_factory=dict)
     predicted: dict = field(default_factory=dict)     # on the proxy, uncorrected
     corrected: dict = field(default_factory=dict)     # scaled to the real hardware
@@ -106,6 +107,9 @@ def prediction_as_dict(p: "Prediction") -> dict:
         "system_used": p.system_used,
         "is_proxy": p.is_proxy,
         "proxy_note": p.proxy_note,
+        "basis": p.basis,
+        "donor": p.donor,
+        "efficiency": p.efficiency,
         "feasible": p.feasible,
         "infeasible_reason": p.infeasible_reason,
         "seed_config": dict(p.seed_config),
@@ -197,7 +201,8 @@ def environment_warning() -> str:
             f"aiconfigurator with --no-deps, or run ./setup.sh which does both.")
 
 
-def _frontier(fp: Fingerprint, slo: SLO, system: str) -> tuple[dict, list[dict]]:
+def _frontier(fp: Fingerprint, slo: SLO, system: str, database_mode: str = "SILICON",
+              backend: str | None = None, version: str | None = None) -> tuple[dict, list[dict]]:
     """Call aiconfigurator and return (top config, the whole frontier).
 
     THE PYTHON API, NOT THE CLI. This used to shell out to
@@ -229,7 +234,10 @@ def _frontier(fp: Fingerprint, slo: SLO, system: str) -> tuple[dict, list[dict]]
     # The ttft/tpot below likewise filter the ranking, not the Pareto set.
     kwargs = {"model_path": model_arg, "total_gpus": fp.hw.gpu_count,
               "system": system, "isl": int(fp.workload.mean_input_tokens),
-              "osl": int(fp.workload.mean_output_tokens), "top_n": 5}
+              "osl": int(fp.workload.mean_output_tokens), "top_n": 5,
+              "database_mode": database_mode}
+    if backend:
+        kwargs.update(backend=backend, backend_version=version)
     if slo.ttft_p99_ms:
         kwargs["ttft"] = slo.ttft_p99_ms
     if slo.itl_p99_ms:
@@ -325,69 +333,105 @@ def _meets(ttft_ms: float, tpot_ms: float, slo: SLO | None) -> bool | None:
     return True
 
 
+def efficiency_of(measured_top: dict, sol_top: dict) -> float:
+    """What share of speed-of-light a measured system reaches: its best
+    configuration within the targets, against the same at SOL. At most 1."""
+    if not measured_top or not sol_top or not sol_top.get("tokens_s_gpu"):
+        return 0.0
+    return min(1.0, measured_top["tokens_s_gpu"] / sol_top["tokens_s_gpu"])
+
+
+def derate(rows: list[dict], efficiency: float, slo: SLO | None) -> list[dict]:
+    """A speed-of-light frontier at a measured efficiency: every rate down by it,
+    every latency up by it, and conformance judged again on the result."""
+    derated = []
+    for row in rows:
+        row = dict(row, tokens_s_gpu=round(row["tokens_s_gpu"] * efficiency, 1),
+                   tokens_s_user=round(row["tokens_s_user"] * efficiency, 2),
+                   req_s=round(row["req_s"] * efficiency, 3),
+                   ttft_ms=round(row["ttft_ms"] / efficiency, 1),
+                   tpot_ms=round(row["tpot_ms"] / efficiency, 2),
+                   request_latency_ms=round(row["request_latency_ms"] / efficiency, 1))
+        row["meets_slo"] = _meets(row["ttft_ms"], row["tpot_ms"], slo)
+        derated.append(row)
+    return derated
+
+
+def _estimate(fp: Fingerprint, slo: SLO, system: str, donor: str) -> tuple[dict, list[dict], float]:
+    """This card at SOL, scaled by the donor's measured efficiency on this very
+    model and traffic. The top is the best derated row within the targets."""
+    _, rows = _frontier(fp, slo, system, "SOL", ESTIMATE_BACKEND, ESTIMATE_VERSION)
+    donor_measured, _ = _frontier(fp, slo, donor, "SILICON", ESTIMATE_BACKEND)
+    donor_sol, _ = _frontier(fp, slo, donor, "SOL", ESTIMATE_BACKEND, ESTIMATE_VERSION)
+    efficiency = efficiency_of(donor_measured, donor_sol)
+    if not rows or not efficiency:
+        return {}, [], 0.0
+    rows = derate(rows, efficiency, slo)
+    within = [row for row in rows if row["meets_slo"] is not False] or rows
+    return max(within, key=lambda row: row["tokens_s_gpu"]), rows, round(efficiency, 3)
+
+
 def predict(fp: Fingerprint, slo: SLO, *, log=print) -> Prediction:
     feasible, reason, remedies = _feasibility(fp, slo)
 
-    system, is_proxy, note = fp.hw.gpu_name, False, ""
-    guess = fp.hw.gpu_name.lower().replace("nvidia ", "").replace(" ", "_")
-    if guess in NATIVE_SYSTEMS:
-        system = guess
-    elif fp.hw.gpu_name in PROXY_SYSTEM:
-        system, note = PROXY_SYSTEM[fp.hw.gpu_name]
-        is_proxy = True
-    else:
+    resolved = cards.system_for(fp.hw.gpu_name)
+    if resolved is None:
         return Prediction(system_used="none", is_proxy=False,
-                          proxy_note=f"no proxy on record for {fp.hw.gpu_name!r}",
+                          proxy_note=f"no system on record for {fp.hw.gpu_name!r}",
                           feasible=feasible, infeasible_reason=reason, remedies=remedies)
+    system, donor = resolved
+    cards.register_with_aiconfigurator()
 
-    top, rows = _frontier(fp, slo, system)
+    if donor:
+        top, rows, efficiency = _estimate(fp, slo, system, donor)
+        note = (f"{system} at speed-of-light, at the {efficiency:.0%} of it that {donor} "
+                f"measured on this model and traffic")
+        basis = "estimate"
+    else:
+        top, rows = _frontier(fp, slo, system, "SILICON", ESTIMATE_BACKEND)
+        efficiency, note, basis = 1.0, "", "measured"
     if not top:
-        return Prediction(system_used=system, is_proxy=is_proxy, proxy_note=note,
-                          feasible=feasible, infeasible_reason=reason,
+        return Prediction(system_used=system, is_proxy=False, proxy_note=note, basis=basis,
+                          donor=donor, feasible=feasible, infeasible_reason=reason,
                           remedies=remedies)
 
-    # Correct to the real hardware. Decode is memory-bound, so scale by the
-    # bandwidth ratio, then floor at the roofline -- the proxy cannot predict a
-    # latency faster than physics allows on the target.
-    proxy_bw = {"b200_sxm": 8000.0, "gb200": 8000.0, "h200_sxm": 4800.0,
-                "h100_sxm": 3350.0, "a100_sxm": 2039.0}.get(system, fp.hw.memory_bandwidth_gb_s)
-    ratio = fp.hw.memory_bandwidth_gb_s / proxy_bw
+    # The predictor cannot report a latency faster than physics allows: a
+    # decode step reads every active weight.
     floor = roofline_itl_ms(fp)
     corrected = {
-        "tokens_s_gpu": round(top["tokens_s_gpu"] * ratio, 1),
+        "tokens_s_gpu": top["tokens_s_gpu"],
         "itl_ms": round(max(1000.0 / top["tokens_s_user"] if top["tokens_s_user"] else floor,
                             floor), 1),
-        "ttft_ms": round(top["ttft_ms"] / ratio, 1),
-        "bandwidth_ratio": round(ratio, 4),
+        "ttft_ms": top["ttft_ms"],
         "roofline_itl_ms": round(floor, 1),
     }
 
     seed = {"max_num_seqs": top["batch_size"], "tensor_parallel_size": top["tp"]}
     if top["pp"] > 1:
         seed["pipeline_parallel_size"] = top["pp"]
-    return Prediction(system_used=system, is_proxy=is_proxy, proxy_note=note,
-                      seed_config=seed, predicted=top, corrected=corrected,
-                      feasible=feasible, infeasible_reason=reason, remedies=remedies,
-                      frontier=rows)
+    return Prediction(system_used=system, is_proxy=False, proxy_note=note, basis=basis,
+                      donor=donor, efficiency=efficiency, seed_config=seed, predicted=top,
+                      corrected=corrected, feasible=feasible, infeasible_reason=reason,
+                      remedies=remedies, frontier=rows)
 
 
 def describe(p: Prediction, log=print) -> None:
     warning = environment_warning()
     if warning:
         log(f"  stage 1.2 WARNING: {warning}")
-    if p.is_proxy:
+    if p.basis == "estimate":
+        log(f"  stage 1.2 estimated for {p.system_used}")
+        log(f"            {p.proxy_note}")
+    elif p.is_proxy:
         log(f"  stage 1.2 predicted on PROXY system {p.system_used}")
         log(f"            {p.proxy_note}")
     else:
         log(f"  stage 1.2 predicted on {p.system_used}")
     if p.predicted:
-        log(f"    on proxy  bs={p.predicted['batch_size']} tp{p.predicted['tp']}pp{p.predicted['pp']}  "
-            f"{p.predicted['tokens_s_gpu']:,.0f} tok/s  ttft {p.predicted['ttft_ms']:.0f}ms")
-        log(f"    corrected {p.corrected['tokens_s_gpu']:,.0f} tok/s  "
-            f"itl >= {p.corrected['roofline_itl_ms']:.0f}ms  "
-            f"(bandwidth ratio {p.corrected['bandwidth_ratio']:.3f})")
-        log(f"    -> ranking is trustworthy, absolute numbers are not; "
-            f"stage 1.3 measures the truth")
+        log(f"    top  bs={p.predicted['batch_size']} tp{p.predicted['tp']}pp{p.predicted['pp']}  "
+            f"{p.predicted['tokens_s_gpu']:,.0f} tok/s  ttft {p.predicted['ttft_ms']:.0f}ms  "
+            f"itl >= {p.corrected['roofline_itl_ms']:.0f}ms")
+        log(f"    -> predicted, not measured; stage 1.3 measures the truth")
     if not p.feasible:
         log(f"\n  INFEASIBLE: {p.infeasible_reason}")
         for r in p.remedies:
