@@ -263,8 +263,11 @@ class HardwareFingerprint(BaseModel):
     @computed_field
     @property
     def supports_fp8(self) -> bool:
-        """derived | Hopper (9.x) and later have FP8 tensor cores."""
-        return self.sm_major >= 9
+        """derived | Ada (8.9) and later have FP8 tensor cores, and vLLM runs
+        FP8 on them. Gating on 9.x left every RTX 40-series, L4, L40 and L40S
+        without the FP8 nodes."""
+        major, minor = (int(part) for part in (self.compute_capability.split(".") + ["0"])[:2])
+        return (major, minor) >= (8, 9)
 
     @computed_field
     @property
