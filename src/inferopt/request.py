@@ -85,6 +85,12 @@ MEMORY_BANDWIDTH_GB_S = {
     "NVIDIA GeForce RTX 4090": 1008.0,
 }
 
+# The caller's figure for this machine's card, when it knows one: a control
+# plane that rented the card for its bandwidth hands the same number down, so
+# the estimate and the choice agree. Read by every request built in the process
+# and in its subprocesses, which a request field would not reach.
+BANDWIDTH_ENV = "INFEROPT_MEMORY_BANDWIDTH_GB_S"
+
 # Unified-memory parts: CPU and GPU share one pool, so "device memory" is system
 # memory and the host competes for it.
 UNIFIED_MEMORY_PARTS = ("GB10", "GH200", "GB200")
@@ -185,12 +191,13 @@ def detect_hardware(req: InferOptRequest) -> HardwareFingerprint:
             raise RuntimeError(f"{name}: memory.total unreadable ({mem!r}) and not a known unified part")
         mem_gb = sys_ram_gb
 
-    bw = req.override_memory_bandwidth_gb_s or MEMORY_BANDWIDTH_GB_S.get(name)
-    if bw is None:
+    bw = (req.override_memory_bandwidth_gb_s or float(os.environ.get(BANDWIDTH_ENV) or 0)
+          or MEMORY_BANDWIDTH_GB_S.get(name))
+    if not bw:
         raise RuntimeError(
             f"no memory bandwidth on record for {name!r}. This number bounds every decode "
-            f"estimate, so it is not defaulted. Add it to MEMORY_BANDWIDTH_GB_S or pass "
-            f"--override-memory-bandwidth-gb-s."
+            f"estimate, so it is not defaulted. Add it to MEMORY_BANDWIDTH_GB_S, pass "
+            f"--override-memory-bandwidth-gb-s or set {BANDWIDTH_ENV}."
         )
 
     return HardwareFingerprint(
