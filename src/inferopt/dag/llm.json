@@ -239,7 +239,7 @@
       "requires": [
         "lora_serve_strategy"
       ],
-      "applicable_when": "workload.prefix_overlap_per_adapter > 0.05",
+      "applicable_when": "workload.prefix_overlap_per_adapter > 0.05 or slo.ttft_p99_ms",
       "rationale": "Placed FIRST among the flag nodes, ahead of the batching and context nodes. On a workload with real prefix sharing this is what makes the SLO reachable at all: measured 2368ms -> 630ms TTFT and 15% -> 97% attainment on Qwen3-14B/GB10. Until attainment is high, goodput is quantised by whole requests -- at 15% attainment one request flipping moves goodput ~11%, against a 5% accept band -- so every node judged before it is decided on noise. The SLO-enabling technique has to come before the nodes measured against the SLO.",
       "action": {
         "set": {
@@ -257,7 +257,8 @@
       ],
       "on_revert": [
         "max_model_len_rightsize"
-      ]
+      ],
+      "guard_note": "Guard, 28 Sep 2026: overlap is measured on the prompts as written, and a chat request carries the model's template in front of every one of them, so the measure read 0 for traffic that shares a prefix on every request. vLLM keeps prefix caching on by default; with a TTFT target it costs one launch to measure."
     },
     {
       "id": "max_model_len_rightsize",
@@ -295,7 +296,7 @@
       "requires": [
         "max_model_len_rightsize"
       ],
-      "applicable_when": "workload.p99_input_tokens > 1024",
+      "applicable_when": "workload.p99_input_tokens > 1024 or slo.itl_p99_ms",
       "rationale": "Interleaves prefill with decode, trading TTFT against ITL. Only meaningful when prompts are long enough for prefill to block decode.",
       "action": {
         "set": {
@@ -323,14 +324,15 @@
       ],
       "sweep_note": "bracketed: 3rd interior point cost a launch and rarely moved the decision",
       "curve_crosses": true,
-      "curve_note": "Negative at low concurrency -- chunking a prefill that could run in one shot is pure overhead -- and positive at high concurrency, where it stops a long prefill blocking every decode behind it. The curves cross, so a single-point measurement is a coin flip."
+      "curve_note": "Negative at low concurrency -- chunking a prefill that could run in one shot is pure overhead -- and positive at high concurrency, where it stops a long prefill blocking every decode behind it. The curves cross, so a single-point measurement is a coin flip.",
+      "guard_note": "Guard, 28 Sep 2026: not only for long prompts. With an ITL target any prefill that runs as its own step stalls every sequence decoding behind it: Qwen3-1.7B on an RTX 4090, 70-token prompts, reached 222 ms ITL p99 at 96-128 concurrent with this node skipped. vLLM's own default is on."
     },
     {
       "id": "max_num_batched_tokens",
       "title": "Scheduler token budget per step",
       "class": "lossless",
       "status": "active",
-      "applicable_when": "workload.p99_input_tokens > 512",
+      "applicable_when": "workload.p99_input_tokens > 512 or measurements.chunked_prefill.kept",
       "rationale": "The number of tokens the scheduler may put in one forward pass, and the chunk size chunked_prefill actually uses -- the two are the same knob seen from different ends, which is why this sits next to it. vLLM's own auto_tune sweeps exactly this alongside max_num_seqs, and it was absent here entirely, so half of what the reference tool tunes was never touched. Gated on p99 input > 512 because below that a prefill fits in any budget and the knob does nothing.",
       "curve_crosses": true,
       "curve_note": "Crosses. A large budget lets one long prefill monopolise a step, which raises throughput at high concurrency and pushes TTFT out at low concurrency; a small budget does the reverse. Scored on its peak across the bracket, like the other crossing families.",
@@ -356,7 +358,8 @@
       ],
       "on_revert": [
         "kv_block_size"
-      ]
+      ],
+      "guard_note": "Guard, 28 Sep 2026: once chunked prefill is kept this is its chunk size, whatever the prompt length."
     },
     {
       "id": "kv_block_size",
@@ -701,6 +704,9 @@
       },
       "sweep": [
         {
+          "quantize": "fp8"
+        },
+        {
           "quantize": "autoquant",
           "quantize_bits": 6.0
         },
@@ -724,7 +730,7 @@
         "math_500"
       ],
       "quality_note": "MANDATORY. Quality on the eval set is the only thing that says whether a quantization did a good job -- goodput alone would keep a checkpoint that serves twice as fast and cannot do arithmetic. Measured against the tolerance established at lossless_complete, so a drop inside the eval's own resolution limit is not mistaken for damage.",
-      "cost_launches": 4,
+      "cost_launches": 5,
       "cost_minutes_hint": 240,
       "cost_note": "Four conversions, four launches, four quality probes. The conversion dominates: AutoQuantize scores sensitivity with a forward pass per candidate format before calibrating the chosen assignment, so a budget point costs more than a fixed-format one. Roughly 45-80 min each on a 14B model.",
       "on_keep": [
@@ -738,7 +744,8 @@
         "nvfp4"
       ],
       "format_note": "w4a16 is W4A16_NVFP4_CFG: 4-bit FLOAT weights (NVFP4) with 16-bit activations. nvfp4 is NVFP4_DEFAULT_CFG: 4-bit weights AND activations. The pair brackets how aggressive to be about activations, which is where quality usually goes first.\n\nTrue INT4-AWQ is unavailable. INT4_AWQ_CFG emits quant_algo W4A16_AWQ and vLLM's modelopt loader accepts only FP8, FP8_PER_CHANNEL_PER_TOKEN, FP8_PB_WO, NVFP4, W4A16_NVFP4, MXFP8 and MIXED_PRECISION. Found by producing the checkpoint and watching vLLM refuse it -- both surviving 4-bit paths are verified to load and generate. AutoQuantize emits MIXED_PRECISION, which is on the list.",
-      "bits_note": "The achievable effective_bits FLOOR is model-dependent, so these values may be infeasible on some models. modelopt never quantizes embeddings, lm_head, routers or vision towers, and the floor is set by what fraction of parameters those are: ~21% on Qwen3-0.6B gives a floor of 7.5 bits, ~5% on a 14B gives roughly 4.6. An infeasible budget fails with the actual floor named rather than a stack trace."
+      "bits_note": "The achievable effective_bits FLOOR is model-dependent, so these values may be infeasible on some models. modelopt never quantizes embeddings, lm_head, routers or vision towers, and the floor is set by what fraction of parameters those are: ~21% on Qwen3-0.6B gives a floor of 7.5 bits, ~5% on a 14B gives roughly 4.6. An infeasible budget fails with the actual floor named rather than a stack trace.",
+      "fp8_note": "Plain FP8, 28 Sep 2026: 8-bit weights AND activations on the FP8 tensor cores, the one format that raises the compute ceiling. AutoQuantize at 5 or 6 bits mixes FP8 with 4-bit layers, and the weight-only formats compute in bf16, so on compute-bound traffic every variant here ran slower than bf16 while plain FP8 was never measured."
     },
     {
       "id": "retune_batching_after_weight",
