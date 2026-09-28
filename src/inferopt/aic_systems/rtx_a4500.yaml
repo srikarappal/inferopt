@@ -1,0 +1,27 @@
+# Estimate-only system for rtx_a4500, written by tools/write_aic_systems.py.
+# Dense bf16 94.6 TFLOPS at FP32 accumulate (datasheet 189.2 sparse),
+# 640 GB/s, 20 GB. Efficiency borrowed from a100_sxm.
+data_dir: data/rtx_a4500
+gpu:
+  mem_bw: 640000000000
+  mem_bw_empirical_scaling_factor: 0.8
+  mem_empirical_constant_latency: 3.0e-06
+  mem_capacity: 21474836480
+  bfloat16_tc_flops: 94600000000000
+  int8_tc_flops: 189200000000000
+  power: 200
+  sm_version: 86
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 25000000000
+  intra_node_bw: 32000000000
+  pcie_bw: 32000000000
+  p2p_latency: 1.0e-05
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: 2.27.3

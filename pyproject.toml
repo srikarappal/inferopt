@@ -61,4 +61,4 @@ packages = ["inferopt", "goodput", "vi_kernels"]
 [tool.setuptools.package-data]
 # The shipped DAG travels with the wheel; runs/, artifacts/ and data/ do not --
 # they are workspace data and resolve through inferopt._paths.
-inferopt = ["dag/*.json"]
+inferopt = ["dag/*.json", "aic_systems/*.yaml"]

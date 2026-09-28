@@ -1,0 +1,28 @@
+# Estimate-only system for l40, written by tools/write_aic_systems.py.
+# Dense bf16 181.0 TFLOPS at FP32 accumulate (datasheet FP16 181.05 dense),
+# 864 GB/s, 48 GB. Efficiency borrowed from l40s.
+data_dir: data/l40
+gpu:
+  mem_bw: 864000000000
+  mem_bw_empirical_scaling_factor: 0.8
+  mem_empirical_constant_latency: 3.0e-06
+  mem_capacity: 51539607552
+  bfloat16_tc_flops: 181000000000000
+  int8_tc_flops: 362000000000000
+  fp8_tc_flops: 362100000000000
+  power: 300
+  sm_version: 89
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 25000000000
+  intra_node_bw: 32000000000
+  pcie_bw: 32000000000
+  p2p_latency: 1.0e-05
+misc:
+  nccl_mem:
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 3758096384
+  nccl_version: 2.27.3
