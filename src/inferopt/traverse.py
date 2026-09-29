@@ -497,6 +497,9 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
 
         # --- measure every variant ---
         variants = _variants(node, incumbent_cfg, ctx)
+        # Said before the first launch, so a watcher sees which node a long
+        # measurement belongs to rather than only its verdict an hour later.
+        log(f"  start {cur:32s} {len(variants)} variant{'' if len(variants) == 1 else 's'}")
         probes = node.get("probes", [])
         # Normally the node decides, and lossless nodes decide "none" -- they
         # cannot move quality, the equivalence probe is a stronger check, and
