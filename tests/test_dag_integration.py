@@ -293,6 +293,29 @@ def test_skips_are_free():
     check("the skip reason is kept", all(s[1] for s in res.skipped), f"{res.skipped}")
 
 
+class LogLines:
+    """traverse's log, kept as lines."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def __call__(self, *parts):
+        self.lines.append(" ".join(str(part) for part in parts))
+
+
+def test_a_node_says_it_starts_before_its_verdict():
+    section("a measured node logs its start, a skipped one does not")
+    from inferopt.traverse import traverse
+    d = mkdag([node("off", "a", status="todo"), node("a", sweep=[{"a": 1}, {"a": 2}])])
+    log = LogLines()
+    traverse(d, ctx(), ScriptedEvaluator({"incumbent": 10.0, "a": 20.0}), log=log)
+    starts = [line.split() for line in log.lines if line.split()[:1] == ["start"]]
+    assert starts == [["start", "a", "2", "variants"]], f"one start, for the measured node only: {starts}"
+    first_start = next(i for i, line in enumerate(log.lines) if line.split()[:2] == ["start", "a"])
+    verdict = next(i for i, line in enumerate(log.lines) if line.split()[:2] == ["KEEP", "a"])
+    assert first_start < verdict, f"the start comes before the verdict: {log.lines}"
+
+
 def test_predicate_error_skips():
     section("a broken predicate skips rather than crashes")
     d = mkdag([node("bad", applicable_when="nonexistent.field > 1")])
