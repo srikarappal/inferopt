@@ -2435,6 +2435,26 @@ def test_resume():
     check("and the first value wins",
           r3.cache[resume.key("prefix_caching", {"x": 1})]["goodput"] == 100.0)
 
+    section("a launch that never started is launched again, not replayed")
+    # MiniMax H3's first search: all 13 launches died because the image had no
+    # ffmpeg. Replaying them after the image was fixed would have finished the
+    # rerun at once with the same nothing.
+    crashed = {"node_id": "prefix_caching", "config": {"x": 1}, "goodput": 0.0,
+               "diagnostics": {"launch_error": "exited 1 during startup"}, "provenance": stamp}
+    (d / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [crashed] + rows))
+    r4 = resume.plan(d, stamp)
+    check("the crash is not in the replay",
+          r4.cache[resume.key("prefix_caching", {"x": 1})]["goodput"] == 100.0,
+          "a later measurement of the same config replays in its place")
+    check("and it is counted, not a duplicate", r4.n_not_started == 1 and r4.n_duplicates == 0,
+          (r4.n_not_started, r4.n_duplicates))
+    check("the banner says so", "1 that failed to start launched again" in resume.describe(r4),
+          resume.describe(r4))
+    (d / "trials.jsonl").write_text(json.dumps(crashed) + "\n")
+    r5 = resume.plan(d, stamp)
+    check("a journal of nothing but crashes replays nothing", r5.resuming and not r5.cache,
+          (r5.mode, len(r5.cache)))
+
     section("the evaluator replays instead of launching")
     from inferopt import evaluator as E
 
