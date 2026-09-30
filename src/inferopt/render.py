@@ -27,11 +27,17 @@ from inferopt.fingerprint import SLO
 from inferopt.request import InferOptRequest, detect_hardware
 
 
+def render_order(trial: dict) -> tuple[bool, bool]:
+    """The incumbent, then what the walk kept, then the rest."""
+    return trial.get("node_id") != "incumbent", not trial.get("kept")
+
+
 def measured_configs(result: dict, only: list[str]) -> list[tuple[str, dict]]:
-    """(node_id, config) for every distinct config the run measured, the
-    incumbent first so the baseline exists before anything is held to it."""
+    """(node_id, config) for every distinct config the run measured: the
+    incumbent first so the baseline exists before anything is held to it,
+    then what the walk kept, then the rest."""
     seen, configs = set(), []
-    trials = sorted(result.get("trials") or [], key=lambda trial: trial.get("node_id") != "incumbent")
+    trials = sorted(result.get("trials") or [], key=render_order)
     for trial in trials:
         key = json.dumps(trial.get("config") or {}, sort_keys=True, default=str)
         if key in seen or (only and trial.get("node_id") not in only and trial.get("node_id") != "incumbent"):
