@@ -661,7 +661,8 @@ def main() -> int:
                         "circular, and omitting it silently zeroed every "
                         "replica count.")
     o.add_argument("--allow-loss", type=float, default=None,
-                   help="quality budget for the LOSSY branch, e.g. 0.1")
+                   help="quality budget for the LOSSY branch, as a share of the baseline's "
+                        "score: 0.03 lets a lossy step cost up to 3%% of it")
     o.add_argument("--lossless-tolerance", type=float, default=0.03,
                    help="how far the eval may move across the LOSSLESS branch before it "
                         "is flagged. Default 0.03. A lossless step should not move the "
