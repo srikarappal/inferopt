@@ -200,6 +200,9 @@ class Sample:
         self.frames = 1
         self.error = ""
         self.image_png: bytes | None = None
+        # The clip itself, for a video: image_png is only its first frame,
+        # decoded for the PSNR check and the preference model.
+        self.video_mp4: bytes | None = None
         self.video_id: str | None = None
 
     @property
@@ -295,6 +298,7 @@ async def _one(client: httpx.AsyncClient, base_url: str, shape: DiffusionShape,
         if want_content:
             c = await client.get(f"{base_url}/v1/videos/{s.video_id}/content", timeout=600)
             if c.status_code == 200:
+                s.video_mp4 = c.content
                 s.image_png = first_frame_png(c.content)
         return s
     except Exception as e:
@@ -566,13 +570,27 @@ class DiffusionEvaluator(VllmEvaluator):
                         for i, prompt in enumerate(self._probe_prompts())]
         return asyncio.run(go())
 
+    def _keep_renders(self, samples: list[Sample], tag: str) -> Path:
+        """Every probe render beside the launch log, whatever the node: the
+        still, and the clip for a video. A lossy step (fewer steps, a cache,
+        fp8) is the one whose outputs most need looking at, and a run that
+        scored its renders and dropped them left nothing to look at."""
+        keep = self.run_dir / "launches" / tag / "probe"
+        keep.mkdir(parents=True, exist_ok=True)
+        for i, s in enumerate(samples):
+            if s.image_png:
+                (keep / f"{i}.png").write_bytes(s.image_png)
+            if s.video_mp4:
+                (keep / f"{i}.mp4").write_bytes(s.video_mp4)
+        return keep
+
     def _equivalence_of(self, samples: list[Sample], tag: str) -> float | None:
         """Fraction of probe samples that do NOT match the baseline render at
         the same seed within the PSNR bar. None until a baseline exists.
 
-        Every render and every PSNR is kept beside the launch log, because the
-        bar is a number that has to be set from renders people have looked at,
-        and a probe that keeps only its verdict cannot be argued with."""
+        Every PSNR is kept beside the renders (_keep_renders), because the bar
+        is a number that has to be set from renders people have looked at, and
+        a probe that keeps only its verdict cannot be argued with."""
         if not self.baseline_dir.exists():
             return None
         keep = self.run_dir / "launches" / tag / "probe"
@@ -582,7 +600,6 @@ class DiffusionEvaluator(VllmEvaluator):
             ref = self.baseline_dir / f"{i}.png"
             if not s.image_png or not ref.exists():
                 continue
-            (keep / f"{i}.png").write_bytes(s.image_png)
             psnrs[str(i)] = round(psnr_db(ref.read_bytes(), s.image_png), 2)
         (keep / "psnr.json").write_text(json.dumps(psnrs, indent=1))
         if not psnrs:
@@ -597,6 +614,8 @@ class DiffusionEvaluator(VllmEvaluator):
         for i, s in enumerate(samples):
             if s.image_png:
                 (self.baseline_dir / f"{i}.png").write_bytes(s.image_png)
+            if s.video_mp4:
+                (self.baseline_dir / f"{i}.mp4").write_bytes(s.video_mp4)
 
     def measure(self, config: dict[str, Any], *, probes: list[str], benchmarks: list[str],
                 node_id: str, concurrency: int | None = None, levels=None,
@@ -668,6 +687,7 @@ class DiffusionEvaluator(VllmEvaluator):
                 samples = self._render_probe_set(config)
                 if node_id == "incumbent" or not self.baseline_dir.exists():
                     self._keep_baseline(samples)
+                self._keep_renders(samples, tag)
                 div = self._equivalence_of(samples, tag) if "equivalence" in probes else None
                 if div is not None:
                     self.log(f"        {el()} equivalence  {div:.0%} of fixed seed renders differ from the baseline")
