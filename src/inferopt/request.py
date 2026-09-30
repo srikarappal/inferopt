@@ -125,8 +125,9 @@ class InferOptRequest(BaseModel):
         description="how far the eval may move across the LOSSLESS branch before it is "
                     "reported as a defect. Not a budget to spend.")
     allow_loss: float | None = Field(None, ge=0.0, le=1.0,
-        description="quality budget for the lossy branch. None means explore it anyway and "
-                    "return the frontier for you to pick from.")
+        description="quality budget for the lossy branch, as a share of the baseline's score "
+                    "(0.03 allows a 3% loss). None means explore it anyway and return the "
+                    "frontier for you to pick from.")
 
     adapters: list[str] = Field(default_factory=list,
         description="LoRA adapter paths. One is merged upstream; several enable the multi-LoRA subtree.")

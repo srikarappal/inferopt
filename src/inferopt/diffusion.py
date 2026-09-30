@@ -25,6 +25,7 @@ import base64
 import io
 import json
 import math
+import re
 import statistics
 import threading
 import time
@@ -53,6 +54,7 @@ CALIBRATION_SAMPLES = 4
 CALIBRATION_SAMPLES_VIDEO = 3
 EQUIVALENT_PSNR_DB = 40.0   # above this two renders differ by float noise, not by a kernel
 POLL_S = 1.0
+QUALITY_FRAMES = 4          # frames of a clip the preference model scores, first to last
 
 VIDEO_TRANSFORMERS = ("WanTransformer3DModel", "HunyuanVideoTransformer3DModel",
                       "LTXVideoTransformer3DModel", "CosmosTransformer3DModel",
@@ -201,8 +203,10 @@ class Sample:
         self.error = ""
         self.image_png: bytes | None = None
         # The clip itself, for a video: image_png is only its first frame,
-        # decoded for the PSNR check and the preference model.
+        # decoded for the PSNR check; quality_frames spread from its first
+        # frame to its last are what the preference model scores.
         self.video_mp4: bytes | None = None
+        self.quality_frames: list[bytes] = []
         self.video_id: str | None = None
 
     @property
@@ -299,7 +303,8 @@ async def _one(client: httpx.AsyncClient, base_url: str, shape: DiffusionShape,
             c = await client.get(f"{base_url}/v1/videos/{s.video_id}/content", timeout=600)
             if c.status_code == 200:
                 s.video_mp4 = c.content
-                s.image_png = first_frame_png(c.content)
+                s.quality_frames = frames_png(c.content)
+                s.image_png = s.quality_frames[0] if s.quality_frames else None
         return s
     except Exception as e:
         s.error = f"{type(e).__name__}: {str(e)[:200]}"
@@ -367,21 +372,60 @@ def summarise(samples: list[Sample], span_s: float,
     }
 
 
-def first_frame_png(video_bytes: bytes) -> bytes | None:
-    """The first frame of an mp4 as PNG, through PyAV when it is installed.
-    None when it is not: an equivalence probe that cannot see the frame says
-    so rather than passing."""
+def frames_png(video_bytes: bytes, count: int = QUALITY_FRAMES) -> list[bytes]:
+    """`count` frames of an mp4, spread from its first to its last, as PNG,
+    through PyAV when it is installed. The first is always frame 0, which the
+    equivalence probe compares. Empty without PyAV: a probe that cannot see
+    the clip says so rather than passing.
+
+    Several frames, not the first alone: a cache or fewer steps can leave the
+    opening frame close to the baseline's and still blur or block up the
+    motion after it, which a score of frame 0 never sees."""
     try:
         import av
-        from PIL import Image
     except ImportError:
-        return None
+        return []
     with av.open(io.BytesIO(video_bytes)) as container:
-        for frame in container.decode(video=0):
-            buf = io.BytesIO()
-            frame.to_image().save(buf, format="PNG")
-            return buf.getvalue()
-    return None
+        images = [frame.to_image() for frame in container.decode(video=0)]
+    picks = sorted({round(i * (len(images) - 1) / max(count - 1, 1)) for i in range(count)}) if images else []
+    frames = []
+    for index in picks:
+        buf = io.BytesIO()
+        images[index].save(buf, format="PNG")
+        frames.append(buf.getvalue())
+    return frames
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_STAGE_DONE = re.compile(r"\[(TextEncodingStage|DenoisingStage|DecodingStage)\] finished in ([0-9.]+) seconds")
+_PIXELS_DONE = re.compile(r"Pixel data generated successfully in ([0-9.]+)")
+_STAGE_KEYS = {"TextEncodingStage": "text", "DenoisingStage": "denoise", "DecodingStage": "decode"}
+
+
+def stage_timings(log_path: Path) -> dict | None:
+    """Median seconds a request spent in each stage, from the server's own
+    timers: SGLang Diffusion logs every stage it finishes and closes each
+    request with "Pixel data generated" and its total. The rest of that total
+    is writing the output plus any wait behind other requests, so the output
+    step is the least waited requests' remainder (the 10th percentile).
+    None when the log holds no complete request."""
+    if not log_path.exists():
+        return None
+    current, requests = {}, []
+    for line in _ANSI.sub("", log_path.read_text(errors="replace")).splitlines():
+        done = _STAGE_DONE.search(line)
+        if done:
+            current[_STAGE_KEYS[done.group(1)]] = float(done.group(2))
+            continue
+        total = _PIXELS_DONE.search(line)
+        if total and len(current) == 3:
+            requests.append({**current, "total": float(total.group(1))})
+            current = {}
+    if not requests:
+        return None
+    rest = sorted(max(r["total"] - r["text"] - r["denoise"] - r["decode"], 0.0) for r in requests)
+    return {**{key: round(statistics.median(r[key] for r in requests), 3) for key in ("text", "denoise", "decode")},
+            "output": round(rest[len(rest) // 10], 3), "requests": len(requests)}
 
 
 # ------------------------------------------------------------------- probes
@@ -441,9 +485,9 @@ class PickScore:
         except Exception as failed:
             self.last_error = f"{type(failed).__name__}: {str(failed)[:160]}"
             return None
-        # Mean over the set, on PickScore's own scale (about 15 to 25); the
-        # walk compares deltas against the budget, so the scale only has to be
-        # the same on both sides.
+        # Mean over the set, on PickScore's own scale (about 15 to 25) over
+        # 100; the walk holds a loss to the budget as a share of the
+        # baseline's score, so the scale does not matter.
         return round(float(scores.mean()) / 100.0, 4)
 
 
@@ -693,8 +737,12 @@ class DiffusionEvaluator(VllmEvaluator):
                     self.log(f"        {el()} equivalence  {div:.0%} of fixed seed renders differ from the baseline")
                 qual: dict = {}
                 if "quality" in probes and benchmarks:
-                    pngs = [s.image_png for s in samples if s.image_png]
-                    prompts = [s.prompt for s in samples if s.image_png]
+                    # Every scored frame is paired with its sample's prompt:
+                    # a clip's frames first to last, an image's one render.
+                    pairs = [(s.prompt, frame) for s in samples
+                             for frame in (s.quality_frames or ([s.image_png] if s.image_png else []))]
+                    prompts = [prompt for prompt, _ in pairs]
+                    pngs = [frame for _, frame in pairs]
                     score = self.scorer.score(prompts, pngs) if pngs else None
                     qual = {b: score for b in benchmarks}
                     self.log(f"        {el()} quality      pickscore {score}"
@@ -713,6 +761,8 @@ class DiffusionEvaluator(VllmEvaluator):
                                                     "stderr_tail": (getattr(e, "stderr", "") or "")[-1200:]})
 
         frames = max(1, int(config.get("num_frames", self.shape.frames)))
+        # Where a sample's time goes, from the log this launch just wrote.
+        stages = stage_timings(self.run_dir / "launches" / tag / "server.log")
         return Trial(
             node_id=node_id, config=dict(config),
             goodput=round(peak["goodput_frames_s"], 2),
@@ -732,7 +782,8 @@ class DiffusionEvaluator(VllmEvaluator):
                          "completed": peak["completed"], "failed": peak["failed"],
                          "latency_p50_s": round(peak["latency_p50_s"], 2),
                          "failure_reasons": peak["failure_reasons"],
-                         "unit": "frames", **({"profile": profile} if profile else {})},
+                         "unit": "frames", **({"profile": profile} if profile else {}),
+                         **({"stages": stages} if stages else {})},
             slo_ok=peak["goodput_frames_s"] > 0,
         )
 

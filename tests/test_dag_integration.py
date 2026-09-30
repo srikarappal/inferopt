@@ -484,7 +484,7 @@ def main() -> int:
              test_malformed_dag_errors_clearly,
              test_branch_semantics,
              test_validator_rejects_bad_dags,
-             test_tolerance_is_reporting_not_gating,
+             test_tolerance_is_reporting_not_gating, test_budget_is_a_share_of_the_baseline,
              test_checkpoint_adopts_tolerance, test_zero_width_gate,
              test_measurements_visible_downstream, test_no_infinite_loop,
              test_all_variants_fail, test_zero_incumbent, test_baseline_carried,
@@ -736,6 +736,22 @@ def test_tolerance_is_reporting_not_gating():
         else:
             check(f"a 0.06 loss over a 0.02 budget is rejected ({label})",
                   "q" not in kept(res), f"kept={kept(res)}")
+
+
+def test_budget_is_a_share_of_the_baseline():
+    """A 97% floor is allow_loss 0.03 on any scale. Held as points, 0.03 of a
+    PickScore near 0.21 was a 14% loss, and Wan's cache plus 15 steps (0.2097
+    to 0.2028, 3.3%) was kept with visibly worse clips."""
+    section("the quality budget is a share of the baseline's score")
+    d = mkdag([node("q", cls="lossy", quality_benchmarks=["pickscore"])])
+    for label, score, expected in (("3.3% over a 3% budget is rejected", 0.2028, False),
+                                   ("2.2% under a 3% budget is kept", 0.2050, True)):
+        c = ctx()
+        c.quality_baseline = {"pickscore": 0.2097}
+        c.quality_tolerance = {"pickscore": 0.0001}
+        c.slo.quality_budget = 0.03
+        res, _ = run(d, {"incumbent": 10.0, "q": {"goodput": 30.0, "quality": {"pickscore": score}}}, c=c)
+        check(label, ("q" in kept(res)) is expected, f"kept={kept(res)}")
 
 
 def test_checkpoint_adopts_tolerance():

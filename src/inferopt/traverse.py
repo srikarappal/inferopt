@@ -561,6 +561,11 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             would reject on noise. budget is the user's allowance: a delta
             over it is unacceptable however real. Between them the loss is
             genuine AND affordable, which is exactly a frontier point.
+
+            THE BUDGET IS A SHARE OF THE BASELINE'S SCORE, not points of it:
+            a 97% floor is allow_loss 0.03, and 0.03 of accuracy near 0.66 was
+            close enough to 3% that nobody noticed, while 0.03 of a PickScore
+            near 0.21 is 14% and let a visibly worse video through.
             """
             if node.get("class") != "lossy" or not t.quality:
                 return True
@@ -578,9 +583,9 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 tol = ctx.quality_tolerance.get(b, tol)
                 if delta <= tol:
                     continue                       # within noise; not a real loss
-                if budget is not None and delta > budget:
+                if budget is not None and delta > budget * abs(ref):
                     log(f"        quality gate: {b} {ref:.4f} -> {v:.4f} "
-                        f"(-{delta:.4f}) exceeds allow_loss {budget:.1%}"
+                        f"(-{delta / abs(ref):.1%}) exceeds allow_loss {budget:.1%} of the baseline"
                         f"  [{_variant_label(t, node)}]")
                     return False
                 log(f"        quality:      {b} -{delta:.4f} "
@@ -627,11 +632,16 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             # four launches produce nothing.
             budget = ctx.slo.quality_budget
             if budget is not None:
-                blocked = {b: t for b, t in ctx.quality_tolerance.items() if t >= budget}
+                # Both in the benchmark's own units: the budget is a share of
+                # the score the lossy branch will be held to, this checkpoint's.
+                allowed = {b: budget * abs(best.quality.get(b) or ctx.quality_baseline.get(b) or 1.0)
+                           for b in ctx.quality_tolerance}
+                blocked = {b: t for b, t in ctx.quality_tolerance.items() if t >= allowed[b]}
                 if blocked:
                     worst = max(blocked.values())
                     log(f"\n  LOSSY BRANCH CANNOT PASS: measured quality tolerance "
-                        f"{worst:.4f} >= allow_loss {budget:.4f}")
+                        f"{worst:.4f} >= allow_loss {budget:.1%} of the baseline "
+                        f"({min(allowed[b] for b in blocked):.4f})")
                     for b, t in sorted(blocked.items(), key=lambda kv: -kv[1]):
                         log(f"    {b:22s} tolerance {t:.4f}")
                     log(f"  Any loss at or under the tolerance is dismissed as "
@@ -639,11 +649,12 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                         f"expensive.\n  With tolerance >= budget there is no band "
                         f"between them, so no lossy node can be kept whatever it "
                         f"measures.")
-                    log(f"  Raise --allow-loss above {worst:.4f}, raise the quality "
+                    needed = max(blocked[b] * budget / allowed[b] for b in blocked)
+                    log(f"  Raise --allow-loss above {needed:.1%}, raise the quality "
                         f"sample size so the tolerance shrinks, or run "
                         f"--lossless-only deliberately.")
                     stopped = (f"lossy branch un-passable: tolerance {worst:.4f} >= "
-                               f"allow_loss {budget:.4f}")
+                               f"allow_loss {budget:.1%} of the baseline")
                     break
             log(f"        measured quality tolerance: "
                 + "  ".join(f"{k}={v:.4f}" for k, v in ctx.quality_tolerance.items()))
