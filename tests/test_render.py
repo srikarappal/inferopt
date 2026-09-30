@@ -36,12 +36,14 @@ def test_the_baseline_keeps_its_clips_too(tmp_path):
     assert sorted(path.name for path in evaluator.baseline_dir.iterdir()) == ["0.mp4", "0.png", "1.mp4", "1.png"]
 
 
-def test_the_rerender_takes_each_config_once_with_the_incumbent_first():
+def test_the_rerender_takes_each_config_once_with_the_incumbent_then_the_kept_first():
     seed = {"num_inference_steps": 30}
     fewer = {"num_inference_steps": 15}
-    result = {"trials": [{"node_id": "steps", "config": fewer}, {"node_id": "incumbent", "config": seed},
-                         {"node_id": "lossless_complete", "config": seed}, {"node_id": "finalist:steps", "config": fewer}]}
+    cached = {"num_inference_steps": 30, "enable_cache_dit": True}
+    result = {"trials": [{"node_id": "cache_dit", "config": cached}, {"node_id": "steps", "config": fewer, "kept": True},
+                         {"node_id": "incumbent", "config": seed}, {"node_id": "lossless_complete", "config": seed},
+                         {"node_id": "finalist:steps", "config": fewer}]}
 
-    assert measured_configs(result, []) == [("incumbent", seed), ("steps", fewer)]
+    assert measured_configs(result, []) == [("incumbent", seed), ("steps", fewer), ("cache_dit", cached)]
     assert measured_configs(result, ["lossless_complete"]) == [("incumbent", seed)], \
         "the incumbent always renders, since everything is held to its baseline"
