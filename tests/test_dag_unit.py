@@ -3420,6 +3420,25 @@ def test_profile():
     check("the profiled one is", prof["profile"] is True and prof["num_profiled_timesteps"] == 5)
 
 
+def test_artifacts_per_customer():
+    """A calibration file holds the prompts it was sampled from: a service
+    keeps one artifacts directory per customer and says where."""
+    import os
+    from inferopt import _paths
+
+    section("artifacts: where the caller says, else the workspace")
+    saved = os.environ.pop("INFEROPT_ARTIFACTS", None)
+    try:
+        check("the workspace by default", _paths.artifacts("x").parent.name == "artifacts")
+        os.environ["INFEROPT_ARTIFACTS"] = "/vi-data/inferopt/artifacts/o1a2b3"
+        check("one directory per customer when set, read on every call",
+              str(_paths.artifacts("m--fp8")) == "/vi-data/inferopt/artifacts/o1a2b3/m--fp8")
+    finally:
+        os.environ.pop("INFEROPT_ARTIFACTS", None)
+        if saved is not None:
+            os.environ["INFEROPT_ARTIFACTS"] = saved
+
+
 def no_memory_reading(gpu):
     return None
 
@@ -3604,7 +3623,7 @@ def test_vllm_dllm_route():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_diffusion_memory, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_diffusion_memory, test_artifacts_per_customer, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

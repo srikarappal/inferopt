@@ -11,7 +11,7 @@ from inferopt import quantize
 
 def test_a_conversion_past_its_time_is_stopped_and_named(monkeypatch, tmp_path):
     monkeypatch.setenv("INFEROPT_QUANTIZE_TIMEOUT_S", "7")
-    monkeypatch.setattr(quantize, "ARTIFACTS", tmp_path)
+    monkeypatch.setenv("INFEROPT_ARTIFACTS", str(tmp_path))
     monkeypatch.setattr(quantize, "HERE", tmp_path)
     monkeypatch.setattr(quantize, "producer_available", lambda: True)
     monkeypatch.setattr(quantize, "_write_calibration", lambda trace, calib: 4)

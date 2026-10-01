@@ -79,11 +79,10 @@ import sys
 import textwrap
 from pathlib import Path
 
-from inferopt._paths import home as _home, workspace as _workspace
+from inferopt._paths import artifacts, home as _home
 # The workspace, not the package. Artifacts are 10-60 GB each and must never
 # be written into site-packages.
 HERE = _home()
-ARTIFACTS = _workspace("artifacts")
 
 # NVIDIA's own quantizer, replacing llmcompressor. Two reasons beyond provenance:
 #
@@ -460,9 +459,9 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
     model_id = fp.model.id
     # The bit budget is part of the identity: autoquant@6.0 and autoquant@4.5 are
     # different checkpoints and must not share a directory or a cache hit.
-    out = ARTIFACTS / f"{model_id.replace('/', '__')}--{kind.replace('@', '_')}"
+    out = artifacts(f"{model_id.replace('/', '__')}--{kind.replace('@', '_')}")
     if (out / "config.json").exists():
-        log(f"  quant     reusing {out.relative_to(HERE)}")
+        log(f"  quant     reusing {out}")
         return str(out)
 
     out.mkdir(parents=True, exist_ok=True)
@@ -499,7 +498,7 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
     for line in (r.stdout or "").splitlines():
         if line.startswith("[job]"):
             log(f"            {line[6:]}")
-    log(f"  quant     wrote {out.relative_to(HERE)}")
+    log(f"  quant     wrote {out}")
     return str(out)
 
 
@@ -519,7 +518,7 @@ def smoke(log=print) -> bool:
         log("  producer not installed; run: python quantize.py --setup")
         return False
 
-    calib = ARTIFACTS / "smoke.trace.jsonl"
+    calib = artifacts("smoke.trace.jsonl")
     calib.parent.mkdir(parents=True, exist_ok=True)
     # A COMPLETE trace record, not just prompts. The same file is handed to
     # build_fingerprint, and WorkloadFingerprint.from_trace needs input_tokens,
@@ -552,7 +551,7 @@ def smoke(log=print) -> bool:
             ok = False
             continue
 
-        probe = ARTIFACTS / f"load_{kind}.py"
+        probe = artifacts(f"load_{kind}.py")
         probe.write_text(
             "import sys\n"
             "from vllm import LLM, SamplingParams\n"
