@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from inferopt import lines
 from inferopt.calibration import STORE
 from inferopt.fingerprint import Context, NodeMeasurement
 from inferopt.predicates import Predicate
@@ -413,7 +414,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
     incumbent_cfg = dict(ctx.incumbent)
     if ctx.incumbent_metrics and ctx.incumbent_metrics.goodput:
         incumbent_goodput = ctx.incumbent_metrics.goodput
-        log(f"incumbent   {incumbent_goodput:.1f} goodput  [stage 1.3]")
+        log(lines.incumbent(incumbent_goodput, "stage 1.3"))
     else:
         # No stage-1.3 measurement: measure the incumbent here rather than let
         # the first node be kept for free. Costs one launch and makes every
@@ -441,12 +442,11 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # Say what was measured and what target would pass, and stop here.
         verdict = seed_misses_slo(t, ctx.slo)
         if verdict:
-            log(f"  STOP  {verdict}")
+            log(lines.stop(verdict))
             stopped = verdict
             suggested = suggested_slo_for(t, ctx.slo)
             root = None
-        log(f"incumbent   {incumbent_goodput:.1f} goodput  [measured here, "
-            f"no stage 1.3 result was supplied]")
+        log(lines.incumbent(incumbent_goodput, "measured here, no stage 1.3 result was supplied"))
     cur, last_kept = root, True
 
     while cur:
@@ -472,7 +472,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         if launches + cost > max_launches or elapsed > max_minutes:
             stopped = (f"budget guard at {cur}: {launches}+{cost} launches "
                        f"vs {max_launches}, {elapsed:.0f} min vs {max_minutes}")
-            log(f"  STOP  {stopped}")
+            log(lines.stop(stopped))
             break
 
         # --- skip: inactive, or the fingerprint says it cannot help ---
@@ -489,7 +489,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 why = f"predicate error: {e}"
         if why:
             skipped.append((cur, why))
-            log(f"  skip  {cur:32s} {why[:70]}")
+            log(lines.skip(cur, why))
             ctx.measurements[cur] = NodeMeasurement(kept=False)
             # A SKIP FOLLOWS on_keep. Worth knowing rather than assuming: a
             # skipped node never ran, yet the walk takes the "this technique
@@ -507,7 +507,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         variants = _variants(node, incumbent_cfg, ctx)
         # Said before the first launch, so a watcher sees which node a long
         # measurement belongs to rather than only its verdict an hour later.
-        log(f"  start {cur:32s} {len(variants)} variant{'' if len(variants) == 1 else 's'}")
+        log(lines.start(cur, len(variants)))
         probes = node.get("probes", [])
         # Normally the node decides, and lossless nodes decide "none" -- they
         # cannot move quality, the equivalence probe is a stronger check, and
@@ -688,9 +688,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                 spec_acceptance_rate=best.diagnostics.get("spec_acceptance_rate"),
                 config=best.config)
             delta = (best.goodput / incumbent_goodput - 1) if incumbent_goodput else 0.0
-            log(f"  {'KEEP' if keep else 'revert':>5} {cur:32s} "
-                f"{best.goodput:8.1f} goodput  {delta:+7.1%}  "
-                f"({len(variants)} variant{'s' if len(variants) > 1 else ''})")
+            log(lines.verdict(keep, cur, best.goodput, delta, len(variants)))
             if keep:
                 incumbent_cfg, incumbent_goodput = dict(best.config), best.goodput
                 # The operating point moves with the incumbent. These techniques
@@ -709,7 +707,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             # "no variant satisfied the SLO" when every variant met the SLO and
             # failed the equivalence probe.
             why = ", ".join(f"{n} {r}" for r, n in dropped.items()) or "no variant measured"
-            log(f"  revert {cur:32s} no variant passed: {why}")
+            log(lines.refused(cur, why))
 
         last_kept = keep
         nxt = node.get("on_keep") if keep else node.get("on_revert")
