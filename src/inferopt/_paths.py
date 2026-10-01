@@ -98,7 +98,12 @@ def data(*parts: str) -> Path:
 
 
 def artifacts(*parts: str) -> Path:
-    return workspace("artifacts", *parts)
+    """Quantized checkpoints and the samples they were calibrated on.
+    INFEROPT_ARTIFACTS moves them: a service keeps one directory per customer,
+    because a calibration file holds that customer's prompts. Read on every
+    call, so it can be set after import."""
+    env = os.environ.get("INFEROPT_ARTIFACTS")
+    return Path(env).expanduser().joinpath(*parts) if env else workspace("artifacts", *parts)
 
 
 def runs(*parts: str) -> Path:
