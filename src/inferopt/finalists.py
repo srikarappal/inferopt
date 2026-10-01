@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from inferopt import lines
 from inferopt.traverse import Trial
 
 LADDER_LLM = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
@@ -112,6 +113,5 @@ def sweep_finalists(evaluator, fp, trials: list[Trial], frontier: list[Trial],
         trial.concurrency = peak["concurrency"]
         trial.diagnostics = {**(trial.diagnostics or {}), "finalist": summary}
         out[trial.node_id] = summary
-        log(f"  stage 2.1  {trial.node_id}: peak {peak['goodput']:.1f} at L={peak['concurrency']}, "
-            f"{met} of {len(curve)} levels served within the target")
+        log(lines.finalist_peak(trial.node_id, peak["goodput"], peak["concurrency"], met, len(curve)))
     return out

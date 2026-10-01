@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from inferopt import lines
+
 JOURNAL = "trials.jsonl"
 
 
@@ -211,8 +213,7 @@ def describe(p: Plan) -> str:
         extra += f", {p.n_not_started} that failed to start launched again"
     if p.n_unscored:
         extra += f", {p.n_unscored} that could not be scored measured again"
-    line = (f"  resume    {len(p.cache)} measurements already on disk will be "
-            f"replayed, not relaunched{extra}")
+    line = lines.resumed(len(p.cache), extra)
     if p.soft_diff:
         line += (f"\n            NOTE: {', '.join(p.soft_diff)} differ from the "
                  f"recorded run. A code change can move every number for the same "
