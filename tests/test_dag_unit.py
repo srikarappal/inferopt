@@ -3286,6 +3286,12 @@ def test_diffusion():
           _value(by["steps"]["sweep"][1]["num_inference_steps"], ctx_vid) == 15)
     check("frontier is terminal and everything reaches it",
           by["frontier"]["class"] == "terminal" and by["guidance"]["on_keep"] == ["frontier"])
+    one = Context(fingerprint=fp.model_copy(update={"diffusion": video.model_copy(update={"max_in_flight": 1})}),
+                  slo=SLO())
+    check("batching is skipped when one sample in flight is all that fits",
+          not Predicate(by["request_batching"]["applicable_when"]).evaluate(one))
+    check("and measured when more fit, or when memory decides",
+          Predicate(by["request_batching"]["applicable_when"]).evaluate(ctx_vid))
 
     section("diffusion: the evaluator turns a sweep into a Trial in frames")
     class Fake(D.DiffusionEvaluator):
@@ -3296,6 +3302,7 @@ def test_diffusion():
             self.run_dir = Path(run_dir); self.base_url = "http://x"; self.prompts = ["a", "b"]
             self.replay = None; self.baseline_dir = self.run_dir / "baseline_samples"
             self.launched = []
+            self.gpu, self.read_memory = "0", no_memory_reading
             class _S:
                 def score(self, prompts, pngs): return 0.21
             self.scorer = _S()
@@ -3332,6 +3339,20 @@ def test_diffusion():
             check("a lossy node is scored", t3.quality == {"pickscore": 0.21}, t3.quality)
             check("a video clip's per frame time divides the sample",
                   True)
+        with tempfile.TemporaryDirectory() as td:
+            # MiniMax H3's shape on the DGX: 80 GB idle, 10 more for a clip,
+            # 100 at one in flight; a second clip would cross the 15% line.
+            tight = Fake(shape.model_copy(), td)
+            tight.read_memory = FakeMeter([(80.0, 121.7), (85.0, 121.7), (90.0, 121.7), (90.0, 121.7),
+                                           (90.0, 121.7), (95.0, 121.7), (100.0, 121.7)])
+            t4 = tight.measure({"num_inference_steps": 8}, probes=["goodput"], benchmarks=[],
+                               node_id="incumbent")
+            memory = t4.diagnostics["memory"]
+            check("the sweep stops where the next clip would not fit",
+                  [p["concurrency"] for p in t4.curve] == [1] and memory["fits_in_flight"] == 1, (t4.curve, memory))
+            check("memory is what was measured, not the engine's figure",
+                  memory["per_sample_gb"] == 10.0 and memory["peak_gb"] == 100.0 and t4.memory_gb == 100.0, memory)
+            check("what fits for the seed caps every later node", tight.shape.max_in_flight == 1)
     finally:
         D.closed_loop = saved
 
@@ -3397,6 +3418,55 @@ def test_profile():
     prof = D.request_body(shape, {"profile": True, "num_profiled_timesteps": 5}, "p", 1)
     check("plain requests are not profiled", "profile" not in plain)
     check("the profiled one is", prof["profile"] is True and prof["num_profiled_timesteps"] == 5)
+
+
+def no_memory_reading(gpu):
+    return None
+
+
+class FakeMeter:
+    """Memory readings in turn, then the last one for good."""
+
+    def __init__(self, readings):
+        self.readings = list(readings)
+
+    def __call__(self, gpu):
+        return self.readings.pop(0) if len(self.readings) > 1 else self.readings[0]
+
+
+def test_diffusion_memory():
+    """Room for the profile and the sweep, measured rather than assumed.
+    MiniMax H3 ran the DGX out of memory profiling on top of two clips' cache."""
+    from inferopt import diffusion as D
+
+    section("memory: read from the box where the card shares it")
+    meminfo = "MemTotal:       127600752 kB\nMemFree:  1000 kB\nMemAvailable:   35179512 kB\n"
+    used, total = D.unified_memory_in_use(meminfo)
+    check("used is the total less what is available, in GB",
+          round(total, 1) == 121.7 and round(used, 1) == 88.1, (used, total))
+    check("no MemAvailable is no reading", D.unified_memory_in_use("MemTotal: 5 kB\n") is None)
+
+    section("memory: a step up in load must leave 15% free")
+    fits, predicted = D.fits_next_level(90.0, 10.0, 121.7, 1, 2)
+    check("two clips at about 100 GB fit under the line at 103", fits and predicted == 100.0, predicted)
+    fits, predicted = D.fits_next_level(100.0, 10.0, 121.7, 2, 4)
+    check("four at about 120 do not", not fits and predicted == 120.0, predicted)
+    check("no reading is no reason to stop",
+          D.fits_next_level(0.0, 10.0, 121.7, 1, 2)[0] and D.fits_next_level(90.0, None, None, 1, 2)[0])
+
+    section("memory: the cap trims the levels")
+    check("no cap measures every level", D.levels_under((1, 2, 4, 8), 0) == [1, 2, 4, 8])
+    check("a cap of one measures one", D.levels_under((1, 2, 4, 8), 1) == [1])
+    check("a cap of three stops at two", D.levels_under((1, 2, 4, 8), 3) == [1, 2])
+
+    section("memory: the watch keeps the highest reading")
+    with D.MemoryWatch("0", read=FakeMeter([(80.0, 121.7), (95.0, 121.7), (85.0, 121.7)])) as watch:
+        pass
+    check("the peak, not the last reading", watch.peak_gb == 95.0 and watch.total_gb == 121.7,
+          (watch.peak_gb, watch.total_gb))
+    with D.MemoryWatch("0", read=FakeMeter([None])) as unread:
+        pass
+    check("a box that cannot be read reads zero and nothing stops on it", unread.peak_gb == 0.0)
 
 
 def test_port_is_ours():
@@ -3534,7 +3604,7 @@ def test_vllm_dllm_route():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_diffusion_memory, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
                test_requires_matches_edges, test_reachability):
         try:
             fn()
