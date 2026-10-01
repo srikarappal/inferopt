@@ -3434,6 +3434,35 @@ def test_profile():
     check("the profiled one is", prof["profile"] is True and prof["num_profiled_timesteps"] == 5)
 
 
+def test_launch_progress_ignores_our_polls():
+    """A hung engine answers 503 to every health poll and logs each one; those
+    lines are ours, not the engine's progress (MiniMax H3's cuda_graph launch
+    hung three hours on them, 1 Oct 2026)."""
+    import tempfile
+    from pathlib import Path
+    from inferopt import evaluator as E
+
+    section("launch: only the engine's own lines are progress")
+    poll = ('\x1b[32mINFO\x1b[0m:     127.0.0.1:54348 - "\x1b[1mGET /health HTTP/1.1\x1b[0m" '
+            '\x1b[91m503 Service Unavailable\x1b[0m')
+    check("a health poll is not progress", E._said(poll + "\n" + poll) == [])
+    check("a line the engine wrote is",
+          E._said(poll + "\n[Diffusion BCG] capture failed; this signature will run eager\n")
+          == ["[Diffusion BCG] capture failed; this signature will run eager"])
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / "server.log"
+        log.write_text("loading weights\n")
+        offset, gained = E._read_from(log, 0)
+        check("the first read is everything", gained == "loading weights\n" and offset == len(gained))
+        with log.open("a") as handle:
+            handle.write(poll + "\n")
+        offset, gained = E._read_from(log, offset)
+        check("the next only what was added", gained == poll + "\n" and not E._said(gained))
+        check("a failure names the engine's last words, not our poll",
+              E._last_line(log) == "loading weights")
+        check("an unreadable log reads as nothing new", E._read_from(Path(td) / "missing.log", 7) == (7, ""))
+
+
 def test_artifacts_per_customer():
     """A calibration file holds the prompts it was sampled from: a service
     keeps one artifacts directory per customer and says where."""
@@ -3637,7 +3666,7 @@ def test_vllm_dllm_route():
 def main() -> int:
     for fn in (test_predicates, test_predicate_eval, test_value, test_variants,
                test_trial_axes, test_frontier, test_pb_design, test_replay, test_moe_backend_and_int_flags,
-               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_diffusion_memory, test_artifacts_per_customer, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
+               test_qps_source, test_methods_comparable, test_doe_analysis, test_seed_from_run, test_api_types, test_judges, test_legality, test_percentile_stability, test_closed_loop_stagger, test_replay_lengths, test_slo_explore, test_review_fixes, test_pb_spare_contrasts, test_parse_metrics_granularity, test_resume, test_seed_provenance, test_benchmark_surface, test_run_benchmark_guards, test_slo_attainment, test_strategies, test_result_api, test_dag_file, test_quality_gets_room, test_engines, test_diffusion, test_diffusion_memory, test_artifacts_per_customer, test_launch_progress_ignores_our_polls, test_profile, test_port_is_ours, test_vi_autoload, test_vllm_dllm_route,
                test_requires_matches_edges, test_reachability):
         try:
             fn()

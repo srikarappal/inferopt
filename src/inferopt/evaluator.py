@@ -320,16 +320,40 @@ STALL_S = float(os.environ.get("INFEROPT_LAUNCH_STALL_S", "600"))
 LAUNCH_HARD_CAP_S = float(os.environ.get("INFEROPT_LAUNCH_HARD_CAP_S", "10800"))
 
 
+# Our own readiness polls, as the engine's access log records them. They are
+# the engine answering us, not the engine getting anywhere: a launch hung in
+# CUDA graph capture answered 503 to every one for three hours; counting
+# them as output kept pushing the stall deadline out (MiniMax H3, 1 Oct 2026).
+HEALTH_POLL = re.compile(r"GET \S*/health\S* HTTP")
+
+
+def _said(text: str) -> list[str]:
+    """The lines of `text` the engine wrote itself: not empty, not our polls."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not HEALTH_POLL.search(line)]
+
+
+def _read_from(path: Path, offset: int) -> tuple[int, str]:
+    """Where the log ends now and what it gained since `offset`."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            gained = handle.read()
+    except OSError:
+        return offset, ""
+    return offset + len(gained), gained.decode(errors="replace")
+
+
 def _last_line(path: Path) -> str:
-    """The last non-empty line of a log, for a failure message.
+    """The last line the engine itself wrote, for a failure message.
 
     A launch that hangs is identified by the last thing it said. Reporting only
     "not healthy in 7200s" sent two hours of investigation in the wrong
     direction when the answer -- gen_cutlass_fused_moe_sm120_module -- was
-    sitting on the final line the whole time.
+    sitting on the final line the whole time. Our own health polls are skipped:
+    "GET /health 503" names nothing.
     """
     try:
-        lines = [l.strip() for l in path.read_text(errors="replace").splitlines() if l.strip()]
+        lines = _said(path.read_text(errors="replace"))
         return lines[-1] if lines else "(log is empty)"
     except Exception:
         return "(log unreadable)"
@@ -851,8 +875,9 @@ class VllmEvaluator:
             # having measured nothing -- and the console said only "not healthy
             # in 7200s", which reads as a slow launch rather than a stuck one.
             #
-            # So: while the server is still WRITING to its log it is making
-            # progress and the deadline is pushed out. When it goes silent for
+            # So: while the server is still WRITING lines of its own (not the
+            # access log of our health polls) it is making progress and the
+            # deadline is pushed out. When it goes silent for
             # STALL_S it is hung, and that fails immediately with the last line
             # it managed to write -- which is the one thing that identifies the
             # cause. A hard cap stops a pathological loop running forever.
@@ -864,15 +889,14 @@ class VllmEvaluator:
             start = time.monotonic()
             hard_cap = start + LAUNCH_HARD_CAP_S
             deadline = start + LAUNCH_TIMEOUT_S
-            last_size, last_note = -1, start
+            read_to, last_note = 0, start
             while True:
                 now = time.monotonic()
                 if proc.poll() is not None:
                     raise LaunchError(f"exited {proc.returncode} during startup",
                                       err.read_text()[-3000:])
-                size = err.stat().st_size if err.exists() else 0
-                if size != last_size:                 # still talking -> still working
-                    last_size = size
+                read_to, gained = _read_from(err, read_to)
+                if _said(gained):                     # the engine talking, not answering our polls
                     deadline = max(deadline, now + STALL_S)
                     moved = PORT_MOVED.search(err.read_text(errors="replace")[-20000:])
                     if moved:
