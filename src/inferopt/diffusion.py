@@ -879,8 +879,10 @@ class DiffusionEvaluator(VllmEvaluator):
                     pngs = [frame for _, frame in pairs]
                     score = self.scorer.score(prompts, pngs) if pngs else None
                     qual = {b: score for b in benchmarks}
+                    why = ("" if score is not None else self.scorer.last_error if pngs
+                           else "no frames to score: PyAV is missing or the clips did not decode")
                     self.log(f"        {el()} quality      pickscore {score}"
-                             + (f"  (unscored: {self.scorer.last_error})" if score is None else ""))
+                             + (f"  (unscored: {why})" if score is None else ""))
                 mem = memory["peak_gb"] or self._gpu_memory_gb()
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:
