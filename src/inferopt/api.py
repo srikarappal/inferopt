@@ -250,6 +250,7 @@ def optimize(
     profile: bool = True,
     chat_prompts: bool = True,
     finalists: int = 3,
+    max_in_flight: int = 0,
     log=print,
 ) -> Result:
     """Search serving configurations and return measured operating points.
@@ -304,7 +305,7 @@ def optimize(
                                  qps=qps or 1.0, allow_loss=allow_loss, run_dir=run_dir,
                                  gpu=gpu, port=port, max_launches=max_launches,
                                  max_minutes=max_minutes, dag=dag, profile=profile,
-                                 finalists=finalists, log=log)
+                                 finalists=finalists, max_in_flight=max_in_flight, log=log)
     fp, slo_ = build_fingerprint(InferOptRequest(
         model=model, trace=trace, ttft_p99_ms=ttft_p99_ms, itl_p99_ms=itl_p99_ms,
         allow_loss=allow_loss, **({"qps": qps} if qps else {})))

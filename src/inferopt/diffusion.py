@@ -27,6 +27,7 @@ import json
 import math
 import re
 import statistics
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -43,6 +44,12 @@ from inferopt.fingerprint import (SLO, Context, DiffusionShape, Fingerprint,
 from inferopt.traverse import Trial
 
 SWEEP_LEVELS = (1, 2, 4, 8)
+# Memory kept free while the search raises load, the line earlyoom stops
+# things at on the DGX. A step up whose predicted peak would cross it is not
+# measured: running the box out of memory took its network down with it
+# (MiniMax H3, 30 Sep 2026).
+KEEP_FREE_SHARE = 0.15
+MEMORY_POLL_S = 2.0
 WINDOW_S = 120.0            # the floor; a window has to hold several samples, see measure()
 SAMPLES_PER_WINDOW = 4      # at L=1. A 74 s clip in a 120 s window completed once per level and
                             # every level read the same number, which cannot be true
@@ -503,6 +510,87 @@ def _features(out):
 
 # ----------------------------------------------------------------- evaluator
 
+def unified_memory_in_use(meminfo: str | None = None) -> tuple[float, float] | None:
+    """(used, total) GB of the whole box from /proc/meminfo: what an engine
+    draws on where the card shares the host's memory, as the GB10 does."""
+    try:
+        text = meminfo if meminfo is not None else Path("/proc/meminfo").read_text()
+    except OSError:
+        return None
+    fields = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        value = rest.split()
+        if value and value[0].isdigit():
+            fields[name] = int(value[0]) / 1024 / 1024
+    if "MemTotal" not in fields or "MemAvailable" not in fields:
+        return None
+    return fields["MemTotal"] - fields["MemAvailable"], fields["MemTotal"]
+
+
+def memory_in_use(gpu: str = "0") -> tuple[float, float] | None:
+    """(used, total) GB of what the engine draws on: the card's own memory, or
+    the box's where the card answers [N/A], as a unified memory part does."""
+    try:
+        out = subprocess.run(["nvidia-smi", "-i", gpu, "--query-gpu=memory.used,memory.total",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15).stdout
+        used, total = (float(part) for part in out.strip().split(","))
+        return used / 1024, total / 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return unified_memory_in_use()
+
+
+def fits_next_level(peak_gb: float, per_sample_gb: float, total_gb: float,
+                    level: int, next_level: int) -> tuple[bool, float]:
+    """Whether raising load from `level` to `next_level` samples in flight
+    keeps KEEP_FREE_SHARE of memory free and the peak that predicts. A
+    missing reading is not a reason to stop."""
+    if not (peak_gb and per_sample_gb and total_gb):
+        return True, 0.0
+    predicted = peak_gb + per_sample_gb * (next_level - level)
+    return predicted <= total_gb * (1 - KEEP_FREE_SHARE), predicted
+
+
+def levels_under(levels, cap: int) -> list[int]:
+    """The load levels to measure: all of them, or those at or under `cap`."""
+    return [level for level in levels if not cap or level <= cap]
+
+
+class MemoryWatch:
+    """The highest memory in use while a block runs, sampled on its own
+    thread. A VAE decode lasts seconds; a reading taken only before and after
+    a level never sees it."""
+
+    def __init__(self, gpu: str, read=memory_in_use):
+        self.gpu, self.read = gpu, read
+        self.peak_gb = 0.0
+        self.total_gb = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._sample()
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=MEMORY_POLL_S * 4)
+        self._sample()
+        return False
+
+    def _run(self):
+        while not self._stop.wait(MEMORY_POLL_S):
+            self._sample()
+
+    def _sample(self):
+        reading = self.read(self.gpu)
+        if reading:
+            self.peak_gb = max(self.peak_gb, reading[0])
+            self.total_gb = reading[1]
+
+
 class DiffusionEvaluator(VllmEvaluator):
     """Launch, measure, tear down, for a diffusers pipeline on SGLang Diffusion.
 
@@ -523,10 +611,27 @@ class DiffusionEvaluator(VllmEvaluator):
         self.replay = None
         self.scorer = PickScore()
         self.baseline_dir = self.run_dir / "baseline_samples"
+        self.read_memory = memory_in_use
 
     # what the LLM path calls that a pipeline has no answer for
     def replay_lengths(self):
         return []
+
+    def _fits(self, memory: dict, peak_gb: float, level: int, next_level: int, el) -> bool:
+        """Whether one more step up in load keeps KEEP_FREE_SHARE free; says so when not."""
+        fits, predicted = fits_next_level(peak_gb, memory.get("per_sample_gb"), memory.get("total_gb"),
+                                          level, next_level)
+        if not fits:
+            self.log(f"        {el()} L={next_level:<3d} not measured: about {predicted:.0f} of "
+                     f"{memory['total_gb']:.0f} GB in use, past the {KEEP_FREE_SHARE:.0%} kept free")
+        return fits
+
+    def _cap_in_flight(self, fits: int | None):
+        """What fits for the seed is the cap for every later node and the DAG
+        reads it: batching needs more than one sample in flight."""
+        if fits and (not self.shape.max_in_flight or fits < self.shape.max_in_flight):
+            self.shape.max_in_flight = fits
+            self.log(f"        at most {fits} in flight from here: that is what fits in memory")
 
     def _probe_prompts(self) -> list[str]:
         n = PROBE_SAMPLES_VIDEO if self.shape.kind == "video" else PROBE_SAMPLES
@@ -672,6 +777,8 @@ class DiffusionEvaluator(VllmEvaluator):
                 t = to_trial(hit)
                 t.diagnostics = {**(t.diagnostics or {}), "replayed": True}
                 self.log(f"        replayed from journal, no launch spent ({t.goodput:.1f} frames/s)")
+                if node_id == "incumbent":
+                    self._cap_in_flight(((t.diagnostics or {}).get("memory") or {}).get("fits_in_flight"))
                 return t
 
         tag = self._launch_tag(node_id, config)
@@ -684,14 +791,30 @@ class DiffusionEvaluator(VllmEvaluator):
         try:
             with self._serve(config, tag) as model:
                 self.log(f"        {el()} healthy, warming up")
+                idle = self.read_memory(self.gpu)
                 # Warm-up renders at least one sample and so knows how long one
                 # takes; the measurement window is sized from that, so every
                 # level completes several samples rather than one.
-                warm = asyncio.run(closed_loop(self.base_url, self.shape, config, self.prompts, 1,
-                                               min(WARMUP_S, 60.0)))
+                with MemoryWatch(self.gpu, self.read_memory) as warm_watch:
+                    warm = asyncio.run(closed_loop(self.base_url, self.shape, config, self.prompts, 1,
+                                                   min(WARMUP_S, 60.0)))
                 one_sample_s = warm["latency_p50_s"] if warm["completed"] else self._first_latency(config)
                 window_s = max(WINDOW_S, SAMPLES_PER_WINDOW * one_sample_s)
                 self.log(f"        {el()} one sample {one_sample_s:.1f}s, window {window_s:.0f}s")
+                # PROFILED BEFORE THE SWEEP, while the engine holds one sample's
+                # memory. After a sweep its cache keeps the highest level's
+                # memory and the profiler on top of that ran the DGX out
+                # (MiniMax H3, 30 Sep 2026). The profile is never skipped, so
+                # room is made for it instead.
+                with MemoryWatch(self.gpu, self.read_memory) as profile_watch:
+                    profile = self._profile_one(config, el)
+                memory = {
+                    "idle_gb": round(idle[0], 1) if idle else None,
+                    "total_gb": round(idle[1], 1) if idle else None,
+                    "per_sample_gb": (round(max(warm_watch.peak_gb - idle[0], 0.0), 1)
+                                      if idle and warm_watch.peak_gb else None),
+                    "profile_peak_gb": round(profile_watch.peak_gb, 1) or None,
+                }
                 if node_id == "incumbent":
                     # THE SEED SPEAKS FOR THE RUN, for a pipeline too. The
                     # sample is fixed by the job, so a request's cost barely
@@ -709,16 +832,23 @@ class DiffusionEvaluator(VllmEvaluator):
                             diagnostics={"completed": calibration["completed"],
                                          "failed": calibration["failed"],
                                          "calibration": calibration, "unit": "frames"})
-                pts = []
-                for level in (levels or SWEEP_LEVELS):
-                    med = asyncio.run(closed_loop(self.base_url, self.shape, config,
-                                                  self.prompts, level, window_s,
-                                                  latency_target_ms=target_ms))
+                pts, level_peak_gb = [], warm_watch.peak_gb
+                for level in levels_under(levels or SWEEP_LEVELS, self.shape.max_in_flight):
+                    if pts and not self._fits(memory, level_peak_gb, pts[-1]["concurrency"], level, el):
+                        memory["fits_in_flight"] = pts[-1]["concurrency"]
+                        break
+                    with MemoryWatch(self.gpu, self.read_memory) as watch:
+                        med = asyncio.run(closed_loop(self.base_url, self.shape, config,
+                                                      self.prompts, level, window_s,
+                                                      latency_target_ms=target_ms))
+                    level_peak_gb = watch.peak_gb or level_peak_gb
                     med["concurrency"] = level
+                    med["memory_peak_gb"] = round(watch.peak_gb, 1) or None
                     pts.append(med)
                     self.log(f"        {el()} L={level:<3d} goodput {med['goodput_frames_s']:7.2f} frames/s  "
                              f"p99 {med['latency_p99_s']:6.1f}s  slo {med['slo_attainment']:.0%}  "
-                             f"({med['completed']} done)")
+                             f"({med['completed']} done)"
+                             + (f"  {watch.peak_gb:.0f} GB" if watch.peak_gb else ""))
                     # Past the peak: more load cannot help. A server that does
                     # not batch samples serialises them, so latency grows with
                     # concurrency and goodput, once it falls, does not come
@@ -727,6 +857,10 @@ class DiffusionEvaluator(VllmEvaluator):
                     if len(pts) >= 2 and med["goodput_frames_s"] < pts[-2]["goodput_frames_s"]:
                         break
                 peak = max(pts, key=lambda m: m["goodput_frames_s"])
+                memory["peak_gb"] = round(max([profile_watch.peak_gb, warm_watch.peak_gb]
+                                              + [m["memory_peak_gb"] or 0.0 for m in pts]), 1) or None
+                if node_id == "incumbent":
+                    self._cap_in_flight(memory.get("fits_in_flight"))
 
                 samples = self._render_probe_set(config)
                 if node_id == "incumbent" or not self.baseline_dir.exists():
@@ -747,8 +881,7 @@ class DiffusionEvaluator(VllmEvaluator):
                     qual = {b: score for b in benchmarks}
                     self.log(f"        {el()} quality      pickscore {score}"
                              + (f"  (unscored: {self.scorer.last_error})" if score is None else ""))
-                profile = self._profile_one(config, el)
-                mem = self._gpu_memory_gb()
+                mem = memory["peak_gb"] or self._gpu_memory_gb()
                 self.log(f"        {el()} done, tearing down")
         except LaunchError as e:
             self.log(f"        launch failed: {e}")
@@ -782,7 +915,8 @@ class DiffusionEvaluator(VllmEvaluator):
                          "completed": peak["completed"], "failed": peak["failed"],
                          "latency_p50_s": round(peak["latency_p50_s"], 2),
                          "failure_reasons": peak["failure_reasons"],
-                         "unit": "frames", **({"profile": profile} if profile else {}),
+                         "unit": "frames", "memory": memory,
+                         **({"profile": profile} if profile else {}),
                          **({"stages": stages} if stages else {})},
             slo_ok=peak["goodput_frames_s"] > 0,
         )
@@ -840,14 +974,15 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
                       run_dir: str | None = None, gpu: str = "0", port: int = 8100,
                       max_launches: int | None = None, max_minutes: float | None = None,
                       dag: str | None = None, profile: bool = True, finalists: int = 3,
-                      log=print):
+                      max_in_flight: int = 0, log=print):
     """Search a diffusers pipeline's serving configurations. The diffusion
     twin of api.optimize, and what it delegates to for a model with a
     model_index.json.
 
     `rows` is the workload: prompt, width, height, num_inference_steps,
     guidance_scale, and num_frames and fps for video. `latency_p99_ms` is the
-    SLO: p99 seconds per sample, in ms.
+    SLO: p99 seconds per sample, in ms. `max_in_flight` caps the samples in
+    flight every node is measured at; 0 leaves it to what fits in memory.
     """
     from inferopt import resume
     from inferopt._paths import default_dag, runs as _runs
@@ -865,6 +1000,7 @@ def optimize_pipeline(*, model: str, rows: list[dict], latency_p99_ms: float,
     hw = detect_hardware(InferOptRequest(model=model, trace=str(trace), ttft_p99_ms=latency_p99_ms))
     fp, ctx = build_context(model, rows, slo, qps, str(trace), hw)
     shape = fp.diffusion
+    shape.max_in_flight = max_in_flight or 0
     log(f"pipeline    {shape.kind}: {shape.transformer_class} {shape.transformer_params_b}B denoiser, "
         f"{shape.text_encoder_arch} {shape.text_encoder_params_b}B encoder, {shape.weights_gb} GB resident")
     log(f"sample      {shape.width}x{shape.height}"

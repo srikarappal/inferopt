@@ -142,7 +142,7 @@
       "requires": [
         "cuda_graph"
       ],
-      "applicable_when": null,
+      "applicable_when": "fingerprint.diffusion.max_in_flight != 1",
       "rationale": "Requests arriving together denoise as one batch: throughput up, latency per sample up. Whether the trade lands inside the latency target is the whole question, so the bracket is measured. batching_mode is dynamic, the only mode; the size and the delay are the knobs.",
       "action": {
         "set": {}

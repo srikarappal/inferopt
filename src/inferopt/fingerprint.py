@@ -545,6 +545,8 @@ class DiffusionShape(BaseModel):
     steps: int = Field(description="workload | denoising steps the customer runs at")
     guidance_scale: float = Field(description="workload | CFG scale; at or under 1 the model is guidance distilled and CFG is off")
     distilled: bool = Field(False, description="derived | guidance_scale <= 1, so the guidance node has nothing to sweep")
+    max_in_flight: int = Field(0, description="search | most samples in flight the search measures; 0 = as many as fit "
+                                              "in memory. Lowered to what fits for the seed, so batching skips at 1")
 
 
 class Fingerprint(BaseModel):
