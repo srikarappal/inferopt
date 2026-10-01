@@ -2455,6 +2455,20 @@ def test_resume():
     check("a journal of nothing but crashes replays nothing", r5.resuming and not r5.cache,
           (r5.mode, len(r5.cache)))
 
+    section("a measurement that could not be scored is measured again")
+    unscored = {"node_id": "lossless_complete", "config": {"x": 1}, "goodput": 0.42,
+                "quality": {"pickscore": None}, "provenance": stamp}
+    (d / "trials.jsonl").write_text(json.dumps(unscored) + "\n")
+    r6 = resume.plan(d, stamp)
+    check("the unscored row is not replayed", not r6.cache and r6.n_unscored == 1, (len(r6.cache), r6.n_unscored))
+    check("and the banner says so", "1 that could not be scored measured again" in resume.describe(r6))
+    from inferopt.traverse import scored
+    from inferopt.fingerprint import NodeMeasurement
+    check("a node's record keeps only scored benchmarks",
+          scored({"pickscore": None, "math_500": 0.7}) == {"math_500": 0.7} and scored(None) == {})
+    check("so a None no longer fails the record",
+          NodeMeasurement(quality=scored({"pickscore": None})).quality == {})
+
     section("the evaluator replays instead of launching")
     from inferopt import evaluator as E
 

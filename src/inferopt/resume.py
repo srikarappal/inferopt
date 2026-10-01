@@ -56,6 +56,7 @@ class Plan:
     n_trials: int = 0
     n_duplicates: int = 0
     n_not_started: int = 0
+    n_unscored: int = 0
     soft_diff: list[str] = field(default_factory=list)
     """Fields that differ but do not block: the code version. Reported, not enforced."""
 
@@ -156,6 +157,7 @@ def plan(run_dir: str | Path, stamp: dict | None) -> Plan:
     cache: dict[tuple[str, str], dict] = {}
     dupes = 0
     not_started = 0
+    unscored = 0
     for row in rows:
         # A launch that never started measured the host, not the config: a
         # missing binary or a full card. Replaying it would carry that fault
@@ -163,13 +165,18 @@ def plan(run_dir: str | Path, stamp: dict | None) -> Plan:
         if (row.get("diagnostics") or {}).get("launch_error"):
             not_started += 1
             continue
+        # Same for a measurement whose quality could not be scored: the
+        # scorer's fault (no PyAV to decode a clip), not the config's.
+        if any(value is None for value in (row.get("quality") or {}).values()):
+            unscored += 1
+            continue
         k = key(row["node_id"], row.get("config") or {})
         if k in cache:
             dupes += 1                  # keep the FIRST, so a replay is deterministic
             continue
         cache[k] = row
     return Plan("resume", cache=cache, n_trials=len(rows), n_duplicates=dupes,
-                n_not_started=not_started, soft_diff=soft,
+                n_not_started=not_started, n_unscored=unscored, soft_diff=soft,
                 reason=f"resuming from {len(cache)} recorded measurements in {path}")
 
 
@@ -202,6 +209,8 @@ def describe(p: Plan) -> str:
     extra = f", {p.n_duplicates} duplicate rows ignored" if p.n_duplicates else ""
     if p.n_not_started:
         extra += f", {p.n_not_started} that failed to start launched again"
+    if p.n_unscored:
+        extra += f", {p.n_unscored} that could not be scored measured again"
     line = (f"  resume    {len(p.cache)} measurements already on disk will be "
             f"replayed, not relaunched{extra}")
     if p.soft_diff:

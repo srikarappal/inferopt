@@ -276,6 +276,14 @@ def _variant_label(t: Trial, node: dict) -> str:
     return ", ".join(f"{k}={t.config.get(k)}" for k in keys)
 
 
+def scored(quality: dict | None) -> dict:
+    """The benchmarks that were scored. None marks one that could not be: it
+    passes the quality gate unjudged; a node's record holds numbers only.
+    MiniMax H3's first scored node crashed the walk carrying a None
+    (1 Oct 2026)."""
+    return {name: value for name, value in (quality or {}).items() if value is not None}
+
+
 def _variants(node, base: dict, ctx: Context) -> list[dict]:
     """base config + the node's action, then one variant per sweep entry."""
     applied = dict(base)
@@ -676,7 +684,7 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             _decide(cur, keep, best, incumbent_goodput, band)
             ctx.measurements[cur] = NodeMeasurement(
                 kept=keep, goodput=best.goodput, ttft_p99_ms=best.ttft_p99_ms,
-                itl_p99_ms=best.itl_p99_ms, quality=best.quality,
+                itl_p99_ms=best.itl_p99_ms, quality=scored(best.quality),
                 spec_acceptance_rate=best.diagnostics.get("spec_acceptance_rate"),
                 config=best.config)
             delta = (best.goodput / incumbent_goodput - 1) if incumbent_goodput else 0.0
