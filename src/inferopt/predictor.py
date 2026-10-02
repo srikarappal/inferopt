@@ -361,8 +361,12 @@ def _estimate(fp: Fingerprint, slo: SLO, system: str, donor: str) -> tuple[dict,
     """This card at SOL, scaled by the donor's measured efficiency on this very
     model and traffic. The top is the best derated row within the targets."""
     _, rows = _frontier(fp, slo, system, "SOL", ESTIMATE_BACKEND, ESTIMATE_VERSION)
+    # The donor is a real AIConfigurator system: ESTIMATE_VERSION exists only on
+    # the cards inferopt registers, and AIConfigurator 0.12 refuses it there,
+    # which took stage 1.2 down on the GB10 (2 Oct 2026). Both donor frames use
+    # its default version, so the efficiency compares like with like.
     donor_measured, _ = _frontier(fp, slo, donor, "SILICON", ESTIMATE_BACKEND)
-    donor_sol, _ = _frontier(fp, slo, donor, "SOL", ESTIMATE_BACKEND, ESTIMATE_VERSION)
+    donor_sol, _ = _frontier(fp, slo, donor, "SOL", ESTIMATE_BACKEND)
     efficiency = efficiency_of(donor_measured, donor_sol)
     if not rows or not efficiency:
         return {}, [], 0.0
