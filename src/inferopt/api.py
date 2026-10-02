@@ -287,7 +287,7 @@ def optimize(
     from inferopt.fingerprint import Context
     from inferopt.methods import MethodRunner
     from inferopt.request import InferOptRequest, build_fingerprint
-    from inferopt.run import seed_config
+    from inferopt.run import prefetch_weights, seed_config
     from inferopt.strategies import STRATEGIES
 
     if slo is not None:
@@ -312,6 +312,11 @@ def optimize(
     ctx = Context(fingerprint=fp, slo=slo_)
     for line in workload_warnings(fp):
         log(line)
+    # The weights before any launch, as run.py has always done: a download
+    # inside a launch prints nothing a hang detector counts, and the first
+    # Qwen3-30B-A3B search through this path lost its baseline to it, stopped
+    # after 30 silent minutes 10 GB short (2 Oct 2026).
+    prefetch_weights(fp.model.id, log=log)
 
     rd = run_dir or str(_runs(f"{model.split('/')[-1].lower()}-{strategy}"))
     bench = benchmarks if benchmarks is not None else ["math_500"]

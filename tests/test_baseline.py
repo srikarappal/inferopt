@@ -6,12 +6,13 @@ vLLM 711 and the walk's answer from that seed 476, below stock: the reported
 lift was a lift over a handicap (1 Oct 2026).
 """
 
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 
-from inferopt import engines, lines, run, traverse
+from inferopt import api, engines, lines, run, traverse
 from inferopt.evaluator import SWEEP_LEVELS, VllmEvaluator
 from inferopt.fingerprint import (SLO, Context, Fingerprint, HardwareFingerprint, LoraFingerprint, ModelFingerprint,
                                   NodeMeasurement, WorkloadFingerprint)
@@ -269,3 +270,11 @@ def test_the_hardware_rails_win_over_a_predicted_shape():
     fingerprint = a_fingerprint(gpu_name="NVIDIA GB10", memory_gb=121.7, unified=True)
     start = run.predicted_start(fingerprint, {"gpu_memory_utilization": 0.95, "tensor_parallel_size": 2})
     assert start["gpu_memory_utilization"] <= engines.UNIFIED_CEILING and "tensor_parallel_size" not in start
+
+
+def test_the_platform_path_fetches_the_weights_before_any_launch():
+    """Only the command line did: a 30B search through api.optimize downloaded
+    inside its first launch, silently, and lost its baseline to the hang
+    detector (2 Oct 2026)."""
+    source = inspect.getsource(api.optimize)
+    assert source.index("prefetch_weights(fp.model.id") < source.index("strat.search(")
