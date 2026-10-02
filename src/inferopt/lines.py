@@ -17,6 +17,13 @@ def incumbent(goodput, source):
     return f"incumbent   {goodput:.1f} goodput  [{source}]"
 
 
+def predicted(goodput, chosen):
+    """A predicted shape measured beside stock at the baseline, and whether the
+    walk starts from it."""
+    where = "the walk starts here" if chosen else "stock stays the start"
+    return f"predicted   {goodput:.1f} goodput  [{where}]"
+
+
 def start(node_id, count):
     """A node about to be measured: said before the first launch."""
     return f"  start {node_id:32s} {variants_word(count)}"

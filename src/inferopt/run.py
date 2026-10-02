@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 from inferopt.calibration import STORE
+from inferopt.engines import engine_for
 from inferopt.finalists import ladder_for
 from inferopt.fingerprint import NodeMeasurement
 from inferopt.request import InferOptRequest, build_fingerprint
@@ -152,9 +153,17 @@ def seed_config(fp) -> dict:
     tok/s against stock vLLM's 711, the walk's answer measured 476, below
     stock, and the lift it reported was a lift over a handicap (1 Oct 2026).
     """
-    from inferopt.engines import engine_for
-    from inferopt.evaluator import hardware_defaults
-    return {**engine_for(fp).stock(fp), **hardware_defaults(fp)}
+    engine = engine_for(fp)
+    return {**engine.stock(fp), **engine.defaults(fp)}
+
+
+def predicted_start(fp, shape: dict) -> dict:
+    """A predicted shape (batch size, parallelism) on top of stock, with the
+    hardware's required flags over it: a start to measure beside stock."""
+    start = {**seed_config(fp), **shape, **engine_for(fp).defaults(fp)}
+    if fp.hw.gpu_count == 1:
+        start.pop("tensor_parallel_size", None)
+    return start
 
 
 def factors_off_config(fp) -> dict:
@@ -182,10 +191,9 @@ def factors_off_config(fp) -> dict:
     }
 
     # Hardware-required flags come from ONE place, so every launch path gets
-    # them -- see evaluator.hardware_defaults. They go UNDER the seed, so
-    # anything set above wins.
-    from inferopt.evaluator import hardware_defaults
-    defaults = hardware_defaults(fp)
+    # them -- the engine's defaults (evaluator.hardware_defaults asks the
+    # same). They go UNDER this config, so anything set above wins.
+    defaults = engine_for(fp).defaults(fp)
     # A diffusion LM on vLLM cannot take 256 sequences: its denoising state is
     # per sequence and the engine default caps it at what the card survives.
     # The seed keeps the engine's cap; the batching nodes raise it and see.
@@ -303,6 +311,7 @@ def cmd_optimize(args) -> int:
     from inferopt.fingerprint import Context
 
     cfg = seed_config(fp)
+    starts: list[dict] = []
 
     # CONTINUE FROM A PREVIOUS RUN'S ANSWER, rather than restarting from the
     # conservative seed.
@@ -331,12 +340,9 @@ def cmd_optimize(args) -> int:
         if not inc:
             print(f"  --seed-from-run: {src} records no incumbent config")
             return 1
-        # hardware_defaults still wins: it carries the rails the previous run's
-        # config may predate (unified-memory utilisation, moe_backend). Imported
-        # here, as seed_config does -- evaluator pulls in torch and vLLM, and
-        # importing it at module scope makes `run.py --help` load the CUDA stack.
-        from inferopt.evaluator import hardware_defaults
-        cfg = {**inc, **{k: v for k, v in hardware_defaults(fp).items()
+        # The hardware's rails still win: they carry what the previous run's
+        # config may predate (unified-memory utilisation, moe_backend).
+        cfg = {**inc, **{k: v for k, v in engine_for(fp).defaults(fp).items()
                          if k not in inc}}
         kept = [t.get("node_id") for t in (prev.get("trials") or []) if t.get("kept")]
         pk = (prev.get("incumbent_peak") or {}).get("goodput")
@@ -344,28 +350,27 @@ def cmd_optimize(args) -> int:
         print(f"    it kept {kept or ['(nothing)']}"
               + (f" and peaked at {pk:.1f} tok/s" if pk else ""))
         print(f"    stage 1.2 is skipped -- a measured incumbent beats a prediction")
-    elif not args.predict:
-        # The baseline is stock vllm serve; a prediction would move it, and
-        # every percentage with it. api.optimize does the same (predict=False).
-        print(f"  stage 1.2 not run: the baseline is the engine's defaults (--predict to seed from it)")
+    elif args.skip_predict:
+        print(f"  stage 1.2 skipped by --skip-predict: stock alone is the start")
     else:
         from inferopt.predictor import describe, predict
         try:
             pred = predict(fp, slo)
             describe(pred)
             if pred.seed_config:
-                # The predictor chooses the SHAPE (batch size, parallelism); the
-                # conservative defaults keep the safety rails it does not model
-                # (unified-memory utilisation, eager mode, right-sized context).
-                cfg.update(pred.seed_config)
-                cfg.pop("tensor_parallel_size", None) if fp.hw.gpu_count == 1 else None
+                # Measured beside stock at the baseline, not taken on trust:
+                # the walk starts from it only if it serves better (traverse).
+                start = predicted_start(fp, pred.seed_config)
+                if start != cfg:
+                    starts.append(start)
+                    print(f"  predicted start {json.dumps(start)}")
             if not pred.feasible:
                 print(f"\n  proceeding anyway -- the roofline is a LOWER BOUND, so measurement "
                       f"can confirm it but never beat it. Expect stage 1.3 to report goodput 0 "
                       f"and stop, which costs one launch and yields a real measured ITL.")
         except Exception as e:
             print(f"  stage 1.2 unavailable ({type(e).__name__}: {e})")
-            print(f"  falling back to the conservative seed")
+            print(f"  stock alone is the start")
     print(f"\n  seed      {json.dumps(cfg)}\n")
 
     run_dir = Path(args.run_dir)
@@ -547,7 +552,8 @@ def cmd_optimize(args) -> int:
                    fixed_concurrency=args.fixed_concurrency,
                    provenance=stamp,
                    force_benchmarks=(_benchmarks(args)
-                                     if args.quality_every_node else None))
+                                     if args.quality_every_node else None),
+                   starts=starts)
 
     # Full sweep on the finalists. The traversal ranks configs at one operating
     # point, which is enough to CHOOSE between them -- most goodput curves sit
@@ -704,12 +710,8 @@ def main() -> int:
                         "restarting from a config that may not even meet the "
                         "SLO. Implies --skip-predict: a measured incumbent is "
                         "better evidence than a prediction.")
-    o.add_argument("--predict", action="store_true",
-                   help="seed the walk from stage 1.2's prediction instead of "
-                        "the engine's defaults. Off by default: a prediction "
-                        "moves the baseline every percentage is against.")
     o.add_argument("--skip-predict", action="store_true",
-                   help="kept so older command lines still parse; stage 1.2 is off unless --predict")
+                   help="do not measure stage 1.2's predicted shape beside stock; stock alone is the start")
     o.add_argument("--fixed-concurrency", type=int, default=None, metavar="N",
                    help="measure every node at exactly N in-flight requests using "
                         "the open-loop driver, with no sweep and no bracket. This is "

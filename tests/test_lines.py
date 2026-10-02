@@ -20,6 +20,8 @@ def test_the_lines_a_flow_is_drawn_from():
     assert lines.finalist_peak("graph_capture", 1368.04, 64, 16, 16) == \
         "  stage 2.1  graph_capture: peak 1368.0 at L=64, 16 of 16 levels served within the target"
     assert lines.resumed(12) == "  resume    12 measurements already on disk will be replayed, not relaunched"
+    assert lines.predicted(1305.84, True) == "predicted   1305.8 goodput  [the walk starts here]"
+    assert lines.predicted(700.0, False) == "predicted   700.0 goodput  [stock stays the start]"
 
 
 def test_a_node_name_longer_than_its_column_still_has_a_space_after_it():
