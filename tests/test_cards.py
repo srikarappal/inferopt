@@ -75,3 +75,28 @@ def test_efficiency_is_measured_over_speed_of_light_and_never_above_one():
     assert predictor.efficiency_of({"tokens_s_gpu": 600}, {"tokens_s_gpu": 1000}) == 0.6
     assert predictor.efficiency_of({"tokens_s_gpu": 1200}, {"tokens_s_gpu": 1000}) == 1.0
     assert predictor.efficiency_of({}, {"tokens_s_gpu": 1000}) == 0.0
+
+
+
+class RecordedFrontier:
+    """Stands in for predictor._frontier and keeps every system and version asked."""
+
+    row = {"tokens_s_gpu": 100.0, "tokens_s_user": 10.0, "req_s": 1.0, "ttft_ms": 100.0,
+           "tpot_ms": 100.0, "request_latency_ms": 1000.0, "meets_slo": True}
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, fp, slo, system, database_mode="SILICON", backend=None, version=None):
+        self.calls.append((system, database_mode, version))
+        return self.row, [self.row]
+
+
+def test_only_the_estimate_card_is_asked_for_the_estimate_version(monkeypatch):
+    """The donor is a real AIConfigurator system and 0.12 refuses a version it
+    does not have; asking it for "estimate" took stage 1.2 down on the GB10."""
+    frontier = RecordedFrontier()
+    monkeypatch.setattr(predictor, "_frontier", frontier)
+    predictor._estimate(None, SLO(), "gb10", "rtx_pro_6000_server")
+    assert ("gb10", "SOL", predictor.ESTIMATE_VERSION) in frontier.calls
+    assert all(version is None for system, _, version in frontier.calls if system == "rtx_pro_6000_server")
