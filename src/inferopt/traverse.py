@@ -112,7 +112,11 @@ class Trial:
 
 
 class Evaluator(Protocol):
-    """Launch a config and measure it. Implementations own the GPU."""
+    """Launch a config and measure it. Implementations own the GPU.
+
+    One may name `baseline_levels`, the loads to measure a baseline across
+    when the walk measures it itself; one without sweeps its own whole range
+    whenever it is given no levels (the diffusion evaluator)."""
 
     def measure(self, config: dict[str, Any], *, probes: list[str],
                 benchmarks: list[str], node_id: str,
@@ -425,8 +429,15 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
         # No stage-1.3 measurement: measure the incumbent here rather than let
         # the first node be kept for free. Costs one launch and makes every
         # keep/revert decision in the run comparable.
+        #
+        # Across the whole ladder, not a node's bracket. A bracket starts at
+        # the workload's own load and doubles outward three times at most: on
+        # Qwen3-8B it stopped at 16 in flight (151 tok/s) while stock vLLM
+        # peaks at 128 (711), and the first node, bracketed upward from 16,
+        # reached 128 and was kept for a +372% it did not earn (1 Oct 2026).
         t = evaluator.measure(incumbent_cfg, probes=["goodput"], benchmarks=[],
                               node_id="incumbent", concurrency=concurrency,
+                              levels=None if fixed_concurrency else getattr(evaluator, "baseline_levels", None),
                               fixed_concurrency=fixed_concurrency)
         # Same inheritance as any lossless node. Without it the incumbent lands
         # on the frontier plot with no accuracy coordinate and is silently

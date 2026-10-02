@@ -531,6 +531,11 @@ class VllmEvaluator:
     diffusion LM lands on SGLang without the caller knowing the difference.
     """
 
+    # The loads a baseline is measured across when the walk measures it
+    # itself (traverse): the whole ladder, as stage 1.3 sweeps it, not the
+    # bracket a node gets around the operating point.
+    baseline_levels = SWEEP_LEVELS
+
     def __init__(self, fp: Fingerprint, slo: SLO, trace_path: str, run_dir: str,
                  gpu: str = "0", port: int = 8000, log=print, engine=None,
                  chat_prompts: bool = True):

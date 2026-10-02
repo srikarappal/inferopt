@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from inferopt import engines, lines, run, traverse
+from inferopt.evaluator import SWEEP_LEVELS, VllmEvaluator
 from inferopt.fingerprint import (SLO, Context, Fingerprint, HardwareFingerprint, LoraFingerprint, ModelFingerprint,
                                   NodeMeasurement, WorkloadFingerprint)
 
@@ -140,3 +141,57 @@ def test_a_sweep_measures_only_the_values_stock_does_not_already_have():
 def test_a_node_whose_launch_is_the_point_is_still_measured():
     seed, said, recorder, result = walk_from_stock()
     assert "lossless_complete" in {node_id for node_id, _config in recorder.launched}
+
+
+# ======================================================  the baseline's sweep ===
+
+class LadderRecorder:
+    """An evaluator that names its baseline ladder and notes how each config
+    was asked to be measured; the baseline peaks at 128 in flight."""
+
+    replay = None
+    baseline_levels = (4, 8, 16, 32, 64, 128, 256)
+
+    def __init__(self):
+        self.asked = []
+
+    def measure(self, config, *, probes, benchmarks, node_id, concurrency=None, levels=None,
+                fixed_concurrency=None):
+        self.asked.append((node_id, concurrency, levels))
+        peak = 128 if node_id == "incumbent" else (concurrency or 16)
+        return traverse.Trial(node_id=node_id, config=dict(config), goodput=711.0, ttft_p99_ms=100.0,
+                              itl_p99_ms=20.0, memory_gb=10.0, slo_ok=True, concurrency=peak)
+
+
+def walk_measuring_its_own_baseline(fixed_concurrency=None):
+    fingerprint = a_fingerprint()
+    context = Context(fingerprint=fingerprint, slo=SLO(ttft_p99_ms=500, itl_p99_ms=250, quality_budget=0.1,
+                                                      lossless_quality_budget=0.03),
+                      incumbent=run.seed_config(fingerprint))
+    recorder = LadderRecorder()
+    traverse.traverse(json.loads(dag_path.read_text()), context, recorder, log=list().append, lossless_only=True,
+                      concurrency=16, fixed_concurrency=fixed_concurrency)
+    return recorder.asked
+
+
+def test_a_baseline_the_walk_measures_itself_is_swept_across_the_whole_ladder():
+    """It was bracketed from the workload's load like a node: on Qwen3-8B it
+    stopped at 16 in flight (151) while stock vLLM peaks at 128 (711), and the
+    first node, bracketed upward from 16, was kept for +372% it did not earn."""
+    asked = walk_measuring_its_own_baseline()
+    assert asked[0] == ("incumbent", 16, LadderRecorder.baseline_levels)
+
+
+def test_the_baselines_peak_is_where_the_first_node_starts():
+    asked = walk_measuring_its_own_baseline()
+    first_node = next(entry for entry in asked if entry[0] != "incumbent")
+    assert first_node[1] == 128 and first_node[2] is None, "a node is bracketed, around the baseline's peak"
+
+
+def test_a_walk_at_a_fixed_load_measures_its_baseline_there_too():
+    asked = walk_measuring_its_own_baseline(fixed_concurrency=30)
+    assert asked[0][2] is None
+
+
+def test_the_vllm_evaluator_sweeps_a_baseline_from_4_to_256():
+    assert VllmEvaluator.baseline_levels == SWEEP_LEVELS == (4, 8, 16, 32, 64, 128, 256)
