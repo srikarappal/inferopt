@@ -191,7 +191,11 @@ class Engine:
 KEEP_FREE_SHARE = 0.15
 UNIFIED_CEILING = 0.75
 UNIFIED_FLOOR = 0.30
-CPU_SIDE_GB = 4.0       # the server's own CPU side and the benchmark client
+# What runs outside the server's share: its own CPU side, which loading a
+# quantized checkpoint grew by 7 GiB (Qwen3-8B, 2 Oct 2026; at 0.75 that took
+# the box from 21 GiB free to 14.9 and the guard stopped it), compile workers,
+# the benchmark client and the agent. 4 GiB was stopped five times in a row.
+OUTSIDE_SHARE_GB = 16.0
 
 
 def memory_now(meminfo: str | None = None) -> tuple[float, float] | None:
@@ -213,7 +217,8 @@ def memory_now(meminfo: str | None = None) -> tuple[float, float] | None:
 
 def unified_fraction(meminfo: str | None = None) -> float:
     """The share of a unified-memory host a server may take, from what is free
-    now: less the share the OOM guard keeps and the CPU side, at most 0.75.
+    now: less the share the OOM guard keeps and what runs outside the share,
+    at most 0.75.
 
     A fixed 0.75 was stopped by the guard seconds after allocating whenever
     another service on the box held 16 GB (Qwen3-8B, stock vLLM, 1 Oct 2026).
@@ -222,7 +227,7 @@ def unified_fraction(meminfo: str | None = None) -> float:
     if memory is None:
         return UNIFIED_CEILING
     available, total = memory
-    share = (available - KEEP_FREE_SHARE * total - CPU_SIDE_GB) / total
+    share = (available - KEEP_FREE_SHARE * total - OUTSIDE_SHARE_GB) / total
     return round(min(UNIFIED_CEILING, max(UNIFIED_FLOOR, share)), 2)
 
 

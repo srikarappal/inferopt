@@ -404,3 +404,10 @@ On unified memory the server's share now comes from what is free when the
 seed is made (`engines.unified_fraction`): a fixed 0.75 was stopped by the
 box's OOM guard seconds after allocating whenever another service held
 16 GB.
+
+The margin outside that share was 4 GiB at first and the guard stopped a
+Qwen3-8B walk five times in a row: loading a quantized checkpoint grows
+vLLM's own CPU side by about 7 GiB, beyond its share, and compile workers,
+the benchmark client and the agent sit outside it too. It is 16 GiB now,
+a share of about 0.66 on an idle GB10, which costs this kind of workload
+nothing: at its peak it uses about 2% of the KV cache it is given.
