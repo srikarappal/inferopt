@@ -74,8 +74,9 @@ def meminfo(available_gib, total_gib=121.7):
 
 
 @pytest.mark.parametrize("available, share", [
-    (118.0, 0.75),     # an idle box: the old fixed share
-    (102.1, 0.66),     # another service holding 16 GB: what earlyoom stopped at 0.75
+    (121.0, 0.71),     # an idle box
+    (115.0, 0.66),     # the GB10 with nothing else running
+    (102.1, 0.56),     # another service holding 16 GB
     (30.0, 0.30),      # nearly full: the floor, and vLLM says plainly it does not fit
 ])
 def test_a_unified_memory_box_gives_a_server_what_is_free_less_what_is_kept(available, share):
