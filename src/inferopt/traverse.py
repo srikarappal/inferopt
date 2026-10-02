@@ -307,6 +307,12 @@ def _variants(node, base: dict, ctx: Context) -> list[dict]:
     return out
 
 
+def declares_a_change(node: dict) -> bool:
+    """Whether a node says what it changes (a value to set, a sweep), so a
+    variant identical to the incumbent is plainly no change at all."""
+    return bool((node.get("action") or {}).get("set") or node.get("sweep"))
+
+
 def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              *, log=print, lossless_only: bool = False,
              journal: str | Path | None = None,
@@ -487,6 +493,17 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
                     why = node["applicable_when"]
             except Exception as e:
                 why = f"predicate error: {e}"
+        # A node or a variant that would only set what the incumbent already
+        # has is not measured: stock vLLM already runs with prefix caching,
+        # chunked prefill and CUDA graphs, and a launch of an unchanged config
+        # measures nothing but noise, which the accept band can mistake for a
+        # gain. A node that declares no change of its own (a checkpoint, a node
+        # whose launch is the point) is left alone.
+        variants = [] if why else _variants(node, incumbent_cfg, ctx)
+        if declares_a_change(node):
+            variants = [variant for variant in variants if variant != incumbent_cfg]
+            if not why and not variants:
+                why = "nothing to change: the incumbent already has it"
         if why:
             skipped.append((cur, why))
             log(lines.skip(cur, why))
@@ -504,7 +521,6 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             continue
 
         # --- measure every variant ---
-        variants = _variants(node, incumbent_cfg, ctx)
         # Said before the first launch, so a watcher sees which node a long
         # measurement belongs to rather than only its verdict an hour later.
         log(lines.start(cur, len(variants)))

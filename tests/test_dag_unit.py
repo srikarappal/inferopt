@@ -3019,7 +3019,10 @@ def test_engines():
     seed_ctx.fingerprint.model.architecture = "DiffusionGemmaForBlockDiffusion"
     seed = RUN.seed_config(seed_ctx.fingerprint)
     check("the seed of a dLLM on vLLM keeps the engine's batch cap", seed.get("max_num_seqs") == 4, seed)
-    check("an autoregressive seed still starts at 256", RUN.seed_config(_ctx().fingerprint).get("max_num_seqs") == 256)
+    stock_seed = RUN.seed_config(_ctx().fingerprint)
+    check("an autoregressive seed is stock vllm serve: its own batch limit on an 80 GB card, prefix caching on",
+          stock_seed.get("max_num_seqs") == 1024 and stock_seed.get("enable_prefix_caching") is True
+          and stock_seed.get("enforce_eager") is False, stock_seed)
     from inferopt.predicates import Predicate as _P
     unreached = _ctx()
     check("a measurement of a node the walk never reached reads as not kept",

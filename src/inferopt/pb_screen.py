@@ -338,12 +338,12 @@ def main() -> int:
     a = ap.parse_args()
 
     from inferopt.methods import MethodRunner, setup
-    from inferopt.run import seed_config
+    from inferopt.run import factors_off_config
 
     fp, slo, ctx = setup(a.model, a.trace, a.ttft_p99, a.itl_p99, a.qps)
     dag = json.loads(Path(a.dag or default_dag()).read_text())
 
-    base = seed_config(fp)              # all factors OFF, same seed the walk uses
+    base = factors_off_config(fp)       # all factors OFF: a screen needs each one's low level
     factors = factors_from_dag(dag, ctx)
     if not factors:
         print("  no applicable lossless factors for this workload")

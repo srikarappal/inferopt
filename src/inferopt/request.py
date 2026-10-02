@@ -186,7 +186,9 @@ def detect_hardware(req: InferOptRequest) -> HardwareFingerprint:
     unified = any(p in name for p in UNIFIED_MEMORY_PARTS)
     # Unified parts report memory.total as [N/A]; the real budget is system RAM.
     try:
-        mem_gb = float(mem)
+        # nvidia-smi's memory.total with nounits is MiB: an H100 read as
+        # "81559 GB" before this, and every check against device memory passed.
+        mem_gb = float(mem) / 1024
     except ValueError:
         if not unified:
             raise RuntimeError(f"{name}: memory.total unreadable ({mem!r}) and not a known unified part")

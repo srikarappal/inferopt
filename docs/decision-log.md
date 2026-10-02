@@ -376,3 +376,31 @@ now captured — see `slo-replay.md`.
 - **vLLM loading of locally-produced INT4/NVFP4 artifacts is unverified.**
   Production works; the load path has not been re-tested since the ninja fix.
 - **Stage 3 is designed, not built.**
+
+---
+
+## The baseline is stock `vllm serve` (1 Oct 2026)
+
+The walk used to start from a conservative seed: eager, prefix caching and
+chunked prefill off, 256 sequences. Every percentage it printed was against
+that. Measured on Qwen3-8B on the GB10, one trace, one SLO, the same seven
+level sweep for all four:
+
+    the old seed                     181 tok/s
+    the walk's answer from it        476
+    stock vllm serve                 711
+    stock plus the 5-bit weights    1395
+
+The answer was below stock: the reported lift was a lift over a handicap,
+and the walk never switched the defaults back on. Decided: the baseline is
+the engine as anyone would run it, plus only what the hardware needs to
+start (`run.seed_config`), written out as the values vLLM resolves on its
+own (`engines.VllmEngine.stock`) so a node that sets one of them is skipped
+as no change rather than launched to measure noise. The predictor no longer
+moves the baseline unless asked (`--predict`). The Plackett-Burman screen
+keeps the all-off base it needs (`run.factors_off_config`).
+
+On unified memory the server's share now comes from what is free when the
+seed is made (`engines.unified_fraction`): a fixed 0.75 was stopped by the
+box's OOM guard seconds after allocating whenever another service held
+16 GB.
