@@ -118,8 +118,9 @@ class SequentialStrategy:
                  force_benchmarks: list[str] | None = None,
                  concurrency: int | None = None,
                  baseline=None, provenance: dict | None = None,
-                 max_minutes: float | None = None):
+                 max_minutes: float | None = None, starts: list[dict] | None = None):
         self.dag = dag
+        self.starts = starts or []
         self.lossless_only = lossless_only
         self.force_benchmarks = force_benchmarks
         self.concurrency = concurrency
@@ -149,7 +150,8 @@ class SequentialStrategy:
                        journal=getattr(runner, "journal", None),
                        force_benchmarks=self.force_benchmarks,
                        max_launches=budget_launches,
-                       max_minutes=self.max_minutes)
+                       max_minutes=self.max_minutes,
+                       starts=self.starts)
         trials = ([self.baseline] if self.baseline else []) + list(res.trials)
         kept = [t for t in res.trials if t.kept]
         ok = [t for t in trials if t.goodput]

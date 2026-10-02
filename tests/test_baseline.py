@@ -196,3 +196,76 @@ def test_a_walk_at_a_fixed_load_measures_its_baseline_there_too():
 
 def test_the_vllm_evaluator_sweeps_a_baseline_from_4_to_256():
     assert VllmEvaluator.baseline_levels == SWEEP_LEVELS == (4, 8, 16, 32, 64, 128, 256)
+
+
+# ==================================================  stock and the prediction ===
+
+class TwoStarts:
+    """An evaluator for a stock baseline and one predicted shape (512
+    sequences): each measures as told; every node measures like its base."""
+
+    replay = None
+    baseline_levels = (4, 8, 16, 32, 64, 128, 256)
+
+    def __init__(self, stock, predicted, predicted_meets_targets=True):
+        self.goodput = {"stock": stock, "predicted": predicted}
+        self.meets = predicted_meets_targets
+        self.asked = []
+
+    def measure(self, config, *, probes, benchmarks, node_id, concurrency=None, levels=None,
+                fixed_concurrency=None):
+        which = "predicted" if config.get("max_num_seqs") == 512 else "stock"
+        self.asked.append((node_id, which, concurrency, levels))
+        return traverse.Trial(node_id=node_id, config=dict(config), goodput=self.goodput[which],
+                              ttft_p99_ms=100.0, itl_p99_ms=20.0, memory_gb=10.0,
+                              slo_ok=self.meets or which == "stock", concurrency=192 if which == "predicted" else 128)
+
+
+def walk_from_both(stock, predicted, predicted_meets_targets=True):
+    fingerprint = a_fingerprint()
+    seed = run.seed_config(fingerprint)
+    start = run.predicted_start(fingerprint, {"max_num_seqs": 512})
+    context = Context(fingerprint=fingerprint, slo=SLO(ttft_p99_ms=500, itl_p99_ms=250, quality_budget=0.1,
+                                                      lossless_quality_budget=0.03), incumbent=seed)
+    evaluator, said = TwoStarts(stock, predicted, predicted_meets_targets), []
+    result = traverse.traverse(json.loads(dag_path.read_text()), context, evaluator, log=said.append,
+                               lossless_only=True, concurrency=16, starts=[start])
+    return evaluator.asked, said, result
+
+
+def test_stock_and_the_prediction_are_both_measured_across_the_whole_ladder():
+    asked, said, result = walk_from_both(700.0, 900.0)
+    assert asked[:2] == [("incumbent", "stock", 16, TwoStarts.baseline_levels),
+                         ("predicted", "predicted", 128, TwoStarts.baseline_levels)]
+
+
+def test_a_prediction_that_serves_better_is_where_the_walk_starts():
+    asked, said, result = walk_from_both(700.0, 900.0)
+    assert lines.predicted(900.0, True) in said
+    first_node = next(entry for entry in asked if entry[0] not in ("incumbent", "predicted"))
+    assert first_node[1:3] == ("predicted", 192), "built on the prediction, from its peak"
+    assert [trial.node_id for trial in result.trials[:2]] == ["incumbent", "predicted"], "stock stays first"
+    assert result.trials[1].kept
+
+
+def test_a_prediction_within_the_band_leaves_stock_as_the_start():
+    asked, said, result = walk_from_both(700.0, 720.0)
+    assert lines.predicted(720.0, False) in said
+    first_node = next(entry for entry in asked if entry[0] not in ("incumbent", "predicted"))
+    assert first_node[1:3] == ("stock", 128)
+
+
+def test_a_prediction_that_misses_the_targets_is_never_the_start():
+    asked, said, result = walk_from_both(700.0, 2000.0, predicted_meets_targets=False)
+    assert lines.predicted(2000.0, False) in said and not result.trials[1].kept
+
+
+def test_a_prediction_that_is_stock_already_is_not_measured_again():
+    fingerprint = a_fingerprint()
+    assert run.predicted_start(fingerprint, {}) == run.seed_config(fingerprint)
+
+
+def test_the_hardware_rails_win_over_a_predicted_shape():
+    fingerprint = a_fingerprint(gpu_name="NVIDIA GB10", memory_gb=121.7, unified=True)
+    start = run.predicted_start(fingerprint, {"gpu_memory_utilization": 0.95, "tensor_parallel_size": 2})
+    assert start["gpu_memory_utilization"] <= engines.UNIFIED_CEILING and "tensor_parallel_size" not in start

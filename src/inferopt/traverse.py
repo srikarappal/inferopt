@@ -311,6 +311,12 @@ def _variants(node, base: dict, ctx: Context) -> list[dict]:
     return out
 
 
+def better_start(candidate: Trial, stock_goodput: float, band: float) -> bool:
+    """Whether an alternative start replaces stock: it meets the targets and
+    beats stock by the band every node has to beat its incumbent by."""
+    return bool(candidate.slo_ok) and candidate.goodput > stock_goodput * (1 + band)
+
+
 def declares_a_change(node: dict) -> bool:
     """Whether a node says what it changes (a value to set, a sweep), so a
     variant identical to the incumbent is plainly no change at all."""
@@ -326,8 +332,15 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
              provenance: dict | None = None,
              force_benchmarks: list[str] | None = None,
              max_launches: int | None = None,
-             max_minutes: float | None = None) -> Result:
+             max_minutes: float | None = None,
+             starts: list[dict] | None = None) -> Result:
     """Walk the DAG, measuring each applicable node against the incumbent.
+
+    `starts` are other configs to begin from, a predicted shape on top of
+    stock: each is measured across the whole ladder beside the stock baseline,
+    and the walk starts from one only if it meets the targets and beats stock
+    by the accept band. Percentages after that are against the start; the
+    stock baseline stays the run's first trial.
 
     `max_launches` and `max_minutes` override the DAG's budget guard. The
     guard is a backstop against a walk that cannot finish, sized for the
@@ -464,6 +477,30 @@ def traverse(dag: dict, ctx: Context, evaluator: Evaluator,
             suggested = suggested_slo_for(t, ctx.slo)
             root = None
         log(lines.incumbent(incumbent_goodput, "measured here, no stage 1.3 result was supplied"))
+
+    # Other starts, measured the same way as the stock baseline. A predicted
+    # shape is a guess about this card; it earns the start only by being
+    # measured better, by as much as any node would have to be.
+    for start_cfg in starts or []:
+        if root is None or start_cfg == incumbent_cfg:
+            continue
+        candidate = evaluator.measure(start_cfg, probes=["goodput"], benchmarks=[], node_id="predicted",
+                                      concurrency=concurrency,
+                                      levels=None if fixed_concurrency else getattr(evaluator, "baseline_levels", None),
+                                      fixed_concurrency=fixed_concurrency)
+        if not candidate.quality and ctx.quality_baseline:
+            candidate.quality = dict(ctx.quality_baseline)
+            candidate.quality_inherited = True
+        candidate.kept = better_start(candidate, incumbent_goodput, band)
+        record(candidate)
+        launches += 1
+        trials.append(candidate)
+        log(lines.predicted(candidate.goodput, candidate.kept))
+        if candidate.kept:
+            incumbent_cfg, incumbent_goodput = dict(candidate.config), candidate.goodput
+            ctx.incumbent = dict(candidate.config)
+            if candidate.concurrency and not fixed_concurrency:
+                concurrency = candidate.concurrency
     cur, last_kept = root, True
 
     while cur:

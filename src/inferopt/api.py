@@ -239,7 +239,7 @@ def optimize(
     allow_loss: float | None = None,
     dag: str | None = None,
     seed_from_run: str | None = None,
-    predict: bool = False,
+    predict: bool = True,
     run_dir: str | None = None,
     gpu: str = "0",
     port: int = 8100,
@@ -333,22 +333,16 @@ def optimize(
     # nothing said so and nothing recorded it.
     seed = seed_config(fp)
 
-    # STAGE 1.2. run.py has always done this and optimize() never did, so the
-    # two entry points disagreed about whether a prediction seeds the search.
-    #
-    # It applies to every strategy, not just the chaining walk, which is what
-    # keeps a method comparison fair: all three start from the same place. The
-    # asymmetry that damaged an earlier comparison was the walk being seeded
-    # from a prediction while yolo and the screen were not, and that cannot
-    # happen here because the seed is computed once, above, and handed to
-    # whichever strategy runs.
-    #
-    # Off by default all the same. A prediction moves the starting point, so
-    # turning it on silently would make every result incomparable with every
-    # result already recorded, and the benchmark runs in this repo all passed
-    # --skip-predict for exactly that reason. seed_fingerprint records which
-    # way it went, so the two cases are distinguishable on disk.
+    # STAGE 1.2: the predicted shape, measured beside stock rather than taken
+    # on trust. The baseline is always stock (seed); the prediction is an
+    # alternative start the sequential walk measures across the whole ladder
+    # right after it, and starts from only if it meets the targets and beats
+    # stock by the accept band (traverse, starts). The screen and yolo vary
+    # factors from stock and take no start. On by default because it no longer
+    # moves the baseline: stock stays the first trial and the stamp, and the
+    # predicted trial says whether it was chosen.
     predicted: dict = {}
+    starts: list[dict] = []
     if predict:
         from inferopt.predictor import (describe, prediction_as_dict,
                                         predict as run_predictor)
@@ -357,13 +351,15 @@ def optimize(
             describe(prediction, log=log)
             predicted = prediction_as_dict(prediction)
             if prediction.seed_config:
-                # The predictor picks the SHAPE, batch size and parallelism. The
-                # conservative defaults keep the rails it does not model, so they
-                # go on top rather than under.
-                seed = {**seed, **prediction.seed_config,
-                        **hardware_defaults(fp)}
+                # The predictor picks the SHAPE, batch size and parallelism, on
+                # top of stock with the hardware's rails over it. Measured
+                # beside stock at the baseline, not taken on trust: the walk
+                # starts from it only if it serves better (traverse, starts).
+                start = {**seed, **prediction.seed_config, **hardware_defaults(fp)}
                 if fp.hw.gpu_count == 1:
-                    seed.pop("tensor_parallel_size", None)
+                    start.pop("tensor_parallel_size", None)
+                if start != seed:
+                    starts.append(start)
         except Exception as e:
             log(f"  stage 1.2 unavailable ({type(e).__name__}: {e}), "
                 f"using the conservative seed")
@@ -383,7 +379,7 @@ def optimize(
     if strategy == "sequential":
         strat = cls(dag_json, lossless_only=lossless_only,
                     force_benchmarks=bench if quality_every_config else None,
-                    max_minutes=max_minutes)
+                    max_minutes=max_minutes, starts=starts)
     else:
         from inferopt.pb_screen import factors_from_dag
         factors = factors_from_dag(dag_json, ctx)
