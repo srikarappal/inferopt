@@ -141,13 +141,31 @@ def cmd_trace(args) -> int:
 
 
 def seed_config(fp) -> dict:
-    """Conservative starting point, used until a predictor covers this hardware.
+    """The baseline: the engine as anyone would run it, `vllm serve <model>`,
+    plus only what this hardware needs to start (hardware_defaults). Written
+    out (engines: stock), so a node that sets what the engine already does is
+    seen to change nothing, and a node's expression over the incumbent always
+    has a number to work from.
 
-    gpu_memory_utilization is 0.75 on unified-memory parts rather than the usual
-    0.90: there the fraction is of SYSTEM memory, and the CPU, the benchmark
-    client and the OS are all competing for the remainder. 0.90 of 122GB left
-    ~1.6GB of headroom on this box and ran the machine to the edge of the OOM
-    killer.
+    Every percentage a walk prints is against this. It used to be the
+    conservative config below: on Qwen3-8B on the GB10 that measured 181
+    tok/s against stock vLLM's 711, the walk's answer measured 476, below
+    stock, and the lift it reported was a lift over a handicap (1 Oct 2026).
+    """
+    from inferopt.engines import engine_for
+    from inferopt.evaluator import hardware_defaults
+    return {**engine_for(fp).stock(fp), **hardware_defaults(fp)}
+
+
+def factors_off_config(fp) -> dict:
+    """Every lossless factor off: the base row of a Plackett-Burman screen,
+    which needs each factor's low level present to measure its effect. Not a
+    baseline; seed_config is.
+
+    gpu_memory_utilization is below the usual 0.90 on unified-memory parts:
+    there the fraction is of SYSTEM memory, and the CPU, the benchmark client
+    and the OS are all competing for the remainder. 0.90 of 122GB left ~1.6GB
+    of headroom on this box and ran the machine to the edge of the OOM killer.
     """
     need = fp.workload.p999_input_tokens + fp.workload.p99_output_tokens
     cfg = {
@@ -326,8 +344,10 @@ def cmd_optimize(args) -> int:
         print(f"    it kept {kept or ['(nothing)']}"
               + (f" and peaked at {pk:.1f} tok/s" if pk else ""))
         print(f"    stage 1.2 is skipped -- a measured incumbent beats a prediction")
-    elif args.skip_predict:
-        print(f"  stage 1.2 skipped by --skip-predict")
+    elif not args.predict:
+        # The baseline is stock vllm serve; a prediction would move it, and
+        # every percentage with it. api.optimize does the same (predict=False).
+        print(f"  stage 1.2 not run: the baseline is the engine's defaults (--predict to seed from it)")
     else:
         from inferopt.predictor import describe, predict
         try:
@@ -405,7 +425,7 @@ def cmd_optimize(args) -> int:
         from inferopt.evaluator import SWEEP_LEVELS
         sweep_off = args.skip_sweep or args.fixed_concurrency
         t = ev.measure(cfg, probes=["goodput", "equivalence", "quality"],
-                       benchmarks=_benchmarks(a), node_id="stage_1_3",
+                       benchmarks=_benchmarks(args), node_id="stage_1_3",
                        levels=None if sweep_off else SWEEP_LEVELS,
                        fixed_concurrency=args.fixed_concurrency)
         if t.diagnostics.get("launch_error"):
@@ -526,7 +546,7 @@ def cmd_optimize(args) -> int:
                    concurrency=operating_L,
                    fixed_concurrency=args.fixed_concurrency,
                    provenance=stamp,
-                   force_benchmarks=(_benchmarks(a)
+                   force_benchmarks=(_benchmarks(args)
                                      if args.quality_every_node else None))
 
     # Full sweep on the finalists. The traversal ranks configs at one operating
@@ -679,13 +699,17 @@ def main() -> int:
     o.add_argument("--budget-minutes", type=int, default=180)
     o.add_argument("--seed-from-run", default=None, metavar="RUNDIR",
                    help="start from a previous run's incumbent config instead "
-                        "of the conservative seed. Use it to run the lossy "
+                        "of the engine's defaults. Use it to run the lossy "
                         "stage on top of a finished lossless search rather than "
                         "restarting from a config that may not even meet the "
                         "SLO. Implies --skip-predict: a measured incumbent is "
                         "better evidence than a prediction.")
+    o.add_argument("--predict", action="store_true",
+                   help="seed the walk from stage 1.2's prediction instead of "
+                        "the engine's defaults. Off by default: a prediction "
+                        "moves the baseline every percentage is against.")
     o.add_argument("--skip-predict", action="store_true",
-                   help="skip stage 1.2 and use the conservative seed")
+                   help="kept so older command lines still parse; stage 1.2 is off unless --predict")
     o.add_argument("--fixed-concurrency", type=int, default=None, metavar="N",
                    help="measure every node at exactly N in-flight requests using "
                         "the open-loop driver, with no sweep and no bracket. This is "

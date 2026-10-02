@@ -145,6 +145,12 @@ class Engine:
         Merged UNDER the caller's config, so an explicit value always wins."""
         return {}
 
+    def stock(self, fp) -> dict:
+        """What this engine resolves on its own when launched with nothing but
+        the model, written out in the DAG's vocabulary. The baseline is this,
+        so a node that sets one of these values is seen to change nothing."""
+        return {}
+
     # --- profiling --------------------------------------------------------
     # Every engine ships a torch profiler behind its own switch and writes a
     # Chrome trace. These four say how to arm it at launch, how to open and
@@ -176,6 +182,48 @@ class Engine:
         counter are different facts.
         """
         raise NotImplementedError
+
+
+# Unified memory (the GB10): gpu_memory_utilization is a share of the WHOLE
+# machine, and what else is resident there is not ours to move. The host's OOM
+# guard (earlyoom on the GB10) stops the biggest process once less than
+# KEEP_FREE_SHARE is free, and a server that has just allocated is that.
+KEEP_FREE_SHARE = 0.15
+UNIFIED_CEILING = 0.75
+UNIFIED_FLOOR = 0.30
+CPU_SIDE_GB = 4.0       # the server's own CPU side and the benchmark client
+
+
+def memory_now(meminfo: str | None = None) -> tuple[float, float] | None:
+    """(available, total) GiB of the whole box from /proc/meminfo, or None."""
+    try:
+        text = meminfo if meminfo is not None else Path("/proc/meminfo").read_text()
+    except OSError:
+        return None
+    fields = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        value = rest.split()
+        if value and value[0].isdigit():
+            fields[name] = int(value[0]) / 1024 / 1024
+    if "MemTotal" not in fields or "MemAvailable" not in fields:
+        return None
+    return fields["MemAvailable"], fields["MemTotal"]
+
+
+def unified_fraction(meminfo: str | None = None) -> float:
+    """The share of a unified-memory host a server may take, from what is free
+    now: less the share the OOM guard keeps and the CPU side, at most 0.75.
+
+    A fixed 0.75 was stopped by the guard seconds after allocating whenever
+    another service on the box held 16 GB (Qwen3-8B, stock vLLM, 1 Oct 2026).
+    Read once, when the seed is made, so every launch in a walk shares it."""
+    memory = memory_now(meminfo)
+    if memory is None:
+        return UNIFIED_CEILING
+    available, total = memory
+    share = (available - KEEP_FREE_SHARE * total - CPU_SIDE_GB) / total
+    return round(min(UNIFIED_CEILING, max(UNIFIED_FLOOR, share)), 2)
 
 
 def _resolve(env_override: str, script: str, module: str) -> list[str]:
@@ -289,7 +337,7 @@ class VllmEngine(Engine):
         # any reasonable time: sm120/121 has 99 KiB shared memory per block
         # against sm100's 228 KiB, so tile configs written for datacenter
         # Blackwell cannot fit.
-        out = {"gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90}
+        out = {"gpu_memory_utilization": unified_fraction() if fp.hw.unified_memory else 0.90}
         # A dLLM on vLLM (DiffusionGemma, 0.29), as measured on the GB10:
         #   max_num_seqs 4      the denoising state is per sequence and large;
         #                       vLLM's own recipe caps the batch there.
@@ -334,6 +382,23 @@ class VllmEngine(Engine):
             "prefix_hit_rate": (hits / queries) if hits is not None and queries else None,
             "spec_acceptance_rate": (accepted / drafts) if accepted is not None and drafts else None,
         }.items() if v is not None}
+
+    def stock(self, fp) -> dict:
+        """What `vllm serve <model>` resolves with no flags, as vLLM 0.29 does
+        it (EngineArgs: the V1 defaults, and
+        _set_default_max_num_seqs_and_batched_tokens_args for the API server):
+        prefix caching, chunked prefill and CUDA graphs on, the model's whole
+        context, and batch limits chosen by device memory, the A100 excepted.
+        A dLLM's required flags (defaults) still go on top of these."""
+        gib = fp.hw.memory_gb
+        if gib >= 160:
+            seqs, tokens = 1024, 16384
+        elif gib >= 70 and "a100" not in fp.hw.gpu_name.lower():
+            seqs, tokens = 1024, 8192
+        else:
+            seqs, tokens = 256, 2048
+        return {"enable_prefix_caching": True, "enable_chunked_prefill": True, "enforce_eager": False,
+                "max_model_len": fp.model.max_model_len, "max_num_seqs": seqs, "max_num_batched_tokens": tokens}
 
 
 class SglangEngine(Engine):
@@ -479,7 +544,7 @@ class SglangEngine(Engine):
         return out
 
     def defaults(self, fp) -> dict:
-        out = {"gpu_memory_utilization": 0.75 if fp.hw.unified_memory else 0.90}
+        out = {"gpu_memory_utilization": unified_fraction() if fp.hw.unified_memory else 0.90}
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_runner_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"
