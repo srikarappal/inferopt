@@ -66,8 +66,10 @@ HISTORY -- measurement bugs, which are the expensive kind
 from __future__ import annotations
 
 import asyncio
+import functools
 import gzip
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -87,6 +89,7 @@ import httpx
 
 from inferopt.calibration import STORE
 from inferopt import leaderboard, prompting
+from inferopt._paths import workspace
 from inferopt.engines import VllmEngine, engine_for
 from inferopt.fingerprint import SLO, Fingerprint
 from inferopt.legality import repair
@@ -409,15 +412,54 @@ class LaunchError(RuntimeError):
         self.stderr = stderr
 
 
+# WHAT AN ENGINE COMPILES OUTLIVES THE LAUNCH THAT COMPILED IT. vLLM's
+# torch.compile artifacts sat in the run directory, deleted when the search
+# left the host (and packed into its archive, 8,197 files on one 30B run), and
+# Triton's, inductor's and FlashInfer's JIT under the container's home, deleted
+# with the container: every search and every endpoint compiled from nothing.
+# One directory per host on the data disk instead, keyed by the compiler stack
+# and the card, so a deploy reuses what its search compiled. Each tool keys its
+# own entries by what they were built from; the key here is what makes a stack
+# nothing runs any more one directory to delete.
+CACHE_STACK = ("vllm", "torch", "triton", "flashinfer-python")
+
+
+def _installed(package: str) -> str:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return "none"
+
+
+def _compute_capability() -> str:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        out = []
+    return f"sm{out[0].replace('.', '')}" if out else "nogpu"
+
+
+@functools.lru_cache(maxsize=1)
+def compile_cache_env() -> dict[str, str]:
+    """The cache directories every engine this host launches shares."""
+    stack = "-".join(f"{package.split('-')[0]}{_installed(package)}" for package in CACHE_STACK)
+    root = workspace("compile-cache", stack, _compute_capability())
+    return {"VLLM_CACHE_ROOT": str(root / "vllm"), "TRITON_CACHE_DIR": str(root / "triton"),
+            "TORCHINDUCTOR_CACHE_DIR": str(root / "inductor"),
+            "FLASHINFER_WORKSPACE_BASE": str(root / "flashinfer")}
+
+
 def child_env(**extra: str) -> dict[str, str]:
     """vLLM JIT-builds CUDA extensions and shells out to `ninja`, which lives
     beside the interpreter. A subprocess inherits only PATH, so an absolute-path
-    invocation dies deep in engine init with FileNotFoundError."""
+    invocation dies deep in engine init with FileNotFoundError. The shared
+    compile cache comes first, so a directory the operator set still wins."""
     bindir = str(Path(sys.executable).parent)
     path = os.environ.get("PATH", "")
     if bindir not in path.split(os.pathsep):
         path = bindir + os.pathsep + path
-    return {**os.environ, "PATH": path, **extra}
+    return {**compile_cache_env(), **os.environ, "PATH": path, **extra}
 
 
 # THE PORT MUST BE OURS BEFORE THE HEALTH CHECK MEANS ANYTHING.
@@ -842,7 +884,6 @@ class VllmEvaluator:
         if getattr(self, "profile", True):
             cmd += engine.profile_flags(self._profile_dir)
         env = child_env(CUDA_VISIBLE_DEVICES=self.gpu,
-                        VLLM_CACHE_ROOT=str(self.run_dir / ".vllm_cache" / f"gpu{self.gpu}"),
                         **(engine.profile_env(self._profile_dir) if getattr(self, "profile", True) else {}))
         # What the load may ask of this server: greedy and seeded everywhere
         # except a diffusion LM on vLLM, which refuses both parameters.
