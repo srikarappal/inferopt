@@ -81,6 +81,11 @@ def summarize(reqs: list[Req], t0: float, t1: float, slo: SLO) -> dict:
         # stable, and goodput is what keep/revert runs on.
         "ttft_p95_ms": pct(ttfts, 0.95) * 1e3,
         "itl_p95_ms": pct(itls, 0.95) * 1e3,
+        # The median beside the tails: what a typical request waits, where p95
+        # and p99 say what the slowest do. The job page draws the three as one
+        # band per load level, so the spread is read rather than chosen.
+        "ttft_p50_ms": pct(ttfts, 0.50) * 1e3,
+        "itl_p50_ms": pct(itls, 0.50) * 1e3,
         "ttft_n": len(ttfts),
         "completed": len(done), "failed": len(started) - len(done), "window_s": win,
         # The distinct reasons, most common first. A screen losing a quarter of

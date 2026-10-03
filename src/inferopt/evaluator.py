@@ -382,7 +382,7 @@ REPEATS = 2
 # better of two TTFT samples, which is exactly backwards for a gate that decides
 # whether an SLO was met.
 LOWER_IS_BETTER = {"ttft_p99_ms", "itl_p99_ms", "ttft_p95_ms", "itl_p95_ms",
-                   "failed", "window_s"}
+                   "ttft_p50_ms", "itl_p50_ms", "failed", "window_s"}
 # ttft_n is a SAMPLE COUNT, not a metric -- but aggregate() takes the least
 # flattering value of everything numeric, and fewer samples is the weaker
 # claim, so it belongs on the min side with goodput. That is where the

@@ -236,6 +236,11 @@ def test_percentile_convention_matches_summarize():
               f"summarize={m[name]} export={ours}")
     check("p95 also agrees",
           abs(m["ttft_p95_ms"] - agg["time_to_first_token"]["p95"]) < 1e-9)
+    for name, key in (("ttft_p50_ms", "time_to_first_token"), ("itl_p50_ms", "inter_token_latency")):
+        check(f"{name}, the median, agrees too", abs(m[name] - agg[key]["p50"]) < 1e-9,
+              f"summarize={m[name]} export={agg[key]['p50']}")
+    check("the median sits at or under p95 and p99",
+          m["ttft_p50_ms"] <= m["ttft_p95_ms"] <= m["ttft_p99_ms"])
 
 
 def test_aggregate_round_trip():
