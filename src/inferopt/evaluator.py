@@ -91,6 +91,7 @@ from inferopt.engines import VllmEngine, engine_for
 from inferopt.fingerprint import SLO, Fingerprint
 from inferopt.legality import repair
 from inferopt.quality import context_needed
+from inferopt.quantize import ensure_variant, split_variant
 import goodput.driver as load_driver
 from goodput.driver import Req, _closed_loop, _load, _mt, _one
 from goodput.metrics import _reasons, summarize
@@ -762,18 +763,11 @@ class VllmEvaluator:
         # `quantize: <kind>` is an instruction to PRODUCE a variant of the served
         # model, not a vLLM flag. It resolves to a local artifact path before the
         # launch, and never to a downloaded checkpoint -- see quantize.py.
-        config = dict(config)
-        kind = config.pop("quantize", None)
-        # effective_bits travels as its own key: "autoquant@6.0" in a sweep value
-        # gets parsed as a predicate expression by validate_dag, where @ is
-        # MatMult. The producer still wants them joined.
-        bits = config.pop("quantize_bits", None)
-        if kind == "autoquant":
-            if bits is None:
-                raise LaunchError("quantize=autoquant requires quantize_bits")
-            kind = f"autoquant@{float(bits)}"
+        try:
+            kind, config = split_variant(config)
+        except ValueError as refused:
+            raise LaunchError(str(refused)) from refused
         if kind:
-            from inferopt.quantize import ensure_variant
             # A conversion that fails is a launch that fails: recorded as
             # goodput 0 on this node and the walk moves on. Left as its own
             # exception it escaped the walk, and a run that had measured seven

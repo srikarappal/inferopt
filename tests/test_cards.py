@@ -100,3 +100,17 @@ def test_only_the_estimate_card_is_asked_for_the_estimate_version(monkeypatch):
     predictor._estimate(None, SLO(), "gb10", "rtx_pro_6000_server")
     assert ("gb10", "SOL", predictor.ESTIMATE_VERSION) in frontier.calls
     assert all(version is None for system, _, version in frontier.calls if system == "rtx_pro_6000_server")
+
+
+def test_a_deployment_and_the_search_name_the_same_checkpoint(monkeypatch, tmp_path):
+    """The deploy finds a point's weights by the name the search wrote them
+    under, so both go through split_variant and variant_dir."""
+    from inferopt import quantize
+    monkeypatch.setenv("INFEROPT_ARTIFACTS", str(tmp_path))
+    kind, rest = quantize.split_variant({"quantize": "autoquant", "quantize_bits": 6, "max_num_seqs": 8})
+    assert kind == "autoquant@6.0" and rest == {"max_num_seqs": 8}
+    assert quantize.variant_dir("Qwen/Qwen3-8B", kind) == tmp_path / "Qwen__Qwen3-8B--autoquant_6.0"
+    assert quantize.split_variant({"quantize": "nvfp4"}) == ("nvfp4", {})
+    assert quantize.split_variant({"max_num_seqs": 8}) == (None, {"max_num_seqs": 8})
+    with pytest.raises(ValueError):
+        quantize.split_variant({"quantize": "autoquant"})

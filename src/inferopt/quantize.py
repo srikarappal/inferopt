@@ -441,6 +441,33 @@ def quantize_timeout_s() -> float:
     return float(os.environ.get("INFEROPT_QUANTIZE_TIMEOUT_S") or 1800)
 
 
+def split_variant(config: dict) -> tuple[str | None, dict]:
+    """(what to produce, the rest of the config) for a config's `quantize`.
+
+    `quantize` is an instruction to PRODUCE a variant of the served model, not
+    an engine flag. autoquant's bit budget travels as its own key, because
+    "autoquant@6.0" in a sweep value is parsed as a predicate expression by
+    validate_dag, where @ is MatMult; the producer wants them joined. One
+    function for the search's launch and a deployment's, so both name the same
+    checkpoint.
+    """
+    rest = dict(config)
+    kind = rest.pop("quantize", None)
+    bits = rest.pop("quantize_bits", None)
+    if kind == "autoquant":
+        if bits is None:
+            raise ValueError("quantize=autoquant requires quantize_bits")
+        kind = f"autoquant@{float(bits)}"
+    return kind, rest
+
+
+def variant_dir(model_id: str, kind: str) -> Path:
+    """Where the `kind` checkpoint of `model_id` lives. The bit budget is part of
+    the identity: autoquant@6.0 and autoquant@4.5 are different checkpoints and
+    must not share a directory or a cache hit."""
+    return artifacts(f"{model_id.replace('/', '__')}--{kind.replace('@', '_')}")
+
+
 def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
     """Path to a quantized checkpoint of `model_id`, producing it if needed.
 
@@ -457,9 +484,7 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
             f"    python quantize.py --setup")
 
     model_id = fp.model.id
-    # The bit budget is part of the identity: autoquant@6.0 and autoquant@4.5 are
-    # different checkpoints and must not share a directory or a cache hit.
-    out = artifacts(f"{model_id.replace('/', '__')}--{kind.replace('@', '_')}")
+    out = variant_dir(model_id, kind)
     if (out / "config.json").exists():
         log(f"  quant     reusing {out}")
         return str(out)
