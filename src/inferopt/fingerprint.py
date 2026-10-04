@@ -566,10 +566,14 @@ class Fingerprint(BaseModel):
                 f"{self.model.max_model_len} -- the tail of this traffic cannot be served"
             )
         kv_gb = self.model.kv_bytes_per_token * need / 1e9
-        if kv_gb + self.model.weight_gb > self.hw.memory_gb:
+        # Every card the run was handed holds a share under tensor parallel
+        # (engines.split_across): their memory together, not one card's.
+        memory_gb = self.hw.memory_gb * max(1, self.hw.gpu_count)
+        if kv_gb + self.model.weight_gb > memory_gb:
             raise ValueError(
                 f"weights ({self.model.weight_gb:.1f}GB) + KV for one max-length sequence "
-                f"({kv_gb:.1f}GB) exceeds device memory ({self.hw.memory_gb}GB) -- "
+                f"({kv_gb:.1f}GB) exceeds device memory ({memory_gb:g}GB across "
+                f"{max(1, self.hw.gpu_count)} card(s)) -- "
                 f"this model cannot serve this workload on this hardware at all"
             )
         return self

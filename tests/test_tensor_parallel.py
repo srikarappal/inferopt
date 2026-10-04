@@ -5,7 +5,10 @@ card would not load it (3 Oct 2026)."""
 import subprocess
 import types
 
+import pytest
+
 from inferopt import engines, request
+from inferopt.fingerprint import Fingerprint
 
 
 def a_fingerprint(gpu_count, dense=True, unified=False):
@@ -48,3 +51,15 @@ def test_a_run_counts_only_the_cards_it_was_handed(tmp_path, monkeypatch):
     assert request.detect_hardware(a_request(tmp_path)).gpu_count == 2
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,7")
     assert request.detect_hardware(a_request(tmp_path)).gpu_count == 4, "a list naming cards it lacks is ignored"
+
+
+def test_a_model_no_one_card_holds_is_checked_against_every_card_it_was_handed():
+    """3 Oct 2026, live: Qwen3-8B's 16.4 GB was refused on four 12 GB cards as
+    exceeding device memory, before vLLM was ever asked to split it."""
+    model = types.SimpleNamespace(max_model_len=40960, kv_bytes_per_token=147456, weight_gb=16.4)
+    workload = types.SimpleNamespace(p999_input_tokens=400, p99_output_tokens=600)
+    four = types.SimpleNamespace(memory_gb=12.0, gpu_count=4)
+    one = types.SimpleNamespace(memory_gb=12.0, gpu_count=1)
+    assert Fingerprint.model_construct(model=model, hw=four, workload=workload)._cross() is not None
+    with pytest.raises(ValueError, match="across 1 card"):
+        Fingerprint.model_construct(model=model, hw=one, workload=workload)._cross()
