@@ -215,6 +215,23 @@ def memory_now(meminfo: str | None = None) -> tuple[float, float] | None:
     return fields["MemAvailable"], fields["MemTotal"]
 
 
+# Room per card that tensor parallel keeps outside the engine's memory share:
+# NCCL's buffers and each worker's CUDA context. On four 8 GB RTX 3070s, vLLM
+# at 0.90 used 7.55 GiB of 7.66 against its own 6.89 and ran out of memory in
+# warm up (3 Oct 2026).
+split_headroom_gib = 1.25
+
+
+def dedicated_fraction(fp) -> float:
+    """The memory share on a card the run has to itself: 0.90, less what tensor
+    parallel needs beside it where 0.90 leaves too little."""
+    count = getattr(fp.hw, "gpu_count", 1) or 1
+    card = getattr(fp.hw, "memory_gb", 0) or 0
+    if count <= 1 or not card:
+        return 0.90
+    return round(min(0.90, 1 - split_headroom_gib / card), 3)
+
+
 def split_across(fp) -> dict:
     """Tensor parallel over every card the run was handed. The platform hands
     a run the fewest cards that hold its model, so a second card is one the
@@ -350,7 +367,7 @@ class VllmEngine(Engine):
         # any reasonable time: sm120/121 has 99 KiB shared memory per block
         # against sm100's 228 KiB, so tile configs written for datacenter
         # Blackwell cannot fit.
-        out = {"gpu_memory_utilization": unified_fraction() if fp.hw.unified_memory else 0.90}
+        out = {"gpu_memory_utilization": unified_fraction() if fp.hw.unified_memory else dedicated_fraction(fp)}
         # A dLLM on vLLM (DiffusionGemma, 0.29), as measured on the GB10:
         #   max_num_seqs 4      the denoising state is per sequence and large;
         #                       vLLM's own recipe caps the batch there.
@@ -557,7 +574,7 @@ class SglangEngine(Engine):
         return out
 
     def defaults(self, fp) -> dict:
-        out = {"gpu_memory_utilization": unified_fraction() if fp.hw.unified_memory else 0.90}
+        out = {"gpu_memory_utilization": unified_fraction() if fp.hw.unified_memory else dedicated_fraction(fp)}
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_runner_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"

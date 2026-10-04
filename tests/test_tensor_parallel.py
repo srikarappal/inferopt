@@ -11,9 +11,9 @@ from inferopt import engines, request
 from inferopt.fingerprint import Fingerprint
 
 
-def a_fingerprint(gpu_count, dense=True, unified=False):
+def a_fingerprint(gpu_count, dense=True, unified=False, memory_gb=80.0):
     return types.SimpleNamespace(
-        hw=types.SimpleNamespace(gpu_count=gpu_count, unified_memory=unified, sm_major=9),
+        hw=types.SimpleNamespace(gpu_count=gpu_count, unified_memory=unified, sm_major=9, memory_gb=memory_gb),
         model=types.SimpleNamespace(is_dense=dense, decoding="autoregressive"))
 
 
@@ -63,3 +63,12 @@ def test_a_model_no_one_card_holds_is_checked_against_every_card_it_was_handed()
     assert Fingerprint.model_construct(model=model, hw=four, workload=workload)._cross() is not None
     with pytest.raises(ValueError, match="across 1 card"):
         Fingerprint.model_construct(model=model, hw=one, workload=workload)._cross()
+
+
+def test_a_split_on_small_cards_leaves_room_beside_the_engines_share():
+    """3 Oct 2026, live: four 8 GB RTX 3070s at 0.90 ran out of memory in warm
+    up, NCCL and the CUDA context sitting outside vLLM's own budget."""
+    assert engines.dedicated_fraction(a_fingerprint(1, memory_gb=7.66)) == 0.90, "one card: stock's share"
+    assert engines.dedicated_fraction(a_fingerprint(4, memory_gb=7.66)) == 0.837
+    assert engines.dedicated_fraction(a_fingerprint(8, memory_gb=80.0)) == 0.90, "a big card has the room already"
+    assert engines.VllmEngine().defaults(a_fingerprint(4, memory_gb=7.66))["gpu_memory_utilization"] == 0.837
