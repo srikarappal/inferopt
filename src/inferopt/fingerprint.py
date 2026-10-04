@@ -246,7 +246,18 @@ class HardwareFingerprint(BaseModel):
     memory_gb: float = Field(description="hardware | usable device memory. On unified-memory parts this is SYSTEM memory, and the CPU competes for it")
     memory_bandwidth_gb_s: float = Field(description="hardware | peak; the binding constraint for decode")
     unified_memory: bool = Field(False, description="hardware | True on GB10/Grace-class parts where CPU and GPU share one pool")
-    interconnect: str | None = Field(None, description="hardware | nvlink/pcie/none; irrelevant at gpu_count=1")
+    interconnect: str | None = Field(None, description="hardware | nvlink or pcie between the run's cards, from "
+                                                       "nvidia-smi topo -m; None on one card or when unread")
+    gpu_paths: dict[str, str] | None = Field(None, description="hardware | how each pair of cards reaches the other "
+                                                               "(topo -m): NV# NVLink, PIX/PXB a PCIe switch, PHB "
+                                                               "the CPU's host bridge, NODE/SYS across NUMA nodes")
+    p2p: bool | None = Field(None, description="hardware | peer to peer reads work between every pair of cards "
+                                               "(topo -p2p r); without them tensor parallel's all reduce goes "
+                                               "through host memory")
+    card_links: list[dict] | None = Field(None, description="hardware | per card: PCIe generation and width now and "
+                                                            "at most, power limit and its maximum")
+    driver_version: str | None = Field(None, description="hardware | the NVIDIA driver")
+    cpu_model: str | None = Field(None, description="hardware | the host CPU, which also runs the benchmark client")
     system_ram_gb: float = Field(description="hardware | host RAM. On unified-memory parts this IS memory_gb "
                                              "and the CPU competes for it; also bounds the CPU-side adapter cache.")
     cpu_cores: int = Field(description="hardware | the load generator is async Python -- too few cores and the "

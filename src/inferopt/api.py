@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from inferopt import topology
 from inferopt._paths import default_dag, runs as _runs
 from inferopt.finalists import sweep_finalists
 from inferopt.provenance import seed_fingerprint
@@ -310,6 +311,7 @@ def optimize(
         model=model, trace=trace, ttft_p99_ms=ttft_p99_ms, itl_p99_ms=itl_p99_ms,
         allow_loss=allow_loss, **({"qps": qps} if qps else {})))
     ctx = Context(fingerprint=fp, slo=slo_)
+    log(topology.describe(fp.hw))
     for line in workload_warnings(fp):
         log(line)
     # The weights before any launch, as run.py has always done: a download

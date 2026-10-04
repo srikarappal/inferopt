@@ -57,6 +57,7 @@ from huggingface_hub import hf_hub_download
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from inferopt import topology
 from inferopt.fingerprint import (
     VLLM_DLLM_ARCHITECTURES,
     DTYPE_BYTES,
@@ -168,6 +169,7 @@ def detect_hardware(req: InferOptRequest) -> HardwareFingerprint:
     # (CUDA_VISIBLE_DEVICES, as a host without docker hands a search its
     # cards) counts only those, or tensor parallel would span cards it lacks.
     visible = [int(i) for i in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if i.strip().isdigit()]
+    everything = rows
     if visible and all(i < len(rows) for i in visible):
         rows = [rows[i] for i in visible]
     # An IndexError here says "list index out of range", which reads like a bug
@@ -209,11 +211,13 @@ def detect_hardware(req: InferOptRequest) -> HardwareFingerprint:
             f"--override-memory-bandwidth-gb-s or set {BANDWIDTH_ENV}."
         )
 
+    # The cards as nvidia-smi numbers them: the ones handed to the run, or all.
+    cards = visible if visible and all(i < len(everything) for i in visible) else list(range(len(rows)))
     return HardwareFingerprint(
         gpu_name=name, gpu_count=len(rows), compute_capability=cc,
         memory_gb=round(mem_gb, 1), memory_bandwidth_gb_s=bw, unified_memory=unified,
-        interconnect="nvlink" if len(rows) > 1 else None,
         system_ram_gb=round(sys_ram_gb, 1), cpu_cores=os.cpu_count() or 1,
+        **topology.read(cards),
     )
 
 
