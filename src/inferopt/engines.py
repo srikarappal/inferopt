@@ -215,6 +215,14 @@ def memory_now(meminfo: str | None = None) -> tuple[float, float] | None:
     return fields["MemAvailable"], fields["MemTotal"]
 
 
+def split_across(fp) -> dict:
+    """Tensor parallel over every card the run was handed. The platform hands
+    a run the fewest cards that hold its model, so a second card is one the
+    model must be split across; stock vLLM and SGLang would use the first."""
+    count = getattr(fp.hw, "gpu_count", 1) or 1
+    return {"tensor_parallel_size": count} if count > 1 else {}
+
+
 def unified_fraction(meminfo: str | None = None) -> float:
     """The share of a unified-memory host a server may take, from what is free
     now: less the share the OOM guard keeps and what runs outside the share,
@@ -373,7 +381,7 @@ class VllmEngine(Engine):
         if not fp.model.is_dense and fp.hw.sm_major == 12:
             if "moe_backend" in self.installed_flags():
                 out["moe_backend"] = "triton"
-        return out
+        return {**out, **split_across(fp)}
 
     def derive(self, series, reduce) -> dict:
         g = lambda *ks: next((reduce(k) for k in ks if k in series), None)
@@ -560,7 +568,7 @@ class SglangEngine(Engine):
             # defaulted by the server, and flashinfer is the backend they test.
             out.update({"trust_remote_code": True, "dllm_algorithm": "LowConfidence",
                         "attention_backend": "flashinfer"})
-        return out
+        return {**out, **split_across(fp)}
 
     def derive(self, series, reduce) -> dict:
         g = lambda *ks: next((reduce(k) for k in ks if k in series), None)

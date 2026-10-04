@@ -164,6 +164,12 @@ def detect_hardware(req: InferOptRequest) -> HardwareFingerprint:
     if not out:
         raise RuntimeError("nvidia-smi returned no GPUs")
     rows = [r.split(",") for r in out.splitlines() if r.strip()]
+    # nvidia-smi lists every card on the machine; a run handed some of them
+    # (CUDA_VISIBLE_DEVICES, as a host without docker hands a search its
+    # cards) counts only those, or tensor parallel would span cards it lacks.
+    visible = [int(i) for i in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if i.strip().isdigit()]
+    if visible and all(i < len(rows) for i in visible):
+        rows = [rows[i] for i in visible]
     # An IndexError here says "list index out of range", which reads like a bug
     # in this file rather than what it is: nvidia-smi answered in a shape we did
     # not expect. That happened on a host where NVML would not initialise --
