@@ -2793,6 +2793,7 @@ class _TightContextEvaluator(evaluator.VllmEvaluator):
         self.slo_ok, self.replayed = slo_ok, replayed
         self.quality_launch_fails = quality_launch_fails
         self.launched, self.scored_under, self.inner_benchmarks = [], [], None
+        self.quality_tokens = 0     # no traffic past the benchmark's own budget
 
     @contextmanager
     def _serve(self, config, tag):

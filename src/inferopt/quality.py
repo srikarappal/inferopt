@@ -79,6 +79,7 @@ HISTORY -- gates that could not be passed
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import sys
@@ -434,7 +435,23 @@ BENCHMARKS: dict[str, Benchmark] = {
 }
 
 
-def context_needed(names: list[str], model: str | None = None) -> int:
+def traffic_floor(p99_output_tokens: int) -> int:
+    """What the traffic asks of one answer: its p99 with a quarter of headroom,
+    in 32 token steps; 0 without traffic. A model that answers past a
+    benchmark's own budget is otherwise scored on answers cut off before their
+    final line (Qwen3 on MATH-500, 4 Oct 2026: a fifth of answers past 1,024)."""
+    return int(math.ceil(p99_output_tokens * 1.25 / 32)) * 32 if p99_output_tokens else 0
+
+
+def generation_budget(name: str, floor: int | None = None) -> int:
+    """What one answer of `name` may run to: the benchmark's own budget, raised
+    to `floor` (traffic_floor) when the traffic's answers run longer. Never
+    lowered: the gate scores this benchmark whatever the traffic is, and a
+    short-answer eval must not cut its answers."""
+    return max(BENCHMARKS[name].max_tokens, int(floor or 0))
+
+
+def context_needed(names: list[str], model: str | None = None, max_tokens: int | None = None) -> int:
     """The smallest max_model_len under which every row of `names` is scorable.
 
     Longest prompt plus the generation budget, and the largest benchmark wins.
@@ -449,14 +466,15 @@ def context_needed(names: list[str], model: str | None = None) -> int:
             continue
         prompt = _chat_wrapper(b.prompt, model) if b.chat else b.prompt
         longest = max(len(prompt(r)) // 4 for r in _load(name, None))
-        need = max(need, longest + b.max_tokens + 1)
+        need = max(need, longest + generation_budget(name, max_tokens) + 1)
     return need
 
 
 def run_benchmark(name: str, gen: Generate, *, full: bool = False,
                   max_input_tokens: int | None = None,
                   model: str | None = None,
-                  record: "Path | str | None" = None) -> float:
+                  record: "Path | str | None" = None,
+                  max_tokens: int | None = None) -> float:
     """Score one benchmark, refusing to score prompts the server cannot take.
 
     A benchmark with long prompts, served under a right-sized max_model_len,
@@ -469,6 +487,9 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
         raise KeyError(f"unknown benchmark {name!r}; have {', '.join(BENCHMARKS)}")
     b = BENCHMARKS[name]
     rows = _load(name, None if full else TRAVERSAL_N)
+    # The generation budget, the benchmark's own or the traffic's when longer
+    # (generation_budget): one number for the filter and the scorer below.
+    tokens = generation_budget(name, max_tokens)
 
     # ONE prompt builder from here down -- the context filter and the scorer must
     # see identical text. They did not once before: the scorer built its own
@@ -479,18 +500,18 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
     if max_input_tokens:
         # Reserve room for the generation: the prompt plus what the model is
         # asked to produce must both fit inside max_model_len.
-        budget = max_input_tokens - b.max_tokens
+        budget = max_input_tokens - tokens
         est = lambda r: len(prompt(r)) // 4
         if budget <= 0:
             raise ValueError(
                 f"{name}: max_model_len={max_input_tokens} leaves no room for a "
-                f"{b.max_tokens}-token generation. Nothing can be scored.")
+                f"{tokens}-token generation. Nothing can be scored.")
         fits = [r for r in rows if est(r) < budget]
         if not fits:
             raise ValueError(
                 f"{name}: every prompt exceeds the served context. Shortest is "
                 f"~{min(est(r) for r in rows)} tokens and the budget is {budget} "
-                f"(max_model_len {max_input_tokens} minus {b.max_tokens} for the "
+                f"(max_model_len {max_input_tokens} minus {tokens} for the "
                 f"generation). Every prompt would be rejected and the benchmark "
                 f"would score 0.0 for every config -- indistinguishable from "
                 f"'no quality change'.\n"
@@ -507,7 +528,7 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
     # the scorer passed its own constant to gen() -- so changing one silently left
     # the filter reserving room for a generation length nothing would produce.
     prompts = [prompt(r) for r in rows]
-    outs = gen(prompts, b.max_tokens)
+    outs = gen(prompts, tokens)
     verdicts = b.judge(rows, [o.text for o in outs])
     if len(verdicts) != len(rows):
         # ONE guard, not two. An empty verdict list was checked separately

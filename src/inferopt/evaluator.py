@@ -93,7 +93,7 @@ from inferopt._paths import workspace
 from inferopt.engines import VllmEngine, engine_for
 from inferopt.fingerprint import SLO, Fingerprint
 from inferopt.legality import repair
-from inferopt.quality import context_needed
+from inferopt.quality import context_needed, traffic_floor
 from inferopt.quantize import ensure_variant, split_variant
 import goodput.driver as load_driver
 from goodput.driver import Req, _closed_loop, _load, _mt, _one
@@ -620,6 +620,10 @@ class VllmEvaluator:
         self.max_tokens = int(fp.workload.mean_output_tokens)
         self.out_tokens = [max(1, int(r.get("output_tokens") or self.max_tokens))
                            for r in replay]
+        # The quality gate's generation budget, raised to what the traffic's
+        # answers need when they run longer than a benchmark's own: one figure
+        # for the whole run, so the baseline and every variant are scored alike.
+        self.quality_tokens = traffic_floor(fp.workload.p99_output_tokens)
         self.in_tokens = [max(0, int(r.get("input_tokens") or 0)) for r in replay]
 
         # Settle for at least ONE request duration. A closed-loop window opens
@@ -695,7 +699,8 @@ class VllmEvaluator:
                 b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
                 max_input_tokens=config.get("max_model_len"),
                 model=self.fp.model.id,
-                record=d / f"generations-{b}.jsonl")
+                record=d / f"generations-{b}.jsonl",
+                max_tokens=self.quality_tokens)
             self.log(f"        {el()} {b:20s} {qual[b]:.4f}  "
                      f"(+/- {resolution(b):.1%} resolution at this sample size)")
         return qual
@@ -1374,7 +1379,7 @@ class VllmEvaluator:
         served = int(config.get("max_model_len") or 0)
         if not served:
             return None
-        need = context_needed(benchmarks, self.fp.model.id) + CONTEXT_MARGIN_TOKENS
+        need = context_needed(benchmarks, self.fp.model.id, self.quality_tokens) + CONTEXT_MARGIN_TOKENS
         if served >= need:
             return None
         raised = min(-(-need // 1024) * 1024, self.fp.model.max_model_len)
