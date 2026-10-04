@@ -77,17 +77,21 @@ def card_links(cards: list[int]) -> tuple[list[dict] | None, str | None]:
 
 
 def cpu_model() -> str | None:
-    """The host CPU's name; an Arm part without one names its implementer."""
+    """The host CPU's name: /proc/cpuinfo's on x86, lscpu's cores on Arm,
+    where cpuinfo names only an implementer code (the GB10's read 0x41)."""
     try:
         with open("/proc/cpuinfo") as handle:
-            text = handle.read()
-    except OSError:
-        return None
-    for key in ("model name", "Hardware", "CPU implementer"):
-        found = re.search(rf"^{key}\s*:\s*(.+)$", text, re.M)
+            found = re.search(r"^model name\s*:\s*(.+)$", handle.read(), re.M)
         if found:
             return found.group(1).strip()
-    return None
+    except OSError:
+        pass
+    try:
+        text = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    names = list(dict.fromkeys(re.findall(r"^Model name:\s*(.+)$", text, re.M)))
+    return " + ".join(name.strip() for name in names) or None
 
 
 def read(cards: list[int]) -> dict:
@@ -116,7 +120,10 @@ def describe(hw) -> str:
         paths = sorted(set((hw.gpu_paths or {}).values()))
         parts.append(f"over {hw.interconnect or 'an unknown link'}" + (f" ({', '.join(paths)})" if paths else ""))
         parts.append("peer to peer " + {True: "on", False: "off", None: "unknown"}[hw.p2p])
-    links = hw.card_links or []
+    # A unified memory part's card hangs off the CPU by NVLink-C2C, and the
+    # PCIe link nvidia-smi gives it (x1, Gen1 on the GB10) is a placeholder:
+    # kept in the record, left out of the line.
+    links = [] if getattr(hw, "unified_memory", False) else (hw.card_links or [])
     if links:
         widths = sorted({f"x{link['width']} of x{link['width_max']}" for link in links if link.get("width")})
         gens = sorted({f"Gen{link['gen_max']}" for link in links if link.get("gen_max")})

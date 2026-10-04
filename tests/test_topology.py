@@ -86,3 +86,27 @@ def test_the_run_records_and_says_what_its_cards_sit_on(tmp_path, monkeypatch):
         "cards     4 x NVIDIA GeForce RTX 3060, over pcie (PHB, SYS), peer to peer off, "
         "PCIe x4 of x16, x8 of x16 Gen4, 150 W of 170 W, 170 W of 170 W, driver 595.71.05, "
         "AMD EPYC 7402 24-Core Processor")
+
+
+class Lscpu:
+    def __call__(self, command, **kwargs):
+        assert command == ["lscpu"]
+        return types.SimpleNamespace(stdout="Architecture:  aarch64\nVendor ID:  ARM\nModel name:  Cortex-X925\n"
+                                            "Model name:  Cortex-A725\n", returncode=0)
+
+
+def test_an_arm_cpu_is_named_by_its_cores_not_its_implementer_code(monkeypatch, tmp_path):
+    """4 Oct 2026, on the DGX: /proc/cpuinfo named only "0x41"."""
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd85\n")
+    real_open = open
+    monkeypatch.setattr("builtins.open", lambda path, *a, **k: real_open(cpuinfo if path == "/proc/cpuinfo" else path, *a, **k))
+    monkeypatch.setattr(subprocess, "run", Lscpu())
+    assert topology.cpu_model() == "Cortex-X925 + Cortex-A725"
+
+
+def test_a_unified_parts_placeholder_pcie_link_stays_out_of_the_line():
+    hw = types.SimpleNamespace(gpu_count=1, gpu_name="NVIDIA GB10", unified_memory=True, interconnect=None,
+                               gpu_paths=None, p2p=None, driver_version="580.173.02", cpu_model="Cortex-X925",
+                               card_links=[{"index": 0, "gen": 1, "gen_max": 1, "width": 1, "width_max": 16}])
+    assert topology.describe(hw) == "cards     1 x NVIDIA GB10, driver 580.173.02, Cortex-X925"
