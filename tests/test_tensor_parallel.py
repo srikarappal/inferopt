@@ -20,6 +20,8 @@ def a_fingerprint(gpu_count, dense=True, unified=False, memory_gb=80.0):
 def four_cards(command, **kwargs):
     if command[0] == "nvidia-smi":
         return types.SimpleNamespace(stdout="NVIDIA H100 80GB HBM3, 9.0, 81559\n" * 4, returncode=0)
+    if command[0] == "lscpu":
+        return types.SimpleNamespace(stdout="", returncode=0)
     raise AssertionError(command)
 
 

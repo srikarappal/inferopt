@@ -14,6 +14,8 @@ def fake_smi(name):
     def run(command, **kwargs):
         if command[0] == "nvidia-smi":
             return types.SimpleNamespace(stdout=f"{name}, 8.6, 10240\n", returncode=0)
+        if command[0] == "lscpu":
+            return types.SimpleNamespace(stdout="", returncode=0)
         raise AssertionError(command)
     return run
 
