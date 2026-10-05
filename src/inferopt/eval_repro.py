@@ -146,7 +146,7 @@ def score_once(ev, model, rows, bench, concurrency, prompt=None):
     """
     import httpx
 
-    from inferopt.evaluator import _one
+    from inferopt.evaluator import _one, as_served
 
     prompt = prompt or bench.prompt
     prompts = [prompt(r) for r in rows]
@@ -156,7 +156,8 @@ def score_once(ev, model, rows, bench, concurrency, prompt=None):
         async with httpx.AsyncClient(timeout=900.0) as c:
             async def go(p):
                 async with sem:
-                    return await _one(c, ev.base_url, model, p, bench.max_tokens, stream=False)
+                    return await _one(c, ev.base_url, model, p, bench.max_tokens, stream=False,
+                                      sampling=as_served())
             return list(await asyncio.gather(*[go(p) for p in prompts]))
 
     outs = asyncio.run(go_all())

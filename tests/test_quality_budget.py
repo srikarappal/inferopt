@@ -63,3 +63,46 @@ def test_a_registered_benchmark_must_carry_its_rows():
     with pytest.raises(ValueError, match="carries its own rows"):
         quality.register_benchmark("x", quality.Benchmark(
             judge=lambda rows, texts: [], prompt=str, metric="exact_match", n_full=1, max_tokens=64))
+
+
+def test_graded_answers_are_sampled_as_the_model_is_served_and_keep_the_seed():
+    """4 Oct 2026: grading sent temperature 0, and greedy Qwen3 looped on about
+    a twentieth of MATH-500; the model's own generation config is not ours to
+    change. The seed stays, so two configurations get the same draw."""
+    from goodput import driver
+
+    assert driver.as_served() == {"seed": 0}
+    assert driver.SAMPLING == {"temperature": 0.0, "seed": 0}, "the load replay and the equivalence probe are unchanged"
+    kept = dict(driver.SAMPLING)
+    try:
+        driver.use_sampling("vllm", "diffusion")
+        assert driver.as_served() == {}, "a server that refuses a seed is sent none"
+    finally:
+        driver.SAMPLING = kept
+
+
+def test_the_request_carries_the_sampling_it_is_given(monkeypatch):
+    import asyncio
+
+    from goodput import driver
+
+    sent = []
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"text": "ok"}], "usage": {"completion_tokens": 1, "prompt_tokens": 1}}
+
+    class Client:
+        async def post(self, url, json=None, timeout=None):
+            sent.append(json)
+            return Response()
+
+    asyncio.run(driver._one(Client(), "http://x", "m", "p", 8, stream=False, sampling=driver.as_served()))
+    asyncio.run(driver._one(Client(), "http://x", "m", "p", 8, stream=False))
+    assert "temperature" not in sent[0] and sent[0]["seed"] == 0
+    assert sent[1]["temperature"] == 0.0

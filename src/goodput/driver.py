@@ -106,10 +106,20 @@ def use_sampling(engine: str, decoding: str) -> dict:
     return SAMPLING
 
 
-async def _one(client, base_url, model, prompt, max_tokens, stream=True) -> Req:
+def as_served() -> dict:
+    """Sampling for an answer that is graded: the model's own. No temperature
+    is sent, so the server samples by the model's generation_config.json, the
+    way it is served; the seed stays where the server takes one, so two
+    configurations are given the same draw on every question. Graded greedily,
+    about a twentieth of Qwen3's MATH-500 answers looped until max_tokens and
+    scored wrong for every configuration (4 Oct 2026)."""
+    return {name: value for name, value in SAMPLING.items() if name != "temperature"}
+
+
+async def _one(client, base_url, model, prompt, max_tokens, stream=True, sampling: dict | None = None) -> Req:
     r = Req(start=time.perf_counter())
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens,
-               **SAMPLING, "stream": stream}
+               **(SAMPLING if sampling is None else sampling), "stream": stream}
     if stream:
         # continuous_usage_stats: usage in EVERY chunk, not only the last. A
         # chunk is not a token. An autoregressive server sends one token per

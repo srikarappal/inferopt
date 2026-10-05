@@ -96,7 +96,7 @@ from inferopt.legality import repair
 from inferopt.quality import context_needed, traffic_floor
 from inferopt.quantize import ensure_variant, split_variant
 import goodput.driver as load_driver
-from goodput.driver import Req, _closed_loop, _load, _mt, _one
+from goodput.driver import Req, _closed_loop, _load, _mt, _one, as_served
 from goodput.metrics import _reasons, summarize
 from inferopt.traverse import Trial
 
@@ -656,8 +656,9 @@ class VllmEvaluator:
 
         TWO KINDS, MEASURED DIFFERENTLY ON PURPOSE.
 
-        Ours (math_500, mbpp_plus, humaneval_plus) run through _greedy with this
-        project's prompts, budgets and graders. They are internally consistent,
+        Ours (math_500, mbpp_plus, humaneval_plus, a caller's own eval) run
+        through _answers, sampled as the model is served (driver.as_served), with
+        this project's prompts, budgets and graders. They are internally consistent,
         which is all a walk needs to RANK configurations, and externally
         unquotable, because nobody can reproduce a number whose harness they do
         not have.
@@ -696,7 +697,7 @@ class VllmEvaluator:
                     self.log(f"        {el()} {b:20s} SKIPPED: {str(e).splitlines()[0]}")
                 continue
             qual[b] = run_benchmark(
-                b, lambda ps, mt: asyncio.run(self._greedy(model, ps, mt)),
+                b, lambda ps, mt: asyncio.run(self._answers(model, ps, mt)),
                 max_input_tokens=config.get("max_model_len"),
                 model=self.fp.model.id,
                 record=d / f"generations-{b}.jsonl",
@@ -1109,13 +1110,19 @@ class VllmEvaluator:
         n = min(len(got), len(self.equiv_ref))
         return sum(1 for a, b in zip(self.equiv_ref[:n], got[:n]) if a != b) / max(1, n)
 
-    async def _greedy(self, model, prompts, max_tokens) -> list[Req]:
+    async def _greedy(self, model, prompts, max_tokens, sampling: dict | None = None) -> list[Req]:
         sem = asyncio.Semaphore(32)
         async with httpx.AsyncClient(timeout=900.0) as c:
             async def go(p):
                 async with sem:
-                    return await _one(c, self.base_url, model, p, max_tokens, stream=False)
+                    return await _one(c, self.base_url, model, p, max_tokens, stream=False, sampling=sampling)
             return list(await asyncio.gather(*[go(p) for p in prompts]))
+
+    async def _answers(self, model, prompts, max_tokens) -> list[Req]:
+        """Answers to grade: sampled by the model's own generation config, with
+        the seed (driver.as_served). The equivalence probe stays greedy: it
+        compares two servers token for token."""
+        return await self._greedy(model, prompts, max_tokens, sampling=as_served())
 
     # --- capacity ---
     # KV utilisation is a GAUGE and preemptions is a COUNTER, and they must not
