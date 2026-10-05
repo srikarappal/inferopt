@@ -38,6 +38,7 @@ from inferopt import topology
 from inferopt._paths import default_dag, runs as _runs
 from inferopt.finalists import sweep_finalists
 from inferopt.provenance import seed_fingerprint
+from inferopt.quality import BENCHMARKS
 
 
 def workload_warnings(fp) -> list[str]:
@@ -433,6 +434,11 @@ def optimize(
     return res
 
 
+def _metric_name(benchmark: str) -> str:
+    """The benchmark's own metric, exact_match for one this module does not know."""
+    return BENCHMARKS[benchmark].metric_spec.name if benchmark in BENCHMARKS else "exact_match"
+
+
 def _changes(res: Result, benchmarks: list[str]) -> list[Any]:
     """Every measured movement on a quality axis, against the first trial.
 
@@ -457,7 +463,7 @@ def _changes(res: Result, benchmarks: list[str]) -> list[Any]:
             q = (getattr(t, "quality", None) or {}).get(b)
             if q is None or t is base or getattr(t, "quality_inherited", False):
                 continue
-            c = QualityChange(benchmark=b, metric="exact_match", before=before,
+            c = QualityChange(benchmark=b, metric=_metric_name(b), before=before,
                               after=q, resolution=tol,
                               node=str(getattr(t, "node_id", "")))
             if not c.within_noise:

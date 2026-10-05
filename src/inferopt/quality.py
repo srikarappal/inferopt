@@ -159,6 +159,12 @@ class Generate(Protocol):
 # --------------------------------------------------------------------------
 
 def _load(name: str, n: int | None) -> list[dict]:
+    # A caller's own eval (register_benchmark) carries its rows; a public one
+    # is read from the data directory. The first n either way: a caller who
+    # wants a representative subset orders its rows so every prefix is one.
+    own = BENCHMARKS[name].rows if name in BENCHMARKS else None
+    if own is not None:
+        return list(own[:n] if n else own)
     p = DATA / f"{name}.jsonl"
     if not p.exists():
         raise FileNotFoundError(
@@ -356,9 +362,10 @@ class Benchmark:
     A code benchmark makes that untenable, since its judge is a subprocess.
     """
     prompt: Callable
-    metric: str
-    """Aggregation name. Resolved to a Metric -- which carries DIRECTION -- by
-    the `metric_spec` property. A bare string cannot say whether a rise is an
+    metric: "str | Metric"
+    """Aggregation name, resolved to a Metric -- which carries DIRECTION -- by
+    the `metric_spec` property, or a Metric itself for a caller's own eval (f1,
+    ROUGE, a rubric's pass rate). A bare string cannot say whether a rise is an
     improvement, and wer and pass@1 move opposite ways."""
     n_full: int
     max_tokens: int
@@ -392,11 +399,15 @@ class Benchmark:
     config -- for a score so low it indicates a broken probe or a broken
     checkpoint rather than a trade worth having."""
 
+    rows: tuple | None = None
+    """The rows themselves, for a caller's own eval (register_benchmark); None
+    for a public benchmark, which is read from the data directory."""
+
     @property
     def metric_spec(self):
         """The metric as a Metric, with its direction."""
         from inferopt.api_types import Metric
-        return Metric(self.metric)
+        return self.metric if isinstance(self.metric, Metric) else Metric(self.metric)
 
     @property
     def higher_is_better(self) -> bool:
@@ -433,6 +444,16 @@ BENCHMARKS: dict[str, Benchmark] = {
     "mbpp_plus": Benchmark(_judge_mbpp_plus, _mbpp_plus_prompt, "pass@1", 378, 512),
     "humaneval_plus": Benchmark(_judge_humaneval_plus, _raw_prompt, "pass@1", 164, 512),
 }
+
+
+def register_benchmark(name: str, benchmark: "Benchmark") -> None:
+    """Add a caller's own eval, to be named in optimize(benchmarks=[...]) like
+    a public one: the customer's rows, scored by the customer's metric, so the
+    frontier's quality axis is their task and not MATH-500 (4 Oct 2026: every
+    search scored MATH-500, whatever eval the customer brought)."""
+    if benchmark.rows is None:
+        raise ValueError(f"{name}: a registered benchmark carries its own rows")
+    BENCHMARKS[name] = benchmark
 
 
 def traffic_floor(p99_output_tokens: int) -> int:
@@ -567,14 +588,14 @@ def run_benchmark(name: str, gen: Generate, *, full: bool = False,
         with open(f, "w") as fh:
             for r, pr, o, v in zip(rows, prompts, outs, verdicts):
                 fh.write(json.dumps({
-                    "task_id": r.get("task_id") or r.get("problem", "")[:60],
+                    "task_id": r.get("task_id") or (r.get("problem") or r.get("prompt") or "")[:60],
                     "prompt": pr,
                     "output": o.text,
                     "verdict": bool(v),
                     # Verdicts carry a reason when the judge supplied one. A
                     # False with no reason is what made RULER undiagnosable.
                     "reason": getattr(v, "reason", ""),
-                    "expected": r.get("answer") or r.get("entry_point"),
+                    "expected": r.get("answer") or r.get("expected") or r.get("entry_point"),
                     "n_output_tokens": getattr(o, "n_out", None),
                 }, default=str) + "\n")
     # Aggregate THROUGH the metric, so a benchmark whose metric is not a plain

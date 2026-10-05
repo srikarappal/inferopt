@@ -28,3 +28,38 @@ def test_the_scorer_asks_for_the_raised_budget(monkeypatch):
 
     quality.run_benchmark("math_500", gen, max_tokens=2080)
     assert asked == [2080]
+
+
+def test_a_callers_own_eval_is_scored_on_its_rows_by_its_metric(monkeypatch):
+    """4 Oct 2026: every search scored MATH-500, whatever eval the customer
+    brought; their rows and their metric are the frontier's quality axis."""
+    from inferopt.api_types import Metric, Verdict
+
+    def judge(rows, texts):
+        return [Verdict(ok=text == row["expected"], value=1.0 if text == row["expected"] else 0.0)
+                for row, text in zip(rows, texts)]
+
+    rows = tuple({"prompt": f"q{i}", "expected": "yes"} for i in range(4))
+    mean = Metric("f1", fn=lambda samples, verdicts: sum(v.value for v in verdicts) / len(verdicts))
+    quality.register_benchmark("customer_eval", quality.Benchmark(
+        judge=judge, prompt=lambda row: row["prompt"], metric=mean, n_full=4, max_tokens=512, chat=False,
+        rows=rows))
+    try:
+        answers = iter(["yes", "no", "yes", "yes"])
+
+        def gen(prompts, max_tokens):
+            return [type("Out", (), {"text": next(answers)})() for _ in prompts]
+
+        assert quality.run_benchmark("customer_eval", gen, full=True) == 0.75
+        assert quality._load("customer_eval", 2) == list(rows[:2]), "the first n: a prefix the caller ordered"
+        assert quality.BENCHMARKS["customer_eval"].metric_spec is mean
+    finally:
+        quality.BENCHMARKS.pop("customer_eval", None)
+
+
+def test_a_registered_benchmark_must_carry_its_rows():
+    import pytest
+
+    with pytest.raises(ValueError, match="carries its own rows"):
+        quality.register_benchmark("x", quality.Benchmark(
+            judge=lambda rows, texts: [], prompt=str, metric="exact_match", n_full=1, max_tokens=64))
