@@ -579,6 +579,10 @@ class VllmEvaluator:
     # bracket a node gets around the operating point.
     baseline_levels = SWEEP_LEVELS
 
+    # The only prompts quantization may calibrate on, when the caller grades on
+    # other rows of the same eval (optimize(calibration=...)); None: the trace.
+    calibration_path: str | None = None
+
     def __init__(self, fp: Fingerprint, slo: SLO, trace_path: str, run_dir: str,
                  gpu: str = "0", port: int = 8000, log=print, engine=None,
                  chat_prompts: bool = True):
@@ -822,7 +826,8 @@ class VllmEvaluator:
             # nodes died at the eighth because modelopt could not load the
             # checkpoint.
             try:
-                path = ensure_variant(self.fp, kind, self.trace_path, log=self.log)
+                path = ensure_variant(self.fp, kind, self.trace_path, log=self.log,
+                                      calibration=self.calibration_path)
             except Exception as failed:
                 raise LaunchError(f"quantization to {kind} failed: "
                                   f"{str(failed).splitlines()[0]}", str(failed)) from failed

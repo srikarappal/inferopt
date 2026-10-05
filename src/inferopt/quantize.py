@@ -418,16 +418,21 @@ print(f"[job] wrote {out_dir}", flush=True)
 '''
 
 
-def _write_calibration(trace_path: str, dest: Path, n: int = N_CALIB) -> int:
-    """Sample calibration prompts from the workload trace.
+def _calibration_rows(source: str, n: int = N_CALIB) -> list[str]:
+    """Up to `n` rows of `source`, a JSONL with a prompt a row.
 
-    Sampled across the whole trace rather than taking the head: traces are often
+    Sampled across the whole file rather than taking the head: traces are often
     ordered, and calibrating on the first N requests would fit the scales to
     whatever topic happened to open the capture.
     """
-    rows = [l for l in Path(trace_path).read_text().splitlines() if l.strip()]
+    rows = [l for l in Path(source).read_text().splitlines() if l.strip()]
     step = max(1, len(rows) // n)
-    picked = rows[::step][:n]
+    return rows[::step][:n]
+
+
+def _write_calibration(trace_path: str, dest: Path, n: int = N_CALIB) -> int:
+    """The calibration prompts for one variant, written beside it."""
+    picked = _calibration_rows(trace_path, n)
     dest.write_text("\n".join(picked) + "\n")
     return len(picked)
 
@@ -468,13 +473,21 @@ def variant_dir(model_id: str, kind: str) -> Path:
     return artifacts(f"{model_id.replace('/', '__')}--{kind.replace('@', '_')}")
 
 
-def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
+def ensure_variant(fp, kind: str, trace_path: str, *, log=print,
+                   calibration: str | None = None) -> str | None:
     """Path to a quantized checkpoint of `model_id`, producing it if needed.
 
     Returns None for `fp8`, which is a launch flag rather than an artifact --
     the caller sets quantization="fp8" instead of swapping the model path.
     Raises on failure: a silently skipped conversion would leave the DAG
     measuring the unquantized model while reporting it as quantized.
+
+    `calibration` is a JSONL of the only prompts the quantizer may read, for a
+    caller that grades on other rows of the same eval: calibrated on the trace,
+    the scales were fit on questions the variant was then graded on (4 Oct
+    2026). Without it the trace is the source, as for real traffic. A
+    checkpoint already on disk is reused only if it was calibrated on these
+    same prompts; one calibrated on others is produced again.
     """
     if kind == "fp8":
         return None      # a load-time flag, no artifact
@@ -485,16 +498,23 @@ def ensure_variant(fp, kind: str, trace_path: str, *, log=print) -> str | None:
 
     model_id = fp.model.id
     out = variant_dir(model_id, kind)
+    calib = out.parent / f"{out.name}.calib.jsonl"
+    source = calibration or trace_path
     if (out / "config.json").exists():
-        log(f"  quant     reusing {out}")
-        return str(out)
+        wanted = "\n".join(_calibration_rows(calibration)) + "\n" if calibration else None
+        if wanted is None or (calib.exists() and calib.read_text() == wanted):
+            log(f"  quant     reusing {out}")
+            return str(out)
+        log(f"  quant     {out.name} was calibrated on other prompts than this run's "
+            f"calibration set; producing it again")
+        shutil.rmtree(out, ignore_errors=True)
 
     out.mkdir(parents=True, exist_ok=True)
-    calib = out.parent / f"{out.name}.calib.jsonl"
-    n = _write_calibration(trace_path, calib)
+    n = _write_calibration(source, calib)
     log(f"  quant     producing {kind} from {model_id}")
-    log(f"            calibrating on {n} prompts from the workload trace "
-        f"(not pileval -- these are the activations the model will actually see)")
+    log(f"            calibrating on {n} prompts from "
+        + ("the calibration set, none of them graded" if calibration else "the workload trace")
+        + " (not pileval -- these are the activations the model will actually see)")
     ignore = sensitivity_ignore(fp, log=log)
 
     job = out.parent / f"{out.name}.job.py"

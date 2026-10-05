@@ -253,9 +253,15 @@ def optimize(
     chat_prompts: bool = True,
     finalists: int = 3,
     max_in_flight: int = 0,
+    calibration: str | None = None,
     log=print,
 ) -> Result:
     """Search serving configurations and return measured operating points.
+
+    `calibration` is a JSONL of prompts, the only ones quantization may
+    calibrate on. For a caller whose benchmark is other rows of the same eval
+    the trace was made from: without it the quantizer samples the trace and
+    can read the questions its variants are then graded on.
 
     `chat_prompts` sends every trace prompt as one user turn through the
     model's chat template (prompting.py). Off for a trace of real traffic,
@@ -327,6 +333,7 @@ def optimize(
                           benchmarks=bench, quality_every=quality_every_config,
                           chat_prompts=chat_prompts, log=log)
     runner.ev.profile = profile
+    runner.ev.calibration_path = calibration
 
     # The seed. Identical across strategies, and --seed-from-run replaces it for
     # ALL THREE, not only the chaining walk.
